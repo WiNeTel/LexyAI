@@ -1,0 +1,13 @@
+name: youtube
+version: 1.0.0
+description: "YouTube-Suche, Video-Infos, Wiedergabe im Frontend"
+entry: youtube_plugin.YouTubePlugin
+requires: []
+optional: [dashboard]
+capabilities: [tool, ws_handler]
+
+config_defaults:
+  api_key: ""
+  max_results: 5
+  region_code: "DE"
+  safe_search: "moderate"

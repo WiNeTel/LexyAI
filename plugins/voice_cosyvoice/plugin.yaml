@@ -1,0 +1,27 @@
+name: voice_cosyvoice
+version: 2.0.0
+description: "CosyVoice 3 TTS (Remote Server) with narrator + emotion pipeline"
+entry: cosyvoice_plugin.CosyVoicePlugin
+requires: []
+optional: []
+capabilities: [voice_tts, ws_handler]
+
+config_defaults:
+  endpoint: "http://172.20.0.245:5500"
+  voice: "referenz_mio"
+  narrator_voice: "referenz_mio"
+  speed: 1.0
+  timeout: 30
+  retries: 2
+  streaming: true
+  default_instruct: ""
+  narrator_mode: "full"
+  segment_pause_ms: 80
+
+frontend:
+  - id: cosyvoice-settings
+    js: cosyvoice_settings.js
+    css: cosyvoice_settings.css
+    mount: sidebar
+    icon: speaker
+    label: "TTS Settings"

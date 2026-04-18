@@ -1,0 +1,28 @@
+name: dashboard
+version: 1.0.0
+description: "Configurable dashboard with plugin-provided widgets"
+entry: dashboard_plugin.DashboardPlugin
+requires: []
+optional: [weather, autonomous_thinking, scheduler]
+capabilities: [tool, ws_handler, event]
+config_defaults:
+  default_layout:
+    - {widget: "clock", x: 0, y: 0, w: 1, h: 1}
+    - {widget: "weather", x: 1, y: 0, w: 1, h: 1}
+    - {widget: "memory_stats", x: 2, y: 0, w: 1, h: 1}
+    - {widget: "system_status", x: 0, y: 1, w: 2, h: 1}
+    - {widget: "thoughts", x: 2, y: 1, w: 1, h: 2}
+    - {widget: "sessions", x: 3, y: 0, w: 1, h: 1}
+    - {widget: "notes", x: 3, y: 1, w: 1, h: 1}
+  refresh_interval_seconds: 30
+  # Per-widget refresh intervals (seconds). Overrides the value each widget
+  # declares in code. Use 0 to make a widget push-only (no periodic poll).
+  widget_intervals:
+    weather: 1800          # 30 min — Open-Meteo doesn't change often
+    memory_stats: 60       # 1 min — collection counts tick slowly
+    sessions: 30           # 30 s  — snappy for new chats
+    system_status: 30      # 30 s  — health pings are cheap
+    clock: 0               # purely client-side, no backend poll needed
+    notes: 0               # push-only (event-driven on save/delete)
+    search: 0              # interactive, no auto-refresh
+    thoughts: 0            # push-only (broadcast on new autonomous thought)

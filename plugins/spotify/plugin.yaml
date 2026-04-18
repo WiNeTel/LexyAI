@@ -1,0 +1,14 @@
+name: spotify
+version: 1.0.0
+description: "Spotify-Steuerung: Playback, Suche, Playlists, Queue"
+entry: spotify_plugin.SpotifyPlugin
+requires: []
+optional: [dashboard]
+capabilities: [tool, ws_handler]
+
+config_defaults:
+  client_id: ""
+  client_secret: ""
+  redirect_uri: "http://localhost:8765/callback/spotify"
+  scopes: "user-read-playback-state user-modify-playback-state user-read-currently-playing playlist-read-private playlist-modify-public playlist-modify-private"
+  market: "DE"

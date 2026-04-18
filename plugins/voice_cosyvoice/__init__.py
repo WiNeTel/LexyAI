@@ -1,0 +1,1 @@
+"""voice_cosyvoice plugin."""

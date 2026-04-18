@@ -1,0 +1,41 @@
+"""Lexy AI – Pydantic Configuration."""
+
+from lexy_core.config.config import (
+    BrainConfig,
+    ChannelConfig,
+    EmbeddingConfig,
+    LexyConfig,
+    MemoryConfig,
+    PluginsConfig,
+    RoutingConfig,
+    RoutingFallback,
+    RoutingRule,
+    ServerConfig,
+    STTConfig,
+    SystemConfig,
+    TTSConfig,
+    VoiceConfig,
+    get_config,
+    load_config,
+    set_config,
+)
+
+__all__ = [
+    "BrainConfig",
+    "ChannelConfig",
+    "EmbeddingConfig",
+    "LexyConfig",
+    "MemoryConfig",
+    "PluginsConfig",
+    "RoutingConfig",
+    "RoutingFallback",
+    "RoutingRule",
+    "ServerConfig",
+    "STTConfig",
+    "SystemConfig",
+    "TTSConfig",
+    "VoiceConfig",
+    "get_config",
+    "load_config",
+    "set_config",
+]

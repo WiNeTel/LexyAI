@@ -1,0 +1,13 @@
+name: mcp_bridge
+version: 1.0.0
+description: "MCP Server Integration: connect external MCP servers, use their tools"
+entry: mcp_bridge_plugin.MCPBridgePlugin
+requires: []
+optional: [dashboard]
+capabilities: [tool, ws_handler, event]
+
+config_defaults:
+  servers: []
+  auto_connect: true
+  tool_prefix: "mcp_"
+  reconnect_interval: 30

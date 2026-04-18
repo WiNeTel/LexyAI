@@ -1,0 +1,15 @@
+name: scheduler
+version: 2.0.0
+description: "Timer, reminders, alarms and periodic impulses (LLM-invocable tools)"
+entry: scheduler_plugin.SchedulerPlugin
+requires: []
+optional: []
+capabilities: [tool, event, ws_handler]
+
+config_defaults:
+  check_interval: 5.0
+  max_active_timers: 50
+  db_filename: "scheduler.db"
+  enable_impulses: true
+  impulse_min_hour: 8
+  impulse_max_hour: 22

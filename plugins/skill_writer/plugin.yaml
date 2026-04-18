@@ -1,0 +1,29 @@
+name: skill_writer
+version: 1.0.0
+description: "Self-improvement: Lexy writes skills, spawns autonomous agents"
+entry: skill_writer_plugin.SkillWriterPlugin
+requires: []
+optional: [dashboard]
+capabilities: [tool, event, ws_handler, hook]
+
+config_defaults:
+  skills_path: "./data/skills"
+  auto_propose: true
+  require_approval: true
+  max_skill_size_bytes: 10000
+  max_agents: 5
+  agent_max_iterations: 10
+  agent_timeout: 120.0
+  sandbox_allowed_imports:
+    - json
+    - re
+    - datetime
+    - math
+    - collections
+    - itertools
+    - functools
+    - pathlib
+    - urllib.parse
+    - time
+    - hashlib
+    - base64

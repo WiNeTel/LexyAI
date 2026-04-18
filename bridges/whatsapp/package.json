@@ -1,0 +1,21 @@
+{
+  "name": "lexy-whatsapp-bridge",
+  "version": "1.0.0",
+  "description": "Baileys-based WhatsApp bridge for Lexy AI. Exposes REST endpoints so the Lexy channel_whatsapp plugin can poll for inbound messages and send replies.",
+  "main": "bridge.js",
+  "scripts": {
+    "start": "node bridge.js",
+    "dev": "node bridge.js --verbose"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.16",
+    "express": "^4.21.0",
+    "pino": "^9.6.0",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "private": true,
+  "license": "MIT"
+}
