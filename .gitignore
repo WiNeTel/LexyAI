@@ -1,0 +1,64 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+env/
+venv/
+*.egg
+
+# === IDE / Tooling ===
+.claude/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === Lexy-specific: Runtime data (sessions, memory, chroma-db, logs) ===
+data/
+logs/
+*.log
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.bak
+
+# === LLM binaries + models (never in git) ===
+llama.cpp/
+*.gguf
+*.bin
+*.safetensors
+
+# === Junctions to external sources (Windows mklink /J targets) ===
+# These are symlinks to other directories on the local machine that must
+# not be dereferenced into this repo.
+/docs/
+/lexy_v1/
+
+# === Reference programs (third-party, out of scope for this repo) ===
+/referenz/
+
+# === Frontend build artifacts (if a node build ever resumes) ===
+frontend/node_modules/
+frontend/.next/
+frontend/dist/
+frontend/build/
+
+# === Local config overrides (keep secrets out) ===
+config/config.local.yaml
+config/*.local.yaml
+
+# === OS ===
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# === Temp / uploads ===
+data/plugins/*/uploads/
+tmp/
+*.tmp
