@@ -1,0 +1,40 @@
+name: orchestrator
+version: 1.0.0
+description: "Hybrid-Orchestrator: Task-Delegation, Agent-Management, Persona-Spawning"
+entry: orchestrator_plugin.OrchestratorPlugin
+requires: [skill_writer]
+optional: [dashboard, expert_panel, scheduler]
+capabilities: [tool, event, ws_handler, hook]
+config_defaults:
+  max_agents: 5
+  decision_brain: "e4b"
+  decision_max_tokens: 200
+  agent_default_brain: "e4b"
+  agent_default_timeout: 300.0
+  agent_max_iterations: 15
+  personas:
+    tutor:
+      name: "Tutor"
+      prompt: "Du bist ein geduldiger Tutor. Erklaere Schritt fuer Schritt, nutze Analogien, frage ob der User folgen kann."
+      brain: "a4b"
+      temperature: 0.5
+    critic:
+      name: "Kritiker"
+      prompt: "Du bist ein konstruktiver Kritiker. Hinterfrage Annahmen, finde Schwachstellen, schlage Alternativen vor."
+      brain: "e4b"
+      temperature: 0.6
+    researcher:
+      name: "Researcher"
+      prompt: "Du bist ein Recherche-Agent. Nutze web_search und web_fetch um Informationen zu finden. Fasse Ergebnisse strukturiert zusammen."
+      brain: "e4b"
+      temperature: 0.3
+    coder:
+      name: "Coder"
+      prompt: "Du bist ein erfahrener Programmierer. Schreibe sauberen Code, erklaere deine Entscheidungen, nutze Best Practices."
+      brain: "a4b"
+      temperature: 0.4
+    storyteller:
+      name: "Erzaehler"
+      prompt: "Du bist ein kreativer Geschichtenerzaehler. Erzaehle lebendige, fesselnde Geschichten mit ueberraschenden Wendungen."
+      brain: "a4b"
+      temperature: 0.9

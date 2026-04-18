@@ -1,0 +1,28 @@
+# Auto-normalise text files to LF, let Windows keep CRLF for its scripts.
+* text=auto eol=lf
+
+# Windows-only scripts must stay CRLF or they break on double-click.
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# Binary assets — never try to merge or line-end normalise.
+*.gguf         binary
+*.bin          binary
+*.safetensors  binary
+*.pt           binary
+*.onnx         binary
+*.png          binary
+*.jpg          binary
+*.jpeg         binary
+*.gif          binary
+*.webp         binary
+*.ico          binary
+*.wav          binary
+*.mp3          binary
+*.ogg          binary
+*.webm         binary
+*.mp4          binary
+*.pdf          binary
+*.zip          binary
+*.7z           binary

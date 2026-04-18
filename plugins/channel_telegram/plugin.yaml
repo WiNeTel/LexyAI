@@ -1,0 +1,12 @@
+name: channel_telegram
+version: 1.0.0
+description: "Telegram Bot channel (polling mode)"
+entry: telegram_plugin.TelegramChannelPlugin
+requires: []
+optional: []
+capabilities: [channel]
+
+config_defaults:
+  token_env: "LEXY_TELEGRAM_TOKEN"
+  allowed_users: []
+  max_message_length: 4096

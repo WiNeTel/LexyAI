@@ -1,0 +1,15 @@
+name: dreaming
+version: 1.0.0
+description: "Background memory consolidation: merge duplicates, create fact links, decay old entries"
+entry: dreaming_plugin.DreamingPlugin
+requires: []
+optional: [autonomous_thinking]
+capabilities: [event]
+config_defaults:
+  enabled: true
+  interval_minutes: 120
+  quiet_hours: ["02:00", "06:00"]
+  max_operations_per_cycle: 10
+  similarity_threshold: 0.85
+  decay_days: 90
+  min_idle_minutes: 30

@@ -1,0 +1,107 @@
+autonomous_thinking:
+  enabled: true
+  max_thoughts_per_hour: 4
+  min_idle_seconds: 120
+  mode_interval_seconds: 600
+  modes:
+  - daydream
+  - reflect
+  - learn
+  - worry
+  quiet_hours:
+  - '23:00'
+  - 07:00
+channel_discord:
+  token_env: LEXY_DISCORD_TOKEN
+channel_telegram:
+  token_env: LEXY_TELEGRAM_TOKEN
+channel_whatsapp:
+  allowed_contacts:
+  - 491624692416@s.whatsapp.net
+  - 207021953560671@lid
+  api_key: lexy-secret
+  bridge_url: http://127.0.0.1:3000
+  inbound_path: /inbound
+  max_message_length: 4096
+  outbound_path: /send
+  poll_interval: 2
+dashboard:
+  refresh_interval_seconds: 30
+dreaming:
+  decay_days: 90
+  enabled: true
+  interval_minutes: 45
+  max_operations_per_cycle: 20
+  min_idle_minutes: 10
+  quiet_hours:
+  - 02:00
+  - 06:00
+  similarity_threshold: 0.85
+expert_panel:
+  convergence_threshold: 3
+  default_brain: e4b
+  default_roles:
+  - analyst
+  - critic
+  - creative
+  - pragmatist
+  - synthesizer
+  default_rounds: 5
+  max_rounds: 10
+  max_tokens_per_response: 1000
+  temperature_overrides: '[object Object]'
+knowledge_acquisition:
+  chunk_overlap: 100
+  chunk_size: 800
+  dedup_threshold: 0.88
+  max_concurrent_jobs: 2
+  max_pages_per_job: 10
+  min_quality_score: 3
+  rate_limit_seconds: 3.0
+mcp_bridge:
+  auto_connect: true
+  servers: []
+  tool_prefix: mcp_
+orchestrator:
+  agent_default_brain: e4b
+  agent_default_timeout: 300
+  agent_max_iterations: 15
+  decision_brain: e4b
+  decision_max_tokens: 400
+  max_agents: 5
+  personas: '[object Object]'
+scheduler:
+  check_interval: 5.0
+  max_active_timers: 50
+skill_writer:
+  agent_timeout: 120.0
+  auto_propose: true
+  max_agents: 5
+  require_approval: true
+spotify:
+  client_id: ''
+  client_secret: ''
+  market: DE
+voice_canary:
+  device: cuda:0
+  language: de
+voice_cosyvoice:
+  emotion_pipeline: true
+  endpoint: http://172.20.0.245:5500
+  speed: 1.0
+  voice: referenz_mio
+voice_gemma4:
+  endpoint: http://127.0.0.1:5006/v1
+  language: de
+  model: gemma-4-e4b-it
+  temperature: 0.0
+weather:
+  latitude: 53.63
+  location: TestTown
+  longitude: 9.24
+  timezone: Europe/Berlin
+  units: metric
+youtube:
+  api_key: ''
+  max_results: 5
+  region_code: DE

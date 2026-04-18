@@ -1,0 +1,14 @@
+name: weather
+version: 1.0.0
+description: "Weather via Open-Meteo (no API key required)"
+entry: weather_plugin.WeatherPlugin
+requires: []
+optional: []
+capabilities: [tool]
+
+config_defaults:
+  location: "Berlin"
+  latitude: 52.52
+  longitude: 13.41
+  units: "metric"
+  timezone: "Europe/Berlin"

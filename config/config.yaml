@@ -1,0 +1,183 @@
+# Lexy AI – Hauptkonfiguration
+# Pydantic Models in lexy_core/config/config.py
+
+system:
+  name: "Lexy AI"
+  version: "2.0.0"
+  debug: true
+  log_level: "INFO"
+  # VRAM profile — decides which servers Lexy talks to and which plugins
+  # are loaded. Pick based on your GPU budget:
+  #
+  #   chat  — E4B (:5006) + A4B (:5005). Both multimodal (vision), E4B
+  #           also handles audio/STT. This is the recommended default:
+  #           two servers do text + vision + STT. voice_gemma4 plugin
+  #           is enabled and points at :5006.
+  #
+  #   voice — MULTI (:5007, Gemma 4 4B) + A4B (:5005). Legacy path for
+  #           setups where a separate 4B lives on :5007 instead of E4B
+  #           handling STT. :5006 is ignored.
+  #
+  #   full  — all three servers. Only makes sense if you have a lot of
+  #           VRAM and want both E4B (5006) and a dedicated 4B (5007).
+  profile: "chat"
+  # Persistent session history — chat tabs survive a server restart.
+  # The SessionStore writes atomically after every message mutation.
+  # Delete this file by hand (or via the GUI's memory-wipe button) if
+  # you want a clean slate.
+  sessions_path: "./data/sessions.json"
+  sessions_max_messages: 20
+
+# === Server ===
+# HTTPS is needed for Firefox mic access when the GUI is opened on a
+# non-localhost device (the browser's getUserMedia requires a secure
+# context). When ssl_enabled is true, Lexy auto-generates a self-signed
+# cert on first startup with a SAN list covering localhost, 127.0.0.1,
+# ::1 and all local LAN IPs detected on this machine.
+#
+# NOTE: Browsers show a "potential security risk" warning on first
+# visit. In Firefox click "Advanced" → "Accept the Risk and Continue",
+# in Chrome click "Advanced" → "Proceed to <host> (unsafe)". You only
+# have to do this once per browser.
+server:
+  host: "0.0.0.0"
+  port: 8765
+  ssl_enabled: true
+  ssl_certfile: "./data/certs/lexy.crt"
+  ssl_keyfile: "./data/certs/lexy.key"
+
+# === Brains (Three-Brain Architecture) ===
+# Port 5005 = Main Brain (26B-A4B MoE on Tesla P40)        → deep reasoning, code, planning
+# Port 5006 = Fast Brain (E4B on RTX 3060 Ti)              → chat, tools, classify
+# Port 5007 = Multi Brain (Gemma 4 4B Multimodal, shared)  → STT + quick text + vision
+#
+# NOTE: The :5007 endpoint is the same llama.cpp server that the voice_gemma4
+# STT plugin talks to. Running the multimodal 4B once gives you BOTH:
+#   (a) audio transcription for the mic input path
+#   (b) a small/fast text brain for trivial questions
+# llama.cpp's /v1/chat/completions endpoint is model-agnostic — the same
+# server handles text and audio requests side by side.
+brains:
+  a4b:
+    model: "gemma-4-26b-a4b-it"
+    endpoint: "http://127.0.0.1:5005/v1"
+    api_key: "sk-lexy-local"
+    # MUSS zur --ctx-size in scripts/start_llm_main.bat passen. Der Server
+    # läuft mit 32768; stand hier 16384 → Context-Budget-Manager hat Prompts
+    # unnötig auf die Hälfte getrimmt. Tesla P40 mit 24 GB VRAM trägt 32k
+    # problemlos (mit swa-full und mlock).
+    context_size: 32768
+    max_tokens: 4096
+    temperature: 0.7
+    top_p: 0.9
+    top_k: 40
+    repeat_penalty: 1.1
+    timeout: 180.0
+    # A4B is the reasoning brain — always think before answering.
+    thinking: true
+    reasoning_budget: 2048
+
+  e4b:
+    model: "gemma-4-e4b-it"
+    endpoint: "http://127.0.0.1:5006/v1"
+    api_key: "sk-lexy-local"
+    context_size: 16384
+    max_tokens: 2048
+    temperature: 0.6
+    top_p: 0.9
+    top_k: 40
+    repeat_penalty: 1.1
+    timeout: 120.0
+    # E4B is the fast chat brain — thinking off by default to keep chat snappy.
+    # Flip to true if you want every turn to go through a <think> pass.
+    thinking: false
+
+  multi:
+    model: "gemma-4-4b-multi-it"
+    endpoint: "http://127.0.0.1:5007/v1"
+    api_key: "sk-lexy-local"
+    context_size: 8192
+    max_tokens: 1024
+    temperature: 0.5
+    top_p: 0.9
+    top_k: 40
+    repeat_penalty: 1.1
+    timeout: 60.0
+    # Multimodal 4B is small and quick; thinking off by default to keep
+    # single-turn replies snappy. Enable if you want chain-of-thought here too.
+    thinking: false
+
+# === Voice ===
+voice:
+  stt_enabled: true
+  tts_enabled: true
+  sample_rate: 24000
+
+  stt:
+    primary: "voice_gemma4"
+    fallback: "voice_canary"
+    # The E4B multimodal server on :5006 handles vision AND audio in
+    # one process — voice_gemma4 plugin points at this endpoint too.
+    # Only override this if you run a separate STT-only server.
+    endpoint: "http://127.0.0.1:5006/v1"
+
+  tts:
+    primary: "voice_cosyvoice"
+    endpoint: "http://172.20.0.245:5500"
+    voice: "referenz_mio"
+    speed: 1.0
+
+# === Memory ===
+memory:
+  chroma_host: "127.0.0.1"
+  chroma_port: 8000
+  collections: ["facts", "solutions", "errors", "context"]
+  recall_limit: 5
+  recall_threshold: 0.3
+  vector_weight: 0.7
+  bm25_weight: 0.3
+  fts_db_path: "./data/memory/fts.db"
+
+# === Embedding ===
+# BGE-M3 = 1024-dim, multilingual, no trust_remote_code.
+# Change to "cuda:0" after installing torch with CUDA support.
+embedding:
+  model: "BAAI/bge-m3"
+  device: "cpu"
+  dimension: 1024
+  cache_size: 512
+  batch_size: 32
+
+# === Plugins ===
+plugins:
+  path: "./plugins"
+  enabled: []      # leer = alle ausser disabled
+  disabled: []
+  hot_reload: false
+
+# === Routing ===
+# Default is A4B — you've got the hardware, use it. Only obvious trivia
+# (greetings, short tool calls) drops to E4B via the complexity score.
+routing:
+  default_brain: "a4b"
+  rules:
+    - pattern: "(code|analysis|planning|complex|creative|research|explain|erkl[aä]r|vergleich)"
+      brain: "a4b"
+  fallback:
+    cloud_enabled: false
+    provider: "google"
+
+# === Channels (Phase 3) ===
+channels:
+  whatsapp:
+    enabled: true
+    bridge_url: "http://127.0.0.1:3000"
+    # Lexy hat eine eigene Handy-Nr: +49 176 211 05176
+    # Die Baileys Bridge läuft unter bridges/whatsapp/
+    # Starten mit: scripts/start_whatsapp_bridge.bat
+  discord:
+    enabled: false
+    token_env: "LEXY_DISCORD_TOKEN"
+  telegram:
+    enabled: false
+    token_env: "LEXY_TELEGRAM_TOKEN"

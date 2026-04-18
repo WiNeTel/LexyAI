@@ -1,0 +1,1047 @@
+<!doctype html>
+<html lang="de" data-theme="cyber-blue">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Lexy AI</title>
+    <link rel="stylesheet" href="/static/style.css" />
+    <link rel="stylesheet" href="/static/holo.css" />
+    <!-- Three.js for 3D Avatar Stage -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r169/three.min.js" defer></script>
+</head>
+<body>
+
+    <!-- ═══ BOOT SEQUENCE OVERLAY ═══════════════════════════════════ -->
+    <div id="boot-overlay">
+        <!-- Phase 1: Start Button -->
+        <div class="boot-phase1">
+            <button class="boot-btn" data-text="INITIALIZE">INITIALIZE</button>
+            <div class="boot-subtitle">Lexy AI Local Intelligence System</div>
+        </div>
+
+        <!-- Phase 2: Logo Transition -->
+        <div class="boot-transition">
+            <div class="boot-logo-large glitch" data-text="LEXY">LEXY</div>
+        </div>
+
+        <!-- Phase 3: System Status -->
+        <div class="boot-status-screen">
+            <div class="boot-status-header">System Initialization</div>
+            <div class="boot-progress"><div class="boot-progress-bar"></div></div>
+            <div class="boot-log"></div>
+        </div>
+    </div>
+
+    <!-- ═══ SCREEN OUTLINE (Activity Indicator) ═════════════════════ -->
+    <div id="screen-outline">
+        <div class="outline-edge outline-edge--top"></div>
+        <div class="outline-edge outline-edge--right"></div>
+        <div class="outline-edge outline-edge--bottom"></div>
+        <div class="outline-edge outline-edge--left"></div>
+        <div class="outline-particle outline-particle--top traveling"></div>
+        <div class="outline-particle outline-particle--right traveling"></div>
+        <div class="outline-particle outline-particle--bottom traveling"></div>
+        <div class="outline-particle outline-particle--left traveling"></div>
+    </div>
+
+    <!-- ═══ VOICE RINGS (Concentric, volume-reactive) ═══════════════ -->
+    <div id="voice-rings-container"></div>
+
+    <!-- ═══ 3D AVATAR STAGE (Three.js) ══════════════════════════════ -->
+    <div id="avatar-stage"></div>
+
+    <!-- ═══ SLEEP CLOCK ═════════════════════════════════════════════ -->
+    <div class="sleep-clock"></div>
+
+    <!-- ═══ MAIN APPLICATION ════════════════════════════════════════ -->
+    <div id="app">
+        <!-- ─── Sidebar ────────────────────────────────────────────── -->
+        <aside id="sidebar">
+            <div class="brand">
+                <div class="logo">L</div>
+                <div class="brand-text">
+                    <div class="brand-name">Lexy AI</div>
+                    <div class="brand-version" id="brand-version">v—</div>
+                </div>
+            </div>
+
+            <!-- ─── Active project switcher ────────────────────────── -->
+            <div class="project-bar">
+                <button id="project-dropdown-btn" class="project-dropdown-btn" title="Switch active project">
+                    <span class="proj-color" id="proj-color"></span>
+                    <span class="proj-icon" id="proj-icon">🏠</span>
+                    <span class="proj-name" id="proj-name">Allgemein</span>
+                    <span class="proj-chevron">▾</span>
+                </button>
+                <div id="project-dropdown" class="project-dropdown" hidden></div>
+            </div>
+
+            <nav id="tabnav">
+                <button class="tab-btn active" data-tab="chat">
+                    <span class="tab-icon">💬</span> Chat
+                </button>
+                <button class="tab-btn" data-tab="dashboard">
+                    <span class="tab-icon">📊</span> Dashboard
+                </button>
+                <button class="tab-btn" data-tab="memory">
+                    <span class="tab-icon">🧠</span> Memory
+                </button>
+                <button class="tab-btn" data-tab="plugins">
+                    <span class="tab-icon">🔌</span> Plugins
+                </button>
+                <button class="tab-btn" data-tab="voice">
+                    <span class="tab-icon">🎙️</span> Voice
+                </button>
+                <button class="tab-btn" data-tab="sessions">
+                    <span class="tab-icon">📜</span> Sessions
+                </button>
+                <button class="tab-btn" data-tab="scheduler">
+                    <span class="tab-icon">⏰</span> Scheduler
+                </button>
+                <button class="tab-btn" data-tab="characters">
+                    <span class="tab-icon">🎭</span> Characters
+                </button>
+                <button class="tab-btn" data-tab="settings">
+                    <span class="tab-icon">⚙️</span> Settings
+                </button>
+            </nav>
+
+            <section class="panel compact">
+                <h3>System</h3>
+                <div class="kv"><span>State</span><strong id="sys-state">—</strong></div>
+                <div class="kv"><span>Session</span><strong id="sys-session">—</strong></div>
+                <div class="kv"><span>WS</span><strong id="sys-ws">…</strong></div>
+            </section>
+
+            <section class="panel compact">
+                <h3>Services</h3>
+                <ul id="services-list" class="service-list"><li class="muted">loading…</li></ul>
+            </section>
+
+            <section class="panel compact">
+                <h3>Signals</h3>
+                <div class="kv"><span>Thinking</span><strong id="sig-thinking">false</strong></div>
+                <div class="kv"><span>Speaking</span><strong id="sig-speaking">false</strong></div>
+            </section>
+
+            <div class="panel footer">
+                <button id="refresh-btn" class="btn">Refresh</button>
+            </div>
+        </aside>
+
+        <!-- ─── Main panels ─────────────────────────────────────────── -->
+        <main id="main">
+            <!-- ─── Chat tab ────────────────────────────────────── -->
+            <section class="tab-panel active" data-tab="chat">
+                <header class="tab-header">
+                    <div class="title">
+                        Chat
+                        <span id="session-pill" class="session-pill" title="Active session — click to copy ID">—</span>
+                    </div>
+                    <div class="controls">
+                        <button id="new-session-btn" class="btn" title="Start a new chat session">🆕 New</button>
+                        <label class="brain-select">
+                            Brain:
+                            <select id="brain">
+                                <option value="auto">auto</option>
+                                <option value="multi">multi (4B, STT+quick)</option>
+                                <option value="e4b">e4b (fast)</option>
+                                <option value="a4b">a4b (main)</option>
+                            </select>
+                        </label>
+                        <button id="mic-btn" class="btn" data-active="false" title="Hold-to-talk (mic)">🎤</button>
+                        <button id="tts-toggle" class="btn" data-active="false">TTS off</button>
+                        <button id="chat-characters-btn" class="btn" title="Charaktere dieser Session verwalten">🎭 Rollen</button>
+                        <button id="clear-chat-btn" class="btn" title="Clear chat window (local only)">Clear</button>
+                    </div>
+                </header>
+
+                <div id="chat-character-bar" class="chat-character-bar" hidden></div>
+
+                <div id="chat-window"></div>
+
+                <div id="voice-visualizer-wrap">
+                    <canvas id="arc-reactor" width="800" height="180"></canvas>
+                </div>
+
+                <footer id="composer">
+                    <textarea id="input" rows="2" placeholder="Schreibe an Lexy… (Shift+Enter = Zeilenumbruch, hold mic button to speak)"></textarea>
+                    <button id="send" class="btn primary">Senden</button>
+                </footer>
+            </section>
+
+            <!-- ─── Dashboard tab ─────────────────────────────────── -->
+            <section class="tab-panel" data-tab="dashboard">
+                <header class="tab-header">
+                    <div class="title">Dashboard</div>
+                    <div class="controls">
+                        <button id="dashboard-edit-btn" class="btn" title="Toggle layout editing">✏️ Edit Layout</button>
+                        <button id="dashboard-refresh-btn" class="btn" title="Refresh all widgets">Refresh</button>
+                    </div>
+                </header>
+
+                <div class="tab-body">
+                    <div id="dashboard-grid" class="dashboard-grid"></div>
+                </div>
+
+                <div id="dashboard-panel-view" class="panel-view" hidden></div>
+            </section>
+
+            <!-- ─── Memory tab ───────────────────────────────────── -->
+            <section class="tab-panel" data-tab="memory">
+                <header class="tab-header">
+                    <div class="title">Memory Browser</div>
+                    <div class="controls">
+                        <label class="brain-select">
+                            Collection:
+                            <select id="memory-collection">
+                                <option value="facts">facts</option>
+                                <option value="solutions">solutions</option>
+                                <option value="errors">errors</option>
+                                <option value="context">context</option>
+                            </select>
+                        </label>
+                        <button id="memory-refresh-btn" class="btn">Refresh</button>
+                        <button id="memory-wipe-collection-btn" class="btn btn-danger" title="Wipe the currently selected collection">Wipe collection</button>
+                        <button id="memory-wipe-all-btn" class="btn btn-danger" title="Wipe ALL memory (ChromaDB + FTS + sessions)">⚠ Wipe all</button>
+                    </div>
+                </header>
+
+                <div class="tab-body">
+                    <div class="memory-search">
+                        <input type="text" id="memory-search-input" placeholder="Semantic + BM25 search…" />
+                        <button id="memory-search-btn" class="btn">Search</button>
+                    </div>
+
+                    <div class="memory-store">
+                        <input type="text" id="memory-store-input" placeholder="Store a new fact…" />
+                        <button id="memory-store-btn" class="btn">Store</button>
+                    </div>
+
+                    <div id="memory-results">
+                        <div class="muted">Click Refresh to browse this collection.</div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- ─── Plugins tab ──────────────────────────────────── -->
+            <section class="tab-panel" data-tab="plugins">
+                <header class="tab-header">
+                    <div class="title">Plugin Manager</div>
+                    <div class="controls">
+                        <button id="plugins-refresh-btn" class="btn">Refresh</button>
+                    </div>
+                </header>
+
+                <div class="tab-body">
+                    <div id="plugins-grid" class="plugin-grid">
+                        <div class="muted">Loading…</div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- ─── Voice tab ────────────────────────────────────── -->
+            <section class="tab-panel" data-tab="voice">
+                <header class="tab-header">
+                    <div class="title">Voice Settings</div>
+                    <div class="controls">
+                        <button id="voice-refresh-btn" class="btn">Refresh</button>
+                    </div>
+                </header>
+
+                <div class="tab-body">
+                    <div class="setting-group">
+                        <h3>Providers</h3>
+                        <div id="voice-providers" class="setting-row">
+                            <div class="muted">loading…</div>
+                        </div>
+                    </div>
+
+                    <div class="setting-group">
+                        <h3>TTS Config (CosyVoice)</h3>
+                        <div class="setting-row">
+                            <label>Speed</label>
+                            <input type="range" id="voice-speed" min="0.5" max="2.0" step="0.05" value="1.0" />
+                            <span id="voice-speed-val" class="mono">1.00</span>
+                        </div>
+                        <div class="setting-row">
+                            <label>Voice</label>
+                            <select id="voice-voice"></select>
+                        </div>
+                        <div class="setting-row">
+                            <label>Narrator mode</label>
+                            <select id="voice-narrator-mode">
+                                <option value="full">full</option>
+                                <option value="emotion_only">emotion_only</option>
+                                <option value="disabled">disabled</option>
+                            </select>
+                        </div>
+                        <div class="setting-row">
+                            <label>Segment pause (ms)</label>
+                            <input type="number" id="voice-segment-pause" min="0" max="500" step="10" value="80" />
+                        </div>
+                        <div class="setting-row">
+                            <label>Default instruct</label>
+                            <input type="text" id="voice-default-instruct" placeholder="(optional) e.g. 'Please speak warmly.'" />
+                        </div>
+                        <div class="setting-row">
+                            <button id="voice-save-btn" class="btn primary">Save</button>
+                            <button id="voice-test-btn" class="btn">Test voice</button>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- ─── Sessions tab ─────────────────────────────────── -->
+            <section class="tab-panel" data-tab="sessions">
+                <header class="tab-header">
+                    <div class="title">Sessions</div>
+                    <div class="controls">
+                        <button id="sessions-refresh-btn" class="btn">Refresh</button>
+                    </div>
+                </header>
+
+                <div class="tab-body">
+                    <div class="session-layout">
+                        <div id="sessions-list">
+                            <div class="muted">loading…</div>
+                        </div>
+                        <div id="sessions-history">
+                            <div class="muted">Select a session to see its history.</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- ─── Scheduler tab ─────────────────────────────────── -->
+            <section class="tab-panel" data-tab="scheduler">
+                <header class="tab-header">
+                    <div class="title">Scheduler</div>
+                    <div class="controls">
+                        <button id="sched-refresh-btn" class="btn">Refresh</button>
+                    </div>
+                </header>
+
+                <div class="tab-body">
+                    <div class="sched-layout">
+                        <div class="sched-list-pane">
+                            <div class="sched-tabs" id="sched-tabs">
+                                <button class="sched-tab active" data-sched-tab="active">Aktiv</button>
+                                <button class="sched-tab" data-sched-tab="recurring">Wiederkehrend</button>
+                                <button class="sched-tab" data-sched-tab="inactive">Pausiert / Fertig</button>
+                            </div>
+                            <div id="sched-list" class="sched-list">
+                                <div class="muted">loading…</div>
+                            </div>
+                        </div>
+
+                        <div class="sched-create-pane">
+                            <h3>Neuer Eintrag</h3>
+                            <div class="sched-form">
+                                <div class="setting-row">
+                                    <label>Modus</label>
+                                    <select id="sched-mode">
+                                        <option value="timer">Timer (in N Min/Sek)</option>
+                                        <option value="reminder">Reminder (HH:MM)</option>
+                                        <option value="recurring">Wiederkehrend</option>
+                                        <option value="proactive_chat">Lexy meldet sich</option>
+                                        <option value="agent_task">Agent-Aufgabe</option>
+                                    </select>
+                                </div>
+                                <div class="setting-row">
+                                    <label>Label</label>
+                                    <input type="text" id="sched-label" placeholder="Kurzbeschreibung" />
+                                </div>
+                                <div id="sched-fields"></div>
+                                <div class="sched-form-actions">
+                                    <button id="sched-create-btn" class="btn primary">+ Erstellen</button>
+                                    <div id="sched-feedback" class="sched-feedback"></div>
+                                </div>
+                                <div class="sched-help muted">
+                                    Pattern-Beispiele: <code>daily 09:00</code>,
+                                    <code>every 30m</code>,
+                                    <code>mo-fr 18:00</code>,
+                                    <code>weekly mo 14:00</code>,
+                                    <code>monthly 1 09:00</code>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- ─── Characters tab ───────────────────────────────── -->
+            <section class="tab-panel" data-tab="characters">
+                <header class="tab-header">
+                    <div class="title">Charaktere</div>
+                    <div class="controls">
+                        <button id="chars-new-btn" class="btn primary">+ Neu</button>
+                        <button id="chars-import-btn" class="btn" title="Silly-Tavern Card importieren">📥 Import</button>
+                        <input type="file" id="chars-import-file" accept=".json,application/json" hidden />
+                        <label class="toggle-label">
+                            <input type="checkbox" id="chars-show-archived" />
+                            <span class="toggle-text">Archivierte zeigen</span>
+                        </label>
+                        <button id="chars-refresh-btn" class="btn">Refresh</button>
+                    </div>
+                </header>
+
+                <div class="tab-body characters-layout">
+                    <div class="characters-list-pane" id="characters-list">
+                        <div class="muted">loading…</div>
+                    </div>
+                    <form class="characters-form" id="characters-form" hidden>
+                        <input type="hidden" id="char-form-id" />
+                        <div class="char-form-header">
+                            <div class="char-form-avatar">
+                                <img id="char-form-avatar-img" alt="" />
+                                <button type="button" class="btn" id="char-form-avatar-btn">🖼 Avatar</button>
+                                <input type="file" id="char-form-avatar-file" accept="image/*" hidden />
+                            </div>
+                            <div class="char-form-title">
+                                <input type="text" id="char-form-name" placeholder="Name" required />
+                                <div class="char-form-meta">
+                                    <label>Farbe
+                                        <input type="color" id="char-form-color" value="#7aa2f7" />
+                                    </label>
+                                    <label>Alter
+                                        <select id="char-form-age">
+                                            <option value="baby">Baby</option>
+                                            <option value="toddler">Kleinkind</option>
+                                            <option value="child">Kind</option>
+                                            <option value="teen">Teen</option>
+                                            <option value="adult" selected>Erwachsen</option>
+                                        </select>
+                                    </label>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="setting-row">
+                            <label>Persona</label>
+                            <textarea id="char-form-persona" rows="5" placeholder="Persönlichkeit, Aussehen, Eigenheiten…"></textarea>
+                        </div>
+                        <div class="setting-row">
+                            <label>Szenario</label>
+                            <textarea id="char-form-scenario" rows="3" placeholder="Wo sind wir, was passiert gerade…"></textarea>
+                        </div>
+                        <div class="setting-row">
+                            <label>Begrüßung</label>
+                            <textarea id="char-form-greeting" rows="2" placeholder="Erste Nachricht des Charakters (optional)"></textarea>
+                        </div>
+                        <div class="setting-row">
+                            <label>Beispiel-Dialog</label>
+                            <textarea id="char-form-example" rows="4" placeholder="Few-shot Anker — wie klingt sie/er typischerweise?"></textarea>
+                        </div>
+                        <div class="setting-row">
+                            <label>Stimme (TTS)
+                                <span class="muted">(leer = Default-Voice)</span>
+                            </label>
+                            <input type="text" id="char-form-voice" placeholder="CosyVoice-Speaker-ID, z.B. 'luna' oder 'referenz_mio'" />
+                        </div>
+                        <div class="setting-row">
+                            <label>Pulse-Pattern
+                                <span class="muted">(leer = keine proaktiven Pulses)</span>
+                            </label>
+                            <input type="text" id="char-form-pulse-pattern" placeholder="z.B. 'every 3h' oder 'daily 07:30'" />
+                        </div>
+                        <div class="setting-row">
+                            <label>Pulse-Text
+                                <span class="muted">(leer = altersabhängiger Default)</span>
+                            </label>
+                            <input type="text" id="char-form-pulse-prompt" placeholder="*schreit laut und sucht Mama*" />
+                        </div>
+                        <div class="setting-row">
+                            <label>Tags</label>
+                            <input type="text" id="char-form-tags" placeholder="rp, family, baby (komma-separiert)" />
+                        </div>
+
+                        <div class="setting-row">
+                            <label>&nbsp;</label>
+                            <div class="characters-form-buttons">
+                                <button type="submit" class="btn primary" id="char-form-save">Speichern</button>
+                                <button type="button" class="btn" id="char-form-reset">Neuer Charakter</button>
+                                <button type="button" class="btn" id="char-form-attach" hidden>An aktive Session</button>
+                                <button type="button" class="btn" id="char-form-detach" hidden>Aus Session entfernen</button>
+                                <button type="button" class="btn" id="char-form-archive" hidden>Archivieren</button>
+                                <button type="button" class="btn" id="char-form-unarchive" hidden>Reaktivieren</button>
+                                <button type="button" class="btn btn-danger" id="char-form-delete" hidden>Löschen</button>
+                            </div>
+                        </div>
+                        <div class="muted characters-form-hint" id="char-form-hint"></div>
+                    </form>
+                </div>
+            </section>
+
+            <!-- ─── Settings tab ─────────────────────────────────── -->
+            <section class="tab-panel" data-tab="settings">
+                <header class="tab-header">
+                    <div class="title">System Settings</div>
+                    <div class="controls">
+                        <button id="settings-refresh-btn" class="btn">Refresh</button>
+                    </div>
+                </header>
+
+                <div class="tab-body">
+                    <div class="setting-group">
+                        <h3>Personality</h3>
+                        <div class="setting-row">
+                            <label>Name</label>
+                            <input type="text" id="persona-name" />
+                        </div>
+                        <div class="setting-row">
+                            <label>User name</label>
+                            <input type="text" id="persona-user-name" />
+                        </div>
+                        <div class="setting-row">
+                            <label>Language</label>
+                            <input type="text" id="persona-language" placeholder="de / en / …" />
+                        </div>
+                        <div class="setting-row">
+                            <label>Thinking</label>
+                            <label class="toggle-label">
+                                <input type="checkbox" id="persona-thinking" />
+                                <span class="toggle-text" id="persona-thinking-label">Off</span>
+                            </label>
+                            <span class="muted">Aktiviert <code>&lt;|think|&gt;</code> Modus — Lexy denkt sichtbar nach bevor sie antwortet.</span>
+                        </div>
+
+                        <div class="setting-row persona-prompt-row">
+                            <label>Identität <span class="muted">(Wer ist Lexy?)</span></label>
+                            <textarea id="persona-identity" rows="10" placeholder="Wer ist Lexy? Ihre Kernidentität…"></textarea>
+                        </div>
+                        <div class="setting-row persona-prompt-row">
+                            <label>Stil <span class="muted">(Wie redet sie?)</span></label>
+                            <textarea id="persona-style" rows="12" placeholder="Sprachstil, Narrator-Aktionen, Humor…"></textarea>
+                        </div>
+                        <div class="setting-row persona-prompt-row">
+                            <label>Regeln <span class="muted">(Was tut sie nicht?)</span></label>
+                            <textarea id="persona-rules" rows="8" placeholder="Verbote, Grenzen, Was vermieden wird…"></textarea>
+                        </div>
+                        <div class="setting-row persona-prompt-hint">
+                            <label>&nbsp;</label>
+                            <span class="muted">Diese 3 Abschnitte sind editierbar. Kontext (Denk-Regeln) und Fähigkeiten (Tools, Delegation) sind geschützt und werden automatisch angehängt.</span>
+                        </div>
+                        <div class="setting-row">
+                            <label>&nbsp;</label>
+                            <button id="persona-save-btn" class="btn primary">Save (live)</button>
+                            <button id="persona-reset-btn" class="btn">Reset to default</button>
+                        </div>
+                    </div>
+
+                    <div class="setting-group">
+                        <h3>VRAM Profile</h3>
+                        <div class="setting-row">
+                            <label>Profile</label>
+                            <select id="system-profile">
+                                <option value="chat">chat (E4B + A4B, no STT)</option>
+                                <option value="voice">voice (MULTI + A4B, STT enabled)</option>
+                                <option value="full">full (all three)</option>
+                            </select>
+                            <button id="profile-save-btn" class="btn primary">Save (needs restart)</button>
+                        </div>
+                        <div class="kv"><span>Active brains</span><strong id="profile-active-brains" class="mono">—</strong></div>
+                    </div>
+
+                    <div class="setting-group">
+                        <h3>Routing</h3>
+                        <div class="setting-row">
+                            <label>Default brain</label>
+                            <select id="routing-default-brain">
+                                <option value="a4b">a4b (deep)</option>
+                                <option value="e4b">e4b (fast)</option>
+                                <option value="multi">multi (4B)</option>
+                            </select>
+                            <button id="routing-save-btn" class="btn primary">Save</button>
+                        </div>
+                    </div>
+
+                    <div class="setting-group">
+                        <h3>Brains</h3>
+                        <div id="brains-grid" class="brains-grid">
+                            <div class="muted">loading…</div>
+                        </div>
+                    </div>
+
+                    <div class="setting-group">
+                        <h3>Memory</h3>
+                        <div id="memory-info" class="setting-row">
+                            <div class="muted">loading…</div>
+                        </div>
+                    </div>
+
+                    <div class="setting-group">
+                        <h3>Embedding</h3>
+                        <div id="embedding-info" class="setting-row">
+                            <div class="muted">loading…</div>
+                        </div>
+                    </div>
+
+                    <div class="setting-group">
+                        <h3>Color Theme</h3>
+                        <div class="setting-row">
+                            <label>Accent</label>
+                            <div class="theme-grid">
+                                <div class="theme-swatch" data-theme="cyber-blue" title="Cyber Blue"></div>
+                                <div class="theme-swatch" data-theme="midnight-purple" title="Midnight Purple"></div>
+                                <div class="theme-swatch" data-theme="neon-green" title="Neon Green"></div>
+                                <div class="theme-swatch" data-theme="ember-orange" title="Ember Orange"></div>
+                                <div class="theme-swatch" data-theme="kids-pink" title="Kids Pink"></div>
+                                <div class="theme-swatch" data-theme="arctic-white" title="Arctic White"></div>
+                            </div>
+                        </div>
+                        <div class="setting-row">
+                            <label>3D Avatar</label>
+                            <button id="avatar-toggle-btn" class="btn">Show / Hide</button>
+                            <span class="muted">Holographic 3D avatar (Three.js). Future: VRM model import.</span>
+                        </div>
+                        <div class="setting-row">
+                            <label>Sound FX</label>
+                            <button id="sound-toggle-btn" class="btn">Toggle sounds</button>
+                            <span id="sound-status" class="mono">on</span>
+                        </div>
+                    </div>
+
+                    <div class="setting-group">
+                        <h3>Autonomous Thinking</h3>
+                        <div class="setting-row">
+                            <label>Status</label>
+                            <span id="thinking-status" class="mono">loading…</span>
+                            <button id="thinking-toggle-btn" class="btn primary">Toggle (live)</button>
+                        </div>
+                        <div class="setting-row">
+                            <label>Trigger now</label>
+                            <select id="thinking-trigger-mode">
+                                <option value="daydream">daydream</option>
+                                <option value="reflect">reflect</option>
+                                <option value="learn">learn</option>
+                                <option value="worry">worry</option>
+                            </select>
+                            <button id="thinking-trigger-btn" class="btn">Fire one thought</button>
+                        </div>
+
+                        <!-- Live-editable config (Phase 8 — Settings-Editor) -->
+                        <div class="setting-row">
+                            <label>Interval (seconds)
+                                <span class="muted">Zeit zwischen zwei Gedanken</span>
+                            </label>
+                            <input type="range" id="thinking-interval" min="60" max="1800" step="30" />
+                            <span id="thinking-interval-val" class="mono">—</span>
+                        </div>
+                        <div class="setting-row">
+                            <label>Min idle (seconds)
+                                <span class="muted">Wartezeit nach letzter Aktivität</span>
+                            </label>
+                            <input type="range" id="thinking-min-idle" min="30" max="600" step="15" />
+                            <span id="thinking-min-idle-val" class="mono">—</span>
+                        </div>
+                        <div class="setting-row">
+                            <label>Max thoughts/hour</label>
+                            <input type="number" id="thinking-max-per-hour" min="1" max="30" step="1" />
+                        </div>
+                        <div class="setting-row">
+                            <label>Quiet hours</label>
+                            <input type="time" id="thinking-quiet-from" />
+                            <span class="muted">bis</span>
+                            <input type="time" id="thinking-quiet-to" />
+                        </div>
+                        <div class="setting-row">
+                            <label>Modes</label>
+                            <div id="thinking-modes" class="checkbox-grid">
+                                <label><input type="checkbox" value="daydream" /> daydream</label>
+                                <label><input type="checkbox" value="reflect" /> reflect</label>
+                                <label><input type="checkbox" value="learn" /> learn</label>
+                                <label><input type="checkbox" value="worry" /> worry</label>
+                            </div>
+                        </div>
+                        <div class="setting-row">
+                            <label>Tool use
+                                <span class="muted">Darf Lexy beim Denken Tools benutzen?</span>
+                            </label>
+                            <label class="inline"><input type="checkbox" id="thinking-tools-enabled" /> enabled</label>
+                            <span class="muted">·</span>
+                            <label class="inline">max iterations
+                                <input type="number" id="thinking-tools-max-iter" min="1" max="10" step="1" class="inline-num" />
+                            </label>
+                        </div>
+                        <div class="setting-row">
+                            <label>Tool whitelist</label>
+                            <input type="text" id="thinking-tools-whitelist" placeholder="memory_store, memory_recall, set_reminder, …" />
+                            <span class="muted">komma-getrennt</span>
+                        </div>
+                        <div class="setting-row">
+                            <label>&nbsp;</label>
+                            <button id="thinking-save-btn" class="btn primary">Save (live)</button>
+                            <button id="thinking-reset-btn" class="btn">Zurücksetzen</button>
+                            <span id="thinking-save-hint" class="muted"></span>
+                        </div>
+                    </div>
+
+                    <div class="setting-group">
+                        <h3>Scheduler</h3>
+                        <div class="setting-row">
+                            <label>Check interval (seconds)
+                                <span class="muted">Wie oft wird nach fälligen Timern gesucht</span>
+                            </label>
+                            <input type="number" id="scheduler-check-interval" min="1" max="60" step="0.5" />
+                        </div>
+                        <div class="setting-row">
+                            <label>Max active timers</label>
+                            <input type="number" id="scheduler-max-active" min="10" max="500" step="10" />
+                        </div>
+                        <div class="setting-row">
+                            <label>Impulse generation
+                                <span class="muted">Zufällige Impulse während wacher Stunden</span>
+                            </label>
+                            <label class="inline"><input type="checkbox" id="scheduler-impulses-enabled" /> enabled</label>
+                        </div>
+                        <div class="setting-row">
+                            <label>Impulse quiet hours</label>
+                            <input type="number" id="scheduler-impulse-min" min="0" max="23" step="1" />
+                            <span class="muted">bis</span>
+                            <input type="number" id="scheduler-impulse-max" min="0" max="23" step="1" />
+                        </div>
+                        <div class="setting-row">
+                            <label>&nbsp;</label>
+                            <button id="scheduler-save-btn" class="btn primary">Save (live)</button>
+                            <button id="scheduler-reset-btn" class="btn">Zurücksetzen</button>
+                            <span id="scheduler-save-hint" class="muted"></span>
+                        </div>
+                    </div>
+
+                    <div class="setting-group">
+                        <h3>Channels</h3>
+                        <div id="channels-grid" class="channels-grid">
+                            <div class="channel-card" data-channel="whatsapp">
+                                <div class="channel-head">
+                                    <strong>WhatsApp</strong>
+                                    <span class="channel-status" id="channel-whatsapp-status">—</span>
+                                </div>
+                                <div class="channel-row">
+                                    <label>Phone</label>
+                                    <span class="mono" style="font-size:11px; color:var(--accent)">+49 176 211 05176</span>
+                                </div>
+                                <div class="channel-row">
+                                    <label>Bridge URL</label>
+                                    <input type="text" id="channel-whatsapp-bridge" placeholder="http://127.0.0.1:3000" />
+                                </div>
+                                <div class="channel-row">
+                                    <label>API key</label>
+                                    <input type="text" id="channel-whatsapp-key" placeholder="lexy-secret" />
+                                </div>
+                                <div class="channel-row">
+                                    <label>Allowed contacts</label>
+                                    <input type="text" id="channel-whatsapp-contacts" placeholder="4915112345678@s.whatsapp.net, ..." />
+                                </div>
+                                <div class="channel-row">
+                                    <label>&nbsp;</label>
+                                    <span class="muted">Leer = alle. Format: <code>Landesvorwahl+Nr@s.whatsapp.net</code> (komma-getrennt)</span>
+                                </div>
+                                <div class="channel-row">
+                                    <label>&nbsp;</label>
+                                    <button class="btn primary" data-channel-save="whatsapp">Save (restart)</button>
+                                </div>
+                                <div class="channel-row">
+                                    <label>&nbsp;</label>
+                                    <span class="muted">Bridge starten: <code>scripts\start_whatsapp_bridge.bat</code> — QR-Code mit Lexys Handy scannen.</span>
+                                </div>
+                            </div>
+
+                            <div class="channel-card" data-channel="discord">
+                                <div class="channel-head">
+                                    <strong>Discord</strong>
+                                    <span class="channel-status" id="channel-discord-status">—</span>
+                                </div>
+                                <div class="channel-row">
+                                    <label>Token env var</label>
+                                    <input type="text" id="channel-discord-token-env" placeholder="LEXY_DISCORD_TOKEN" />
+                                </div>
+                                <div class="channel-row">
+                                    <label>Command prefix</label>
+                                    <input type="text" id="channel-discord-prefix" placeholder="!lexy" />
+                                </div>
+                                <div class="channel-row">
+                                    <label>&nbsp;</label>
+                                    <button class="btn primary" data-channel-save="discord">Save (restart)</button>
+                                </div>
+                                <div class="channel-row">
+                                    <label>&nbsp;</label>
+                                    <span class="muted">Secret bleibt in der <code>.env</code>, nie auf Disk. Setze <code>LEXY_DISCORD_TOKEN=…</code> vor dem Start.</span>
+                                </div>
+                            </div>
+
+                            <div class="channel-card" data-channel="telegram">
+                                <div class="channel-head">
+                                    <strong>Telegram</strong>
+                                    <span class="channel-status" id="channel-telegram-status">—</span>
+                                </div>
+                                <div class="channel-row">
+                                    <label>Token env var</label>
+                                    <input type="text" id="channel-telegram-token-env" placeholder="LEXY_TELEGRAM_TOKEN" />
+                                </div>
+                                <div class="channel-row">
+                                    <label>Allowed users (csv)</label>
+                                    <input type="text" id="channel-telegram-users" placeholder="123456789,987654321" />
+                                </div>
+                                <div class="channel-row">
+                                    <label>&nbsp;</label>
+                                    <button class="btn primary" data-channel-save="telegram">Save (restart)</button>
+                                </div>
+                                <div class="channel-row">
+                                    <label>&nbsp;</label>
+                                    <span class="muted">Secret bleibt in der <code>.env</code>. Setze <code>LEXY_TELEGRAM_TOKEN=…</code> vor dem Start.</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <div id="toast-container"></div>
+
+    <!-- ─── Memory wipe confirm modal ────────────────────────────── -->
+    <div id="memory-wipe-modal" class="modal-wrap" hidden>
+        <div class="modal">
+            <header class="modal-header">
+                <h3>⚠ Wipe all memory</h3>
+                <button class="modal-close" id="memory-wipe-close">×</button>
+            </header>
+            <div class="modal-body">
+                <p class="wipe-warning">
+                    Diese Aktion ist <strong>destruktiv und irreversibel</strong>.
+                    Lexy vergisst alles was du unten ankreuzt.
+                </p>
+                <div class="wipe-options">
+                    <label class="wipe-option">
+                        <input type="checkbox" id="wipe-opt-collections" checked />
+                        <div>
+                            <strong>Vector Memory</strong>
+                            <div class="muted">
+                                Alle ChromaDB-Collections (facts, solutions, errors, context) +
+                                der FTS5 BM25-Index werden gedroppt und leer neu angelegt.
+                            </div>
+                        </div>
+                    </label>
+                    <label class="wipe-option">
+                        <input type="checkbox" id="wipe-opt-sessions" checked />
+                        <div>
+                            <strong>Conversation History</strong>
+                            <div class="muted">
+                                Alle Session-Histories (die letzten 20 Messages pro
+                                Session) werden geleert. Live-Chats werden nicht abgebrochen.
+                            </div>
+                        </div>
+                    </label>
+                    <label class="wipe-option">
+                        <input type="checkbox" id="wipe-opt-plugin-data" />
+                        <div>
+                            <strong>Plugin Data</strong>
+                            <div class="muted">
+                                Löscht <code>data/plugins/</code> komplett (Scheduler-Timer,
+                                autonome Gedanken, Plugin-eigene SQLite-DBs). <strong>Lexy
+                                muss danach neu gestartet werden</strong> weil Plugins
+                                offene DB-Handles halten.
+                            </div>
+                        </div>
+                    </label>
+                </div>
+                <p class="wipe-confirm-prompt">
+                    Tippe <code>LÖSCHEN</code> zur Bestätigung:
+                </p>
+                <input type="text" id="wipe-confirm-input" placeholder="LÖSCHEN" autocomplete="off" />
+            </div>
+            <footer class="modal-footer">
+                <button class="btn" id="memory-wipe-cancel">Abbrechen</button>
+                <button class="btn btn-danger" id="memory-wipe-confirm" disabled>Jetzt löschen</button>
+            </footer>
+        </div>
+    </div>
+
+    <!-- ─── Projects management modal ────────────────────────────── -->
+    <div id="projects-modal" class="modal-wrap" hidden>
+        <div class="modal projects-modal">
+            <header class="modal-header">
+                <h3>Projekte verwalten</h3>
+                <button class="modal-close" id="projects-modal-close">×</button>
+            </header>
+            <div class="modal-body">
+                <div class="projects-modal-cols">
+                    <div class="projects-modal-list" id="projects-modal-list">
+                        <div class="muted">loading…</div>
+                    </div>
+                    <form class="projects-modal-form" id="projects-modal-form">
+                        <div class="setting-row">
+                            <label>Name</label>
+                            <input type="text" id="proj-form-name" required />
+                        </div>
+                        <div class="setting-row">
+                            <label>Beschreibung</label>
+                            <textarea id="proj-form-description" rows="2" placeholder="Kurze Beschreibung (optional)"></textarea>
+                        </div>
+                        <div class="setting-row">
+                            <label>Farbe</label>
+                            <input type="color" id="proj-form-color" value="#7aa2f7" />
+                        </div>
+                        <div class="setting-row">
+                            <label>Icon</label>
+                            <input type="text" id="proj-form-icon" maxlength="4" placeholder="🎮" />
+                        </div>
+                        <div class="setting-row">
+                            <label>Memory isoliert</label>
+                            <label class="toggle-label">
+                                <input type="checkbox" id="proj-form-scoped" checked />
+                                <span class="toggle-text">Nur Erinnerungen dieses Projekts</span>
+                            </label>
+                        </div>
+                        <div class="setting-row persona-prompt-row">
+                            <label>Persona-Override <span class="muted">(wird an Lexys Basis-Persona angehängt)</span></label>
+                            <textarea id="proj-form-override" rows="5" placeholder="Zusätzliche Persona-Hinweise für dieses Projekt (optional)…"></textarea>
+                        </div>
+                        <div class="setting-row">
+                            <label>&nbsp;</label>
+                            <div class="projects-form-buttons">
+                                <button type="submit" class="btn primary" id="proj-form-save">Speichern</button>
+                                <button type="button" class="btn" id="proj-form-reset">Neues Projekt</button>
+                                <button type="button" class="btn" id="proj-form-archive" hidden>Archivieren</button>
+                                <button type="button" class="btn" id="proj-form-unarchive" hidden>Wiederherstellen</button>
+                                <button type="button" class="btn btn-danger" id="proj-form-delete" hidden>Löschen</button>
+                            </div>
+                        </div>
+                        <div id="proj-form-hint" class="muted projects-form-hint"></div>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ─── Session → Project move menu ──────────────────────────── -->
+    <div id="session-context-menu" class="session-context-menu" hidden>
+        <div class="scm-header muted">In Projekt verschieben…</div>
+        <div id="scm-list"></div>
+    </div>
+
+    <!-- ─── Character session modal (chat-toolbar popout) ────────── -->
+    <div id="character-session-modal" class="modal-wrap" hidden>
+        <div class="modal character-session-modal">
+            <header class="modal-header">
+                <h3>🎭 Charaktere dieser Session</h3>
+                <button class="modal-close" id="char-session-close">×</button>
+            </header>
+            <div class="modal-body">
+                <div class="char-session-mode-row">
+                    <label><strong>Character-Mode</strong></label>
+                    <select id="char-session-mode-select">
+                        <option value="0">Aus — nur Lexy antwortet</option>
+                        <option value="1">Nur Charaktere — Lexy ist still</option>
+                        <option value="2">Hybrid — Lexy + Charaktere zusammen</option>
+                    </select>
+                    <div class="muted" id="char-session-mode-hint">
+                        Lexy antwortet normal, danach reagieren die Charaktere.
+                    </div>
+                </div>
+                <div class="char-session-sim-row">
+                    <label><strong>Autonome Simulation</strong></label>
+                    <div class="sim-controls">
+                        <button id="char-session-sim-toggle" class="btn primary">▶ Start</button>
+                        <label class="inline">
+                            alle
+                            <input type="number" id="char-session-sim-interval"
+                                   min="1" max="15" value="3" class="inline-num" />
+                            Minuten
+                        </label>
+                        <span id="char-session-sim-status" class="muted">gestoppt</span>
+                    </div>
+                    <div class="muted">
+                        Jede N Minuten spricht Lexy oder ein Charakter automatisch —
+                        auch ohne deine Nachricht. Die Szene läuft lebendig weiter.
+                    </div>
+                </div>
+                <div class="char-session-scene-row">
+                    <label>Szene</label>
+                    <textarea id="char-session-scene" rows="2" placeholder="Wo sind wir, wie ist die Stimmung?"></textarea>
+                </div>
+                <div class="char-session-attached">
+                    <h4>Angehängt in dieser Session</h4>
+                    <div id="char-session-attached-list"><div class="muted">—</div></div>
+                </div>
+                <div class="char-session-available">
+                    <h4>Verfügbare Charaktere (anheften)</h4>
+                    <div id="char-session-available-list"><div class="muted">—</div></div>
+                </div>
+            </div>
+            <footer class="modal-footer">
+                <button class="btn" id="char-session-done">Fertig</button>
+            </footer>
+        </div>
+    </div>
+
+    <!-- ─── Plugin config modal ──────────────────────────────────── -->
+    <div id="plugin-config-modal" class="modal-wrap" hidden>
+        <div class="modal">
+            <header class="modal-header">
+                <h3 id="plugin-config-title">Plugin Config</h3>
+                <button class="modal-close" id="plugin-config-close">×</button>
+            </header>
+            <div class="modal-body">
+                <div class="muted" id="plugin-config-desc"></div>
+                <form id="plugin-config-form"></form>
+            </div>
+            <footer class="modal-footer">
+                <button class="btn" id="plugin-config-cancel">Cancel</button>
+                <button class="btn primary" id="plugin-config-save">Save</button>
+            </footer>
+        </div>
+    </div>
+
+    <template id="msg-template">
+        <div class="msg">
+            <div class="role"></div>
+            <div class="bubble"></div>
+        </div>
+    </template>
+
+    <template id="brain-row-template">
+        <div class="brain-card">
+            <div class="brain-head">
+                <strong class="brain-name"></strong>
+                <span class="brain-model mono"></span>
+            </div>
+            <div class="brain-body">
+                <div class="setting-row">
+                    <label>Endpoint</label>
+                    <span class="brain-endpoint mono"></span>
+                </div>
+                <div class="setting-row">
+                    <label>Temperature</label>
+                    <input type="number" class="brain-temp" min="0" max="2" step="0.05" />
+                </div>
+                <div class="setting-row">
+                    <label>Top p</label>
+                    <input type="number" class="brain-top-p" min="0" max="1" step="0.05" />
+                </div>
+                <div class="setting-row">
+                    <label>Max tokens</label>
+                    <input type="number" class="brain-max-tokens" min="64" max="8192" step="64" />
+                </div>
+                <div class="setting-row">
+                    <label>Thinking</label>
+                    <input type="checkbox" class="brain-thinking" />
+                </div>
+                <div class="setting-row">
+                    <label>Reasoning budget</label>
+                    <input type="number" class="brain-reasoning-budget" min="0" max="8192" step="128" />
+                </div>
+                <div class="setting-row">
+                    <button class="btn primary brain-save-btn">Save</button>
+                </div>
+            </div>
+        </div>
+    </template>
+
+    <!-- HoloMat layer loads BEFORE app.js so window.LexyHolo is available -->
+    <script src="/static/holo.js"></script>
+    <script src="/static/app.js"></script>
+</body>
+</html>

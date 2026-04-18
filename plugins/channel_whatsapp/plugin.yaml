@@ -1,0 +1,16 @@
+name: channel_whatsapp
+version: 1.0.0
+description: "WhatsApp channel via Baileys Node.js bridge"
+entry: whatsapp_plugin.WhatsAppChannelPlugin
+requires: []
+optional: []
+capabilities: [channel]
+
+config_defaults:
+  bridge_url: "http://127.0.0.1:3000"
+  api_key: "lexy-secret"
+  inbound_path: "/inbound"
+  outbound_path: "/send"
+  poll_interval: 2.0
+  max_message_length: 4096
+  allowed_contacts: []

@@ -1,0 +1,14 @@
+name: channel_discord
+version: 1.0.0
+description: "Discord bot channel via discord.py"
+entry: discord_plugin.DiscordChannelPlugin
+requires: []
+optional: []
+capabilities: [channel]
+
+config_defaults:
+  token_env: "LEXY_DISCORD_TOKEN"
+  allowed_guilds: []
+  allowed_channels: []
+  command_prefix: "!lexy"
+  max_message_length: 2000

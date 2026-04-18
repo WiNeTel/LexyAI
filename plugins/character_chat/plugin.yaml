@@ -1,0 +1,66 @@
+name: character_chat
+version: 0.1.0
+description: "Silly-Tavern-lite: persistent RP characters with sequential group dynamics, isolated memory and autonomous pulses."
+entry: character_chat_plugin.CharacterChatPlugin
+requires: []
+optional: [scheduler, dashboard]
+capabilities: [tool, event, ws_handler]
+
+config_defaults:
+  # Which brain runs the character turns. e4b = fast (Gemma4 12B, port 5006),
+  # a4b = deep reasoning (Gemma4 27B, port 5005). Characters benefit from the
+  # deeper model because each turn carries a distinct persona + isolated
+  # memory — persönlichkeitsreiche Antworten sind die halbe Miete. Lexys
+  # eigene Turns laufen weiterhin über den Agent-Router auf ihrem Standardbrain.
+  default_brain: "a4b"
+  # Per-character response budget. Gross genug für 2-3 narrative Absätze
+  # inklusive *Handlungen in Sternen* und Dialog — RP braucht Platz für
+  # Szene + Gefühl + Dialog, 320 cuttet regelmäßig mitten im Satz.
+  # Bei Gemma4 27B (a4b) mit 32k Context sind 1536 komfortabel im Rahmen.
+  max_tokens_per_turn: 1536
+  # Temperature per turn — RP wants a bit of warmth, not clinical prose.
+  temperature: 0.8
+  # Sequential-turn budget: how many characters speak in one round after a user
+  # message. If the LLM-picked speaker list is longer, the overflow is dropped
+  # (prevents 10-character echo chambers).
+  max_speakers_per_round: 4
+  # How a round's speaker order is chosen. "autonomous" = LLM picks who reacts
+  # and in what order based on context; "round_robin" = deterministic fallback.
+  turn_selection: "autonomous"
+  # Proactive pulses: characters can ping the session even without a user
+  # message ("pregnant Luna kicks", "hungry baby cries"). Option B from the
+  # design review — intensive but the point of the feature.
+  proactive_pulses_enabled: true
+  # Lexy's own auto-react to a proactive pulse. The user can still stay silent,
+  # but Lexy reflexively answers "Luna, alles gut?" when her baby cries.
+  lexy_auto_reacts_to_pulses: true
+  # Avatars live under data/plugins/character_chat/avatars/.
+  avatar_max_kb: 512
+  # Memory scoping — strict isolation per character (Decision #4). Each
+  # character only sees their own private memory namespace
+  # `character:<id>`. Shared events are stored from each perspective
+  # separately, not in a shared collection.
+  memory_strict_isolation: true
+  # Minimum gap (seconds) between pulse-triggered rounds PER SESSION.
+  # With 4 babies each on their own timer, pulses cascade without this.
+  # 600 = one pulse-round every 10 minutes max; other pulses are debounced.
+  pulse_cooldown_seconds: 600
+  # Autonomous simulation: default interval for new sim timers (minutes).
+  # Range 1-15; the frontend lets the user override per session.
+  simulation_default_interval_minutes: 3
+  # Probability (0.0-1.0) that Lexy speaks on a given sim tick. Remaining
+  # probability goes to "one character speaks". 0.3 = Lexy takes ~30% of
+  # ticks, characters share the other ~70%.
+  lexy_turn_probability: 0.3
+  # Context-window management. The plugin builds potentially large prompts
+  # (persona + scenario + example dialog + history + memory + previous
+  # turns) which could exceed the brain's context window for heavy
+  # Silly-Tavern imports. The orchestrator trims progressively to fit.
+  #
+  # 0 = read the live value from the active brain's routing.yaml
+  # (recommended — survives brain swaps and routing edits automatically).
+  # Positive = force this budget (useful for tests or debugging).
+  context_size_override: 0
+  # Safety margin (tokens) subtracted from the context window before
+  # fitting, to reserve room for tokenizer overhead + prompt framing.
+  context_safety_margin: 256

@@ -1,0 +1,19 @@
+name: voice_gemma4
+version: 2.0.0
+description: "Gemma 4 multimodal STT via llama.cpp OpenAI endpoint (shared with the E4B brain on :5006 by default)"
+entry: gemma4_stt.Gemma4STTPlugin
+requires: []
+optional: []
+capabilities: [voice_stt]
+
+config_defaults:
+  # Point at the same llama.cpp instance that serves the E4B brain —
+  # when E4B is started with --mmproj (vision + audio) it answers
+  # /v1/audio/transcriptions and /v1/chat/completions from a single
+  # server, so one process does text chat + vision + STT.
+  endpoint: "http://127.0.0.1:5006/v1"
+  api_key: "sk-lexy-local"
+  model: "gemma-4-e4b-it"
+  language: "de"
+  temperature: 0.0
+  timeout: 60.0

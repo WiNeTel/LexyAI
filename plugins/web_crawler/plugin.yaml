@@ -1,0 +1,13 @@
+name: web_crawler
+version: 1.0.0
+description: "Web search via local SearXNG + page content fetching"
+entry: crawler_plugin.WebCrawlerPlugin
+requires: []
+optional: []
+capabilities: [tool]
+
+config_defaults:
+  searxng_url: "http://127.0.0.1:7899"
+  max_results: 5
+  fetch_timeout: 15.0
+  max_content_length: 4000

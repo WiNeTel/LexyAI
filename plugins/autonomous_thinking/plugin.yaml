@@ -1,0 +1,30 @@
+name: autonomous_thinking
+version: 2.1.0
+description: "Background thinking engine: Daydream, Worry, Learn, Reflect modes — now with whitelisted tool-use."
+entry: thinking_plugin.AutonomousThinkingPlugin
+requires: []
+optional: [scheduler]
+capabilities: [event, ws_handler]
+
+config_defaults:
+  enabled: false
+  # Which LLM brain runs thoughts. "e4b" = fast, "a4b" = deep.
+  default_brain: "e4b"
+  mode_interval_seconds: 600
+  modes: ["daydream", "reflect", "learn", "worry"]
+  quiet_hours: ["23:00", "07:00"]
+  min_idle_seconds: 120
+  max_thoughts_per_hour: 4
+
+  # Phase 7 — tool-capable thinking
+  tools_enabled: true
+  tools_max_iterations: 3
+  tools_whitelist:
+    - memory_store
+    - memory_recall
+    - set_reminder
+    - set_timer
+    - set_recurring
+    - schedule_proactive_reminder
+    - web_search
+    - web_fetch

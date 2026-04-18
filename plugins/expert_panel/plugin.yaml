@@ -1,0 +1,26 @@
+name: expert_panel
+version: 1.0.0
+description: "Multi-agent collaborative discussion with 3-5 expert perspectives"
+entry: panel_plugin.ExpertPanelPlugin
+requires: []
+optional: [dashboard]
+capabilities: [tool, event, ws_handler]
+
+config_defaults:
+  default_roles:
+    - analyst
+    - critic
+    - creative
+    - pragmatist
+    - synthesizer
+  default_rounds: 3
+  max_rounds: 5
+  default_brain: "e4b"
+  convergence_threshold: 3
+  max_tokens_per_response: 400
+  temperature_overrides:
+    analyst: 0.4
+    critic: 0.5
+    creative: 0.8
+    pragmatist: 0.4
+    synthesizer: 0.5

@@ -1,0 +1,12 @@
+name: voice_canary
+version: 1.0.0
+description: "NVIDIA Canary-1B-Flash STT fallback (local)"
+entry: canary_plugin.CanarySTTPlugin
+requires: []
+optional: []
+capabilities: [voice_stt]
+
+config_defaults:
+  model: "nvidia/canary-1b-flash"
+  device: "cuda:0"
+  language: "de"

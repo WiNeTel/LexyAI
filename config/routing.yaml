@@ -1,0 +1,41 @@
+# Lexy AI – LLM Routing Regeln
+# Two-Brain Architecture: E4B (fast) ↔ A4B (deep)
+
+routing:
+  default_brain: "e4b"
+
+  # Pattern-Matches gegen Klassifikations-Output (z.B. "code", "simple_chat")
+  rules:
+    - pattern: "simple_chat|greeting|timer|weather|classify"
+      brain: "e4b"
+      max_tokens: 1024
+    # Tool-calls need more headroom: multi-call chains (e.g. 4× spawn_character)
+    # produce long results that eat into context. 1024 was causing premature
+    # truncation after the first iteration.
+    - pattern: "tool_call"
+      brain: "e4b"
+      max_tokens: 2048
+    - pattern: "code|analysis|planning|complex|creative|research"
+      brain: "a4b"
+      max_tokens: 4096
+    - pattern: "summarize|extract_facts|memory_query"
+      brain: "e4b"
+      max_tokens: 1024
+
+  brains:
+    a4b:
+      model: "gemma-4-26b-a4b-it"
+      endpoint: "http://127.0.0.1:5005/v1"
+      gpu: "p40"
+      context_size: 16384
+      temperature: 0.7
+    e4b:
+      model: "gemma-4-e4b-it"
+      endpoint: "http://127.0.0.1:5006/v1"
+      gpu: "rtx3060ti"
+      context_size: 16384
+      temperature: 0.6
+
+  fallback:
+    cloud_enabled: false
+    provider: "google"
