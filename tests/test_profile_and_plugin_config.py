@@ -169,12 +169,20 @@ def test_patch_plugin_config_unknown_404(lexy_client: TestClient) -> None:
 
 
 def test_get_plugin_status_for_autonomous_thinking(lexy_client: TestClient) -> None:
-    """autonomous_thinking exposes ``get_status()`` → UI-friendly snapshot."""
+    """autonomous_thinking exposes ``get_status()`` → UI-friendly snapshot.
+
+    Phase 9.10 swapped the route schema: the old route returned
+    ``{name, available, ...}``; the new one merges manifest data and
+    plugin status, returning ``{name, loaded, enabled, version,
+    description, ...custom}``. So we check ``loaded``/``enabled``
+    instead of the deprecated ``available`` flag.
+    """
     resp = lexy_client.get("/api/v1/plugins/autonomous_thinking/status")
     assert resp.status_code == 200
     data = resp.json()
     assert data["name"] == "autonomous_thinking"
-    assert data["available"] is True
+    assert data.get("loaded") is True
+    assert data.get("enabled") is True
     # Core observability fields the dashboard reads.
     for key in (
         "active",
@@ -196,14 +204,18 @@ def test_get_plugin_status_for_autonomous_thinking(lexy_client: TestClient) -> N
 def test_get_plugin_status_for_plugin_without_hook(
     lexy_client: TestClient,
 ) -> None:
-    """Plugins that don't expose ``get_status()`` get a clean
-    ``available: False`` response, never a 500."""
+    """Plugins that don't expose ``get_status()`` still get a clean
+    response — never a 500. Phase 9.10 unified the schema, so the
+    response now always carries ``{name, loaded, enabled, ...}``;
+    plugins without ``get_status`` simply don't add custom fields."""
     # weather doesn't implement get_status.
     resp = lexy_client.get("/api/v1/plugins/weather/status")
     assert resp.status_code == 200
     data = resp.json()
     assert data["name"] == "weather"
-    assert data["available"] is False
+    # No ``last_error`` / ``active`` / etc. (those are custom fields
+    # plugins opt into via get_status). loaded+enabled always present.
+    assert "loaded" in data and "enabled" in data
 
 
 def test_get_plugin_status_unknown_404(lexy_client: TestClient) -> None:

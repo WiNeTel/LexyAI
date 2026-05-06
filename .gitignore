@@ -18,7 +18,22 @@ venv/
 *.swp
 *.swo
 
-# === Lexy-specific: Runtime data (sessions, memory, chroma-db, logs) ===
+# === Lexy-specific: Runtime data (sessions, memory, plugin DBs, logs) ===
+#
+# ``data/`` ist der Catch-all für alle Runtime-Daten. Konkret abgedeckt:
+#   * data/sessions.json (+ .bak)         — Conversation-History (Chat + RP)
+#   * data/projects.json                   — Projekt-Definitionen
+#   * data/memory/                         — FTS-Indices, Memory-State
+#   * data/uploads/                        — User-Uploads (Bilder, PDFs, Code, Audio)
+#   * data/plugins/character_chat/         — Charaktere + Avatare + Lorebooks + Lore-Entries
+#   * data/plugins/scheduler/              — Timer / Pulses / Wecker
+#   * data/plugins/coder/                  — Approval-Audit-Log (Phase 10.B/C)
+#   * data/plugins/{dashboard,orchestrator,
+#                   rp_director,skill_writer,
+#                   knowledge_acquisition,
+#                   expert_panel,spotify}/  — State pro Plugin
+#   * data/certs/                          — TLS-Zertifikate (private keys!)
+# Keine Ausnahmen — ALLES unterhalb von data/ gehört nicht ins Repo.
 data/
 logs/
 *.log
@@ -27,6 +42,16 @@ logs/
 *.sqlite3
 *.sqlite-journal
 *.bak
+
+# === Lexy Self-Coding Workspace (Phase 10.B/C) ===
+#
+# Lexy schreibt hier eigene Skills + Projekte rein, jeweils mit
+# eigenem .venv pro Skill (kann GB-groß werden). Inhalt ändert sich
+# ständig und ist machine-spezifisch — nichts davon gehört ins Repo.
+# Falls du jemals einen Skill explizit ins Repo legen willst, mach's
+# außerhalb des Workspace-Verzeichnisses (z.B. unter plugins/).
+workspace/
+workspace_test/
 
 # === LLM binaries + models (never in git) ===
 llama.cpp/

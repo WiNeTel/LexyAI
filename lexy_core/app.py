@@ -262,11 +262,16 @@ class LexyApp:
                 return
             text = message.get("text", "")
             session_id = message.get("session_id") or client.session_id
+            attachments_raw = message.get("attachments") or []
+            attachments = (
+                attachments_raw if isinstance(attachments_raw, list) else []
+            )
             async for chunk in self.agent.process_stream(
                 text=text,
                 session_id=session_id,
                 user_id=client.user_id,
                 brain=message.get("brain", "auto"),
+                attachments=attachments,
             ):
                 await client.send_json(chunk)
 

@@ -25,7 +25,8 @@ On-disk format (v2)::
                     "project_id": "proj-abc" | null,
                     "created_at": 1712851200.0,
                     "updated_at": 1712851299.0,
-                    "title": "Erste User-Message (max 60 chars)..." | null
+                    "title": "Erste User-Message (max 60 chars)..." | null,
+                    "kind": "chat" | "rp"
                 }
             }
         }
@@ -57,6 +58,12 @@ log = structlog.get_logger(__name__)
 
 _STORE_VERSION = 2
 _TITLE_MAX_LEN = 60
+
+# Allowed values for ``meta.kind``. Phase 9.12 introduces this field to
+# split the UI between the normal Chat tab and the new Rollenspiel tab.
+# Legacy sessions (created before 9.12) default to ``"chat"`` on load.
+VALID_SESSION_KINDS: tuple[str, ...] = ("chat", "rp")
+_DEFAULT_SESSION_KIND = "chat"
 
 
 class SessionStore:
@@ -156,6 +163,8 @@ class SessionStore:
             file_version = data.get("version") if isinstance(data, dict) else 1
             restored = 0
             migrated_from_v1 = 0
+            backfilled_project = 0
+            backfilled_kind = 0
             for session_id, raw_value in sessions.items():
                 if not isinstance(session_id, str):
                     continue
@@ -163,6 +172,25 @@ class SessionStore:
                 if entry is None:
                     continue
                 self._trim(entry["messages"])
+                # Backfill: legacy sessions with no project_id end up
+                # invisible the moment Mike switches to any non-default
+                # project. Auto-assign them to "default" on first load
+                # so they live somewhere concrete and the user can
+                # always see them under the default-project filter.
+                # Idempotent: subsequent loads see "default" and skip.
+                meta = entry["meta"]
+                if meta.get("project_id") is None:
+                    meta["project_id"] = "default"
+                    backfilled_project += 1
+                # Phase 9.12: same trick for ``kind``. Sessions without
+                # a kind get defaulted to "chat" so the new Chat-/RP-tab
+                # split has a deterministic starting point. The
+                # character_chat plugin lazily upgrades sessions to
+                # "rp" the next time a character is attached, so old
+                # RP-style sessions transparently migrate on use.
+                if meta.get("kind") not in VALID_SESSION_KINDS:
+                    meta["kind"] = _DEFAULT_SESSION_KIND
+                    backfilled_kind += 1
                 self._sessions[session_id] = entry
                 restored += 1
                 if isinstance(raw_value, list):
@@ -174,9 +202,17 @@ class SessionStore:
                 sessions=restored,
                 file_version=file_version,
                 migrated_v1_entries=migrated_from_v1,
+                backfilled_project_id=backfilled_project,
+                backfilled_kind=backfilled_kind,
             )
-            # Rewrite on-disk so subsequent reads see v2 shape
-            if migrated_from_v1 > 0 or file_version != _STORE_VERSION:
+            # Rewrite on-disk so subsequent reads see v2 shape and
+            # backfilled project_ids / kinds (no need to migrate twice).
+            if (
+                migrated_from_v1 > 0
+                or file_version != _STORE_VERSION
+                or backfilled_project > 0
+                or backfilled_kind > 0
+            ):
                 self._save_locked()
             return restored
 
@@ -188,7 +224,9 @@ class SessionStore:
         ``{"messages": [...], "meta": {...}}`` shape. Returns ``None``
         for values we cannot interpret.
         """
-        # v1: bare list of messages
+        # v1: bare list of messages — no meta on disk, so no ``kind``
+        # either; the load() loop will detect the missing field and
+        # backfill it (counter increments → file gets rewritten).
         if isinstance(raw_value, list):
             cleaned = self._clean_messages(raw_value)
             if not cleaned:
@@ -200,9 +238,12 @@ class SessionStore:
                     "created_at": 0.0,
                     "updated_at": 0.0,
                     "title": None,
+                    # NOTE: kind intentionally omitted — load() backfills.
                 },
             }
-        # v2: dict with messages + meta
+        # v2: dict with messages + meta. We pass ``kind`` through
+        # only when it's a known value; load() does the validation /
+        # default and counts how many entries needed the backfill.
         if isinstance(raw_value, dict):
             cleaned = self._clean_messages(raw_value.get("messages") or [])
             raw_meta = raw_value.get("meta") or {}
@@ -214,6 +255,10 @@ class SessionStore:
                 "updated_at": float(raw_meta.get("updated_at") or 0.0),
                 "title": raw_meta.get("title"),
             }
+            raw_kind = raw_meta.get("kind")
+            if isinstance(raw_kind, str) and raw_kind in VALID_SESSION_KINDS:
+                meta["kind"] = raw_kind
+            # else: leave absent so load() can backfill + rewrite-on-disk
             # Allow empty-message sessions (registered but no first turn yet)
             return {"messages": cleaned, "meta": meta}
         return None
@@ -317,6 +362,10 @@ class SessionStore:
                     "created_at": now,
                     "updated_at": now,
                     "title": title,
+                    # New sessions start as plain "chat". The
+                    # character_chat plugin upgrades to "rp" on the
+                    # first character attach (Phase 9.12).
+                    "kind": _DEFAULT_SESSION_KIND,
                 },
             }
             self._sessions[session_id] = entry
@@ -491,6 +540,33 @@ class SessionStore:
             if entry is None:
                 return False
             entry["meta"]["project_id"] = project_id
+            self._touch(entry)
+            self._persist()
+            return True
+
+    def set_kind(self, session_id: str, kind: str) -> bool:
+        """
+        Set the session's ``kind`` (Phase 9.12 — Chat / RP split).
+
+        Returns ``True`` iff the session existed and the kind actually
+        changed. Idempotent: calling with the current value returns
+        ``False`` so callers can avoid unnecessary broadcasts. Unknown
+        kinds raise ``ValueError`` rather than silently coercing — we
+        want a hard fail in tests, not stealth corruption.
+        """
+        if kind not in VALID_SESSION_KINDS:
+            raise ValueError(
+                f"unknown session kind: {kind!r}; "
+                f"valid: {VALID_SESSION_KINDS}"
+            )
+        with self._lock:
+            entry = self._sessions.get(session_id)
+            if entry is None:
+                return False
+            current = entry["meta"].get("kind") or _DEFAULT_SESSION_KIND
+            if current == kind:
+                return False
+            entry["meta"]["kind"] = kind
             self._touch(entry)
             self._persist()
             return True

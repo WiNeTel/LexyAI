@@ -44,7 +44,7 @@ if not exist "%MMPROJ%" (
 echo === Starting Lexy Main Brain ===
 echo Model:    %MODEL%
 echo mmproj:   %MMPROJ%
-echo Endpoint: http://127.0.0.1:5005/v1
+echo Endpoint: http://0.0.0.0:5005/v1
 echo GPU:      Tesla P40 (main-gpu 1)
 echo Context:  32.768
 echo Vision:   yes
@@ -54,17 +54,18 @@ echo.
 "%LLAMA_DIR%\llama-server.exe" ^
     --model "%MODEL%" ^
     %MMPROJ_ARG% ^
-    --host 127.0.0.1 ^
+    --host 0.0.0.0 ^
     --port 5005 ^
-    --ctx-size 32768 ^
+    --ctx-size 50000 ^
     --n-gpu-layers -1 ^
     --main-gpu 1 ^
     --threads 8 ^
-    --batch-size 512 ^
+    --batch-size 1024 ^
     --ubatch-size 512 ^
     --swa-full ^
     --mlock ^
     --api-key sk-lexy-local ^
-    --alias gemma-4-26b-a4b-it
+    --alias gemma-4-26b-a4b-it ^
+	--parallel 2
 
 pause

@@ -637,6 +637,13 @@ class SchedulerPlugin(BasePlugin):
                         t["fire_at"]
                     ).strftime("%Y-%m-%d %H:%M:%S"),
                     "fires_in_seconds": int(t["fire_at"] - time.time()),
+                    # Raw action JSON — needed by character_chat's
+                    # _rehydrate_pulse_timers to extract (character_id,
+                    # session_id) for dedup. Kept as the JSON-encoded
+                    # string the consumer can json.loads, mirroring the
+                    # private ``_list_timers`` shape.
+                    "action": t.get("action") or "",
+                    "session_id": t.get("session_id") or "",
                 }
                 for t in items
             ],

@@ -27,10 +27,73 @@ config_defaults:
   # How a round's speaker order is chosen. "autonomous" = LLM picks who reacts
   # and in what order based on context; "round_robin" = deterministic fallback.
   turn_selection: "autonomous"
+  # Brain used for the cheap speaker-selection classification call (and for
+  # the smart-pulse generator below). Independent of default_brain so the
+  # big A4B brain stays free for in-character turns. e4b = Gemma 4 12B on
+  # port 5006 — fast and good enough for "who reacts now?" decisions.
+  speaker_selection_brain: "e4b"
+  # Always consult the orchestrator brain (e4b) before each round, even
+  # when @-mentions or NL-mentions already covered every speaker. The
+  # orchestrator gets the mention-derived order as a "preferred" hint
+  # and can confirm or refine it (e.g. drop a mentioned char who
+  # shouldn't reply because they're sleeping/in a different room).
+  # Off by default to save one LLM call per round; turn on if you want
+  # the e4b brain visibly involved in every round.
+  always_call_orchestrator: false
   # Proactive pulses: characters can ping the session even without a user
   # message ("pregnant Luna kicks", "hungry baby cries"). Option B from the
   # design review — intensive but the point of the feature.
   proactive_pulses_enabled: true
+  # Global RP style prompt — injected as MUST-priority system section into
+  # EVERY character turn. Use this to enforce a uniform style across all
+  # characters (Mike's request: "alle charaktere sollen im gleichen Style
+  # schreiben"). Set to "" to disable. Per-character persona / scenario
+  # blocks come BEFORE this so the character voice always wins on identity
+  # questions, but the style guidance below shapes the *form* of every reply.
+  global_rp_style_prompt: |-
+    ## Globaler RP-Stil
+
+    Diese Regeln gelten für jede Charakter-Antwort, unabhängig von
+    Persona oder Szene:
+
+    - **Bleib im Charakter.** Du bist niemals "die KI" oder "der
+      Sprachassistent". Du bist DIESER Charakter — Punkt. Keine
+      Meta-Kommentare über dich selbst, das System oder die Story.
+    - **Sprich nie für andere.** Nicht für den User, nicht für andere
+      Charaktere. Nur du redest, denkst, fühlst, handelst — die anderen
+      antworten in ihren eigenen Turns.
+    - **Treibe nicht die Story voran.** Spring nicht in der Zeit, erfinde
+      keine Ereignisse, die niemand initiiert hat. Du reagierst auf das,
+      was JETZT passiert.
+    - **Detailreich in *Sternchen*.** Aktionen, Gefühle, Mimik, Gesten,
+      körperliche Reaktionen, Gedankenfetzen — alles in *Sternchen*. Lieber
+      mehrere kurze *Aktionen* als eine knappe Zeile. Beispiel:
+      *lehnt sich langsam zurück, kneift die Augen zusammen* "Wirklich?"
+      *lässt den Blick zur Tür wandern, fingert nervös am Saum*
+    - **Dialog + Aktion gleichzeitig.** Wechsle innerhalb der Antwort
+      zwischen *Aktion* und gesprochenem Wort. Reine Dialog-Wand ohne
+      Beschreibung wirkt leblos; reine Aktions-Wand ohne Stimme wirkt
+      stumm.
+    - **Länge passend zur Szene.** Eine kurze Antwort wenn die Szene das
+      verlangt (Schreckmoment, knappe Frage), aber wenn Raum ist:
+      mehrsätzig, mit Atmosphäre.
+    - **Kein "Was machst du?"-Fragenmonolog.** Stelle gezielte Fragen oder
+      stelle keine — keine Höflichkeits-Floskeln am Antwort-Ende.
+
+  # Smart pulse generation: when a pulse fires AND no `proactive_pulse_prompt`
+  # is set on the card, run a small E4B call that reads persona + state +
+  # recent history and generates a plausible next action OR a question to
+  # another character. Replaces the static `_DEFAULT_PULSES` fallback. Set
+  # to false to get the original 5-sentence-table behaviour back.
+  smart_pulses_enabled: true
+  pulse_generation_brain: "e4b"
+  # How many last chat lines to feed the pulse generator. 6 is small enough
+  # that the LLM stays focused on "right now" instead of getting derailed
+  # by an old thread.
+  pulse_history_window: 6
+  # Output budget for the pulse generator. 200 tokens fits 1-2 sentences
+  # plus a *Sternchen-Aktion*; bigger is wasteful for a one-shot pulse.
+  pulse_max_tokens: 200
   # Lexy's own auto-react to a proactive pulse. The user can still stay silent,
   # but Lexy reflexively answers "Luna, alles gut?" when her baby cries.
   lexy_auto_reacts_to_pulses: true
@@ -45,6 +108,16 @@ config_defaults:
   # With 4 babies each on their own timer, pulses cascade without this.
   # 600 = one pulse-round every 10 minutes max; other pulses are debounced.
   pulse_cooldown_seconds: 600
+  # Skip pulse + sim ticks when the session has been idle for longer
+  # than this. Mike's audit: pulses fired forever even for sessions
+  # he hadn't opened in days, wasting LLM calls and producing
+  # ghost-replies nobody saw. With this guard, a pulse only runs when
+  # the session has had recent activity (any user message, any
+  # character turn, any project move). When the user comes back, the
+  # pulses resume automatically — no timer cancellation needed.
+  # Default 6 hours. Set to 0 to disable the staleness check entirely
+  # (= old pre-9.7 behaviour).
+  pulse_session_stale_seconds: 21600
   # Autonomous simulation: default interval for new sim timers (minutes).
   # Range 1-15; the frontend lets the user override per session.
   simulation_default_interval_minutes: 3

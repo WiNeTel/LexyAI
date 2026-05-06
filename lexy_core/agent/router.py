@@ -238,10 +238,31 @@ class BrainRouter:
             for rule in config.rules
         ]
 
-    def route(self, text: str, requested: str = "auto") -> tuple[str, str]:
-        """Pick a brain. Returns ``(brain_name, reason)``."""
+    def route(
+        self,
+        text: str,
+        requested: str = "auto",
+        *,
+        has_images: bool = False,
+    ) -> tuple[str, str]:
+        """Pick a brain. Returns ``(brain_name, reason)``.
+
+        ``has_images=True`` forces the multimodal brain regardless of
+        text complexity — the text-only A4B/E4B servers don't accept
+        ``image_url`` content blocks. Caller-supplied ``requested`` still
+        wins over the image override (a user explicitly asking for A4B
+        should get A4B even if the prompt has an attached image; that
+        usually means they're aware their build has vision support).
+        """
         if requested in self.KNOWN_BRAINS:
             return requested, "explicit"
+
+        if has_images:
+            # Multi is the only brain we *know* speaks vision (Gemma 4 4B
+            # multimodal on :5007). Use it. If that brain ever gets removed
+            # from config, the LLM call will surface an error and we route
+            # accordingly — better than silently dropping the image.
+            return "multi", "image_attached"
 
         for pattern, brain in self._compiled_rules:
             if pattern.search(text):

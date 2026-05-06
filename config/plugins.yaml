@@ -96,8 +96,8 @@ voice_gemma4:
   model: gemma-4-e4b-it
   temperature: 0.0
 weather:
-  latitude: 53.63
-  location: TestTown
+  latitude: 53.64
+  location: Hechthausen
   longitude: 9.24
   timezone: Europe/Berlin
   units: metric

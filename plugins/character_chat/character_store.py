@@ -23,7 +23,9 @@ from .character_card import (
     AGE_STAGES,
     CharacterCard,
     CharacterCardError,
+    parse_silly_tavern_bytes,
     parse_silly_tavern_card,
+    parse_silly_tavern_png,
 )
 
 
@@ -43,6 +45,7 @@ CREATE TABLE IF NOT EXISTS characters (
     relationships TEXT DEFAULT '{}',
     tags TEXT DEFAULT '[]',
     active_sessions TEXT DEFAULT '[]',
+    state TEXT NOT NULL DEFAULT '{}',
     proactive_pulse_pattern TEXT DEFAULT '',
     proactive_pulse_prompt TEXT DEFAULT '',
     archived INTEGER DEFAULT 0,
@@ -59,6 +62,7 @@ CREATE INDEX IF NOT EXISTS idx_characters_archived ON characters(archived);
 _MIGRATIONS: tuple[tuple[str, str], ...] = (
     # (column, ALTER statement)
     ("voice", "ALTER TABLE characters ADD COLUMN voice TEXT DEFAULT ''"),
+    ("state", "ALTER TABLE characters ADD COLUMN state TEXT NOT NULL DEFAULT '{}'"),
 )
 
 
@@ -79,6 +83,7 @@ _UPDATABLE_COLUMNS: frozenset[str] = frozenset(
         "relationships",
         "tags",
         "active_sessions",
+        "state",
         "proactive_pulse_pattern",
         "proactive_pulse_prompt",
         "archived",
@@ -284,12 +289,57 @@ class CharacterStore:
         color: str | None = None,
         age_stage: str = "adult",
     ) -> CharacterCard:
-        """Parse a Silly-Tavern card payload and persist it."""
+        """Parse a Silly-Tavern card payload (JSON dict) and persist it."""
         card = parse_silly_tavern_card(payload)
         if color:
             card.color = color
         card.age_stage = age_stage
         return await self.create(card)
+
+    async def import_silly_tavern_bytes(
+        self,
+        data: bytes,
+        *,
+        filename: str = "",
+        content_type: str = "",
+        color: str | None = None,
+        age_stage: str = "adult",
+        avatar_dir: Any = None,
+    ) -> CharacterCard:
+        """Auto-detect JSON vs PNG and persist the resulting card.
+
+        When the payload is a Silly-Tavern PNG card, the embedded image
+        is also written to ``avatar_dir/<character_id>.png`` and the
+        card's ``avatar`` field is set to the served URL
+        (``/avatars/<id>.png``). For JSON payloads this is a no-op.
+        ``avatar_dir`` should be a ``pathlib.Path`` — ``None`` skips
+        the avatar write (caller takes care of it later).
+        """
+        card, png_bytes = parse_silly_tavern_bytes(
+            data, filename=filename, content_type=content_type,
+        )
+        if color:
+            card.color = color
+        card.age_stage = age_stage
+        # Persist the card first so we have its assigned id, then drop
+        # the avatar onto disk + patch the field.
+        saved = await self.create(card)
+        if png_bytes is not None and avatar_dir is not None:
+            from pathlib import Path
+            d = Path(avatar_dir)
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+                avatar_path = d / f"{saved.id}.png"
+                avatar_path.write_bytes(png_bytes)
+                # ``/avatars`` is the static mount used elsewhere; the
+                # frontend renders <img src="card.avatar"> directly.
+                avatar_url = f"/avatars/{avatar_path.name}"
+                saved = await self.update(saved.id, avatar=avatar_url) or saved
+            except OSError:
+                # Non-fatal: the card landed in the DB; the avatar just
+                # didn't get the picture. Caller can re-upload manually.
+                pass
+        return saved
 
     # ─── Helpers ─────────────────────────────────────────────────────────
 

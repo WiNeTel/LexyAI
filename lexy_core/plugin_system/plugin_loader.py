@@ -239,6 +239,125 @@ class PluginLoader:
         self._plugins.pop(name, None)
         self._apis.pop(name, None)
 
+    async def load_plugin(self, name: str) -> bool:
+        """Discover + load + enable a single plugin (Phase 11 hot-load).
+
+        Re-scans the plugins directory for the named plugin's manifest.
+        Use this for plugins that just appeared on disk (e.g. published
+        from ``workspace/extensions/`` by the coder plugin). Returns
+        True on success, False if the plugin is already loaded or no
+        matching manifest was found.
+        """
+        if name in self._plugins:
+            return False
+        # Re-scan only the named directory.
+        target = self._plugins_path / name
+        manifest_path = target / "plugin.yaml"
+        if not manifest_path.exists():
+            log.warning(
+                "plugin_loader.load_missing_manifest",
+                plugin=name, path=str(manifest_path),
+            )
+            return False
+        try:
+            manifest = PluginManifest.from_yaml(manifest_path)
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "plugin_loader.load_manifest_error",
+                plugin=name, error=str(exc),
+            )
+            return False
+        if manifest.name != name:
+            log.warning(
+                "plugin_loader.load_name_mismatch",
+                expected=name, got=manifest.name,
+            )
+            return False
+        self._manifests[manifest.name] = manifest
+        if name not in self._load_order:
+            self._load_order.append(name)
+        try:
+            await self._load_plugin(name)
+            await self._enable_plugin(name)
+        except Exception as exc:  # noqa: BLE001
+            log.error("plugin_loader.load_failed", plugin=name, error=str(exc))
+            return False
+        return True
+
+    async def reload_plugin(self, name: str) -> bool:
+        """Disable + reload + re-enable a plugin (Phase 11 hot-reload).
+
+        Re-imports the plugin's Python modules so source changes take
+        effect without a full backend restart. The order is:
+
+        1. ``disable_plugin`` — runs the plugin's ``on_disable`` and
+           clears its API registrations (tools, hooks, WS handlers).
+        2. Drop cached imports of every ``<plugin_name>.*`` module so
+           the next ``importlib.import_module`` reads from disk.
+        3. Reload manifest from disk (``plugin.yaml`` may have changed).
+        4. ``_load_plugin`` + ``_enable_plugin`` again.
+
+        Returns True on success. If anything fails the plugin is left
+        in whatever in-between state we got to — the caller should log
+        and consider a full restart.
+        """
+        import importlib
+        if name not in self._plugins and name not in self._manifests:
+            # Maybe never loaded — just try a fresh load.
+            return await self.load_plugin(name)
+        await self.unload_plugin(name)
+
+        # Drop cached imports for this plugin's package + submodules so
+        # the next import_module re-reads from disk. Without this,
+        # importlib.import_module returns the cached (old) module object.
+        prefix = f"{name}."
+        cached = [
+            mod_name for mod_name in list(sys.modules)
+            if mod_name == name or mod_name.startswith(prefix)
+        ]
+        for mod_name in cached:
+            sys.modules.pop(mod_name, None)
+        # Wipe __pycache__/ inside the plugin's directory so Python
+        # can't serve a stale .pyc whose embedded source-mtime collides
+        # with the freshly-edited .py (Windows mtime resolution is coarse).
+        plugin_dir = self._plugins_path / name
+        for cache_dir in plugin_dir.rglob("__pycache__"):
+            try:
+                import shutil
+                shutil.rmtree(cache_dir, ignore_errors=True)
+            except Exception:  # noqa: BLE001
+                pass
+        # Force the import system to re-stat directories.
+        importlib.invalidate_caches()
+
+        # Re-read manifest in case plugin.yaml changed.
+        manifest_path = self._plugins_path / name / "plugin.yaml"
+        if not manifest_path.exists():
+            log.warning(
+                "plugin_loader.reload_missing_manifest",
+                plugin=name, path=str(manifest_path),
+            )
+            return False
+        try:
+            manifest = PluginManifest.from_yaml(manifest_path)
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "plugin_loader.reload_manifest_error",
+                plugin=name, error=str(exc),
+            )
+            return False
+        self._manifests[manifest.name] = manifest
+        if name not in self._load_order:
+            self._load_order.append(name)
+        try:
+            await self._load_plugin(name)
+            await self._enable_plugin(name)
+        except Exception as exc:  # noqa: BLE001
+            log.error("plugin_loader.reload_failed", plugin=name, error=str(exc))
+            return False
+        log.info("plugin_loader.reloaded", plugin=name)
+        return True
+
     async def unload_all(self) -> None:
         """Reverse-order shutdown of all plugins."""
         for name in reversed(self._load_order):

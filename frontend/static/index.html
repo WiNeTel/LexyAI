@@ -4,10 +4,20 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Lexy AI</title>
-    <link rel="stylesheet" href="/static/style.css" />
-    <link rel="stylesheet" href="/static/holo.css" />
-    <!-- Three.js for 3D Avatar Stage -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r169/three.min.js" defer></script>
+    <!--
+      Cache-bust: every Lexy update bumps ?v=... here so browsers pick
+      up new JS/CSS without needing a manual hard-reload. Mike ran into
+      this on his second machine — old cached app.js still tried to
+      JSON.parse a PNG and failed with "unexpected character at line 1
+      column 1". Bump the date string when shipping a frontend change.
+    -->
+    <link rel="stylesheet" href="/static/style.css?v=20260506a" />
+    <link rel="stylesheet" href="/static/holo.css?v=20260506a" />
+    <!-- Three.js for 3D Avatar Stage. Bundled locally so Lexy works
+         offline / on air-gapped LANs (cdnjs blocked or unreachable).
+         Falls back gracefully — holo.js uses ``typeof THREE === 'undefined'``
+         to skip the avatar stage when the script didn't load. -->
+    <script src="/static/vendor/three.min.js?v=20260506a" defer></script>
 </head>
 <body>
 
@@ -101,6 +111,12 @@
                 <button class="tab-btn" data-tab="characters">
                     <span class="tab-icon">🎭</span> Characters
                 </button>
+                <button class="tab-btn" data-tab="rp">
+                    <span class="tab-icon">🎬</span> Rollenspiel
+                </button>
+                <button class="tab-btn" data-tab="lorebooks">
+                    <span class="tab-icon">📚</span> Lorebooks
+                </button>
                 <button class="tab-btn" data-tab="settings">
                     <span class="tab-icon">⚙️</span> Settings
                 </button>
@@ -149,14 +165,14 @@
                                 <option value="a4b">a4b (main)</option>
                             </select>
                         </label>
+                <!-- Phase 9.12: Charakter-Funktionalität ist in den
+                     eigenen Tab "🎬 Rollenspiel" gewandert. Der Chat-
+                     Tab ist jetzt rein für die normale Lexy-Session. -->
                         <button id="mic-btn" class="btn" data-active="false" title="Hold-to-talk (mic)">🎤</button>
                         <button id="tts-toggle" class="btn" data-active="false">TTS off</button>
-                        <button id="chat-characters-btn" class="btn" title="Charaktere dieser Session verwalten">🎭 Rollen</button>
                         <button id="clear-chat-btn" class="btn" title="Clear chat window (local only)">Clear</button>
                     </div>
                 </header>
-
-                <div id="chat-character-bar" class="chat-character-bar" hidden></div>
 
                 <div id="chat-window"></div>
 
@@ -164,7 +180,15 @@
                     <canvas id="arc-reactor" width="800" height="180"></canvas>
                 </div>
 
+                <div id="composer-attachments" class="composer-attachments" hidden></div>
+
                 <footer id="composer">
+                    <div id="composer-toolbar" class="composer-toolbar">
+                        <button id="upload-image-btn" class="btn upload-btn" title="Bild anhängen (Vision)">🖼</button>
+                        <button id="upload-file-btn" class="btn upload-btn" title="Datei/Code/Audio anhängen">📎</button>
+                        <input type="file" id="upload-image-input" accept="image/*" hidden>
+                        <input type="file" id="upload-file-input" hidden>
+                    </div>
                     <textarea id="input" rows="2" placeholder="Schreibe an Lexy… (Shift+Enter = Zeilenumbruch, hold mic button to speak)"></textarea>
                     <button id="send" class="btn primary">Senden</button>
                 </footer>
@@ -297,6 +321,15 @@
                 <header class="tab-header">
                     <div class="title">Sessions</div>
                     <div class="controls">
+                        <label class="brain-select" title="Filtere nach Session-Typ (Phase 9.12)">
+                            Typ:
+                            <select id="sessions-kind-filter">
+                                <option value="all">Alle</option>
+                                <option value="chat">💬 Chat</option>
+                                <option value="rp">🎬 Rollenspiel</option>
+                            </select>
+                        </label>
+                        <button id="sessions-show-all-btn" class="btn" data-active="false" title="Sessions aus allen Projekten zeigen">🌐 alle Projekte</button>
                         <button id="sessions-refresh-btn" class="btn">Refresh</button>
                     </div>
                 </header>
@@ -376,8 +409,8 @@
                     <div class="title">Charaktere</div>
                     <div class="controls">
                         <button id="chars-new-btn" class="btn primary">+ Neu</button>
-                        <button id="chars-import-btn" class="btn" title="Silly-Tavern Card importieren">📥 Import</button>
-                        <input type="file" id="chars-import-file" accept=".json,application/json" hidden />
+                        <button id="chars-import-btn" class="btn" title="Silly-Tavern Card importieren (JSON oder PNG)">📥 Import</button>
+                        <input type="file" id="chars-import-file" accept=".json,application/json,.png,image/png" hidden />
                         <label class="toggle-label">
                             <input type="checkbox" id="chars-show-archived" />
                             <span class="toggle-text">Archivierte zeigen</span>
@@ -472,6 +505,207 @@
                     </form>
                 </div>
             </section>
+
+            <!-- ─── Roleplay tab (Phase 9.12) ──────────────────────────
+                 Eigener Chat-Bereich für Charakter-Sessions. Dasselbe
+                 Layout wie der normale Chat-Tab, aber mit eigener
+                 Session-Liste (kind=rp) und einer prominenten Char-Bar
+                 unter dem Header. WS-Routing erkennt am ``session_id``,
+                 ob ein Bubble in den Chat- oder RP-Window soll. -->
+            <section class="tab-panel" data-tab="rp">
+                <header class="tab-header">
+                    <div class="title">
+                        Rollenspiel
+                        <span id="rp-session-pill" class="session-pill" title="Aktive RP-Session — klick zum Kopieren der ID">—</span>
+                    </div>
+                    <div class="controls">
+                        <button id="rp-new-session-btn" class="btn" title="Neue Rollenspiel-Session">🆕 Neue RP-Session</button>
+                        <label class="brain-select">
+                            Brain:
+                            <select id="rp-brain">
+                                <option value="auto">auto</option>
+                                <option value="multi">multi (4B)</option>
+                                <option value="e4b">e4b (fast)</option>
+                                <option value="a4b" selected>a4b (deep)</option>
+                            </select>
+                        </label>
+                        <button id="rp-mic-btn" class="btn" data-active="false" title="Hold-to-talk (mic)">🎤</button>
+                        <button id="rp-tts-toggle" class="btn" data-active="false">TTS off</button>
+                        <button id="rp-characters-btn" class="btn" title="Charaktere dieser RP-Session verwalten">🎭 Rollen</button>
+                        <button id="rp-clear-btn" class="btn" title="RP-Window leeren (lokal)">Clear</button>
+                    </div>
+                </header>
+
+                <div id="rp-character-bar" class="chat-character-bar" hidden></div>
+
+                <div id="rp-chat-window"></div>
+
+                <div id="rp-composer-attachments" class="composer-attachments" hidden></div>
+
+                <footer id="rp-composer">
+                    <div id="rp-composer-toolbar" class="composer-toolbar">
+                        <button id="rp-upload-image-btn" class="btn upload-btn" title="Bild anhängen">🖼</button>
+                        <button id="rp-upload-file-btn" class="btn upload-btn" title="Datei anhängen">📎</button>
+                        <input type="file" id="rp-upload-image-input" accept="image/*" hidden>
+                        <input type="file" id="rp-upload-file-input" hidden>
+                    </div>
+                    <textarea id="rp-input" rows="2" placeholder="Schreibe an deine Charaktere… (Shift+Enter = Zeilenumbruch)"></textarea>
+                    <button id="rp-send" class="btn primary">Senden</button>
+                </footer>
+            </section>
+
+            <!-- ─── Lorebooks tab (Phase 9.11) ─────────────────────── -->
+            <section class="tab-panel" data-tab="lorebooks">
+                <header class="tab-header">
+                    <div class="title">Lorebooks</div>
+                    <div class="controls">
+                        <label class="brain-select">
+                            Scope:
+                            <select id="lore-scope-filter">
+                                <option value="all">alle</option>
+                                <option value="global">global</option>
+                                <option value="character">Charakter</option>
+                                <option value="session">Session</option>
+                            </select>
+                        </label>
+                        <select id="lore-scope-id-filter" hidden></select>
+                        <button id="lore-new-book-btn" class="btn primary">+ Neues Buch</button>
+                        <button id="lore-refresh-btn" class="btn">Refresh</button>
+                    </div>
+                </header>
+
+                <div class="tab-body lorebooks-layout">
+                    <!-- Books list (left) -->
+                    <aside class="lore-books-pane" id="lore-books-pane">
+                        <div class="muted">loading…</div>
+                    </aside>
+
+                    <!-- Entries pane (right) -->
+                    <div class="lore-entries-pane" id="lore-entries-pane">
+                        <div class="lore-empty muted">
+                            Wähle links ein Lorebook um seine Einträge zu sehen.
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- ─── Lorebook: Book editor modal ─────────────────────── -->
+            <div id="lore-book-modal" class="modal-wrap" hidden>
+                <div class="modal lore-book-modal">
+                    <header class="modal-head">
+                        <h3 id="lore-book-modal-title">Lorebook</h3>
+                        <button class="btn icon" id="lore-book-modal-close" title="Schließen">✕</button>
+                    </header>
+                    <form id="lore-book-form" class="modal-body">
+                        <input type="hidden" id="lore-book-id" />
+                        <div class="setting-row">
+                            <label>Name</label>
+                            <input type="text" id="lore-book-name" placeholder="z.B. Mittelerde-Welt" required />
+                        </div>
+                        <div class="setting-row">
+                            <label>Beschreibung</label>
+                            <textarea id="lore-book-description" rows="2" placeholder="Optional — was ist das für ein Lorebook?"></textarea>
+                        </div>
+                        <div class="setting-row">
+                            <label>Scope</label>
+                            <select id="lore-book-scope">
+                                <option value="global">global — sichtbar in jeder Session</option>
+                                <option value="character">Charakter — nur wenn dieser Char redet</option>
+                                <option value="session">Session — nur in dieser Session</option>
+                            </select>
+                        </div>
+                        <div class="setting-row" id="lore-book-scope-id-row">
+                            <label id="lore-book-scope-id-label">Charakter</label>
+                            <select id="lore-book-scope-id"></select>
+                        </div>
+                        <div class="setting-row">
+                            <label>Token-Budget</label>
+                            <input type="number" id="lore-book-token-budget" min="0" max="10000" step="100" value="1500" />
+                            <span class="muted">Maximale Zeichen für Lore-Inhalte pro Runde.</span>
+                        </div>
+                        <div class="setting-row">
+                            <label>Aktiv</label>
+                            <label class="toggle-label">
+                                <input type="checkbox" id="lore-book-enabled" checked />
+                                <span class="toggle-text">Aktiviert</span>
+                            </label>
+                        </div>
+                        <div class="modal-foot">
+                            <button type="button" class="btn btn-danger" id="lore-book-delete" hidden>Löschen</button>
+                            <button type="button" class="btn" id="lore-book-cancel">Abbrechen</button>
+                            <button type="submit" class="btn primary" id="lore-book-save">Speichern</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+
+            <!-- ─── Lorebook: Entry editor modal ────────────────────── -->
+            <div id="lore-entry-modal" class="modal-wrap" hidden>
+                <div class="modal lore-entry-modal">
+                    <header class="modal-head">
+                        <h3 id="lore-entry-modal-title">Eintrag</h3>
+                        <button class="btn icon" id="lore-entry-modal-close" title="Schließen">✕</button>
+                    </header>
+                    <form id="lore-entry-form" class="modal-body">
+                        <input type="hidden" id="lore-entry-id" />
+                        <input type="hidden" id="lore-entry-book-id" />
+                        <div class="setting-row">
+                            <label>Name</label>
+                            <input type="text" id="lore-entry-name" placeholder="z.B. Hobbit-Auenland" required />
+                        </div>
+                        <div class="setting-row">
+                            <label>Trigger-Keys
+                                <span class="muted">(komma-separiert)</span>
+                            </label>
+                            <input type="text" id="lore-entry-keys" placeholder="Hobbit, Auenland, Halbling" />
+                        </div>
+                        <div class="setting-row">
+                            <label>Always-On</label>
+                            <label class="toggle-label">
+                                <input type="checkbox" id="lore-entry-always-on" />
+                                <span class="toggle-text">jede Runde feuern</span>
+                            </label>
+                            <span class="muted">Aktiv = Keys irrelevant.</span>
+                        </div>
+                        <div class="setting-row">
+                            <label>Inhalt</label>
+                            <textarea id="lore-entry-content" rows="8" placeholder="Der eigentliche Lore-Text. Wird in den Prompt injiziert wenn ein Key matcht."></textarea>
+                        </div>
+                        <div class="setting-row">
+                            <label>Position</label>
+                            <select id="lore-entry-position">
+                                <option value="before_persona">vor Persona</option>
+                                <option value="after_persona">nach Persona</option>
+                                <option value="before_scenario" selected>vor Szenario (default)</option>
+                                <option value="before_history">vor History</option>
+                                <option value="before_user_message">direkt vor User-Message</option>
+                            </select>
+                        </div>
+                        <div class="setting-row">
+                            <label>Priorität</label>
+                            <input type="number" id="lore-entry-priority" min="0" max="999" step="1" value="100" />
+                            <span class="muted">Niedriger = früher im Lore-Block.</span>
+                        </div>
+                        <div class="setting-row">
+                            <label>Scan-Tiefe</label>
+                            <input type="number" id="lore-entry-scan-depth" min="0" max="20" step="1" value="4" />
+                            <span class="muted">Letzte N Messages werden auf Keys gescannt.</span>
+                        </div>
+                        <div class="setting-row">
+                            <label>Aktiv</label>
+                            <label class="toggle-label">
+                                <input type="checkbox" id="lore-entry-enabled" checked />
+                                <span class="toggle-text">Aktiviert</span>
+                            </label>
+                        </div>
+                        <div class="modal-foot">
+                            <button type="button" class="btn btn-danger" id="lore-entry-delete" hidden>Löschen</button>
+                            <button type="button" class="btn" id="lore-entry-cancel">Abbrechen</button>
+                            <button type="submit" class="btn primary" id="lore-entry-save">Speichern</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
 
             <!-- ─── Settings tab ─────────────────────────────────── -->
             <section class="tab-panel" data-tab="settings">
@@ -801,6 +1035,50 @@
 
     <div id="toast-container"></div>
 
+    <!-- ─── Coder approval modal (Phase 10.B) ─────────────────── -->
+    <div id="coder-approval-overlay" class="coder-overlay" hidden>
+        <div class="coder-modal" role="dialog" aria-modal="true" aria-labelledby="coder-approval-title">
+            <header class="coder-modal-header">
+                <span id="coder-approval-risk" class="coder-risk">MED</span>
+                <h2 id="coder-approval-title">Lexy fragt nach…</h2>
+            </header>
+            <div class="coder-modal-body">
+                <div class="coder-action-row">
+                    <span class="coder-action-label">Action</span>
+                    <code id="coder-approval-action">workspace_write</code>
+                </div>
+                <pre id="coder-approval-preview" class="coder-preview"></pre>
+                <details class="coder-payload">
+                    <summary>Payload</summary>
+                    <pre id="coder-approval-payload"></pre>
+                </details>
+            </div>
+            <footer class="coder-modal-actions">
+                <button id="coder-approve-session-btn" class="btn">Auto-genehmigen für Session</button>
+                <button id="coder-deny-btn" class="btn btn-danger">Ablehnen</button>
+                <button id="coder-approve-btn" class="btn primary">Genehmigen</button>
+            </footer>
+        </div>
+    </div>
+
+    <!-- ─── Deep-Research console (live progress + report) ────── -->
+    <div id="research-console" class="research-console" hidden>
+        <header class="research-console-header">
+            <span class="research-console-title">🔍 Deep Research</span>
+            <button id="research-console-close" class="btn research-console-close" title="Konsole verbergen">✕</button>
+        </header>
+        <div id="research-console-body" class="research-console-body"></div>
+    </div>
+
+    <!-- ─── Coder console (live task log) ─────────────────────── -->
+    <div id="coder-console" class="coder-console" hidden>
+        <header class="coder-console-header">
+            <span class="coder-console-title">🛠 Coder</span>
+            <button id="coder-console-close" class="btn coder-console-close" title="Coder-Konsole verbergen">✕</button>
+        </header>
+        <div id="coder-console-body" class="coder-console-body"></div>
+    </div>
+
     <!-- ─── Memory wipe confirm modal ────────────────────────────── -->
     <div id="memory-wipe-modal" class="modal-wrap" hidden>
         <div class="modal">
@@ -1040,8 +1318,10 @@
         </div>
     </template>
 
-    <!-- HoloMat layer loads BEFORE app.js so window.LexyHolo is available -->
-    <script src="/static/holo.js"></script>
-    <script src="/static/app.js"></script>
+    <!-- HoloMat layer loads BEFORE app.js so window.LexyHolo is available.
+         ``?v=…`` matches the head-tag version so the bundle stays
+         consistent across cache layers. -->
+    <script src="/static/holo.js?v=20260506a"></script>
+    <script src="/static/app.js?v=20260506a"></script>
 </body>
 </html>

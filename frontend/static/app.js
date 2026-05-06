@@ -33,6 +33,62 @@
     const newSessionBtn = $("new-session-btn");
     const sessionPill = $("session-pill");
     const msgTemplate = $("msg-template");
+    const uploadImageBtn = $("upload-image-btn");
+    const uploadFileBtn = $("upload-file-btn");
+    const uploadImageInput = $("upload-image-input");
+    const uploadFileInput = $("upload-file-input");
+    const composerAttachments = $("composer-attachments");
+
+    // ── Phase 9.12: Rollenspiel-Tab DOM refs ──────────────────────
+    // Eigener Composer + Window für die RP-Sessions, sodass der
+    // Chat-Tab und der RP-Tab parallel je eine aktive Session
+    // haben können (state.chatSessionId / state.rpSessionId).
+    const rpChatWindow = $("rp-chat-window");
+    const rpInput = $("rp-input");
+    const rpSend = $("rp-send");
+    const rpBrain = $("rp-brain");
+    const rpTtsToggle = $("rp-tts-toggle");
+    const rpMicBtn = $("rp-mic-btn");
+    const rpClearBtn = $("rp-clear-btn");
+    const rpNewSessionBtn = $("rp-new-session-btn");
+    const rpSessionPill = $("rp-session-pill");
+    const rpUploadImageBtn = $("rp-upload-image-btn");
+    const rpUploadFileBtn = $("rp-upload-file-btn");
+    const rpUploadImageInput = $("rp-upload-image-input");
+    const rpUploadFileInput = $("rp-upload-file-input");
+    const rpComposerAttachments = $("rp-composer-attachments");
+
+    // Returns the DOM/state pair for whichever chat-context the user
+    // is currently looking at (Chat tab vs Rollenspiel tab). Used by
+    // sendMessage(), the streaming bubble code, and the upload UI so
+    // each tab works on its own session/composer/window without
+    // duplicating the entire send pipeline.
+    function getActiveChatContext() {
+        if (state.activeTab === "rp") {
+            return {
+                kind: "rp",
+                input: rpInput,
+                window: rpChatWindow,
+                send: rpSend,
+                brain: rpBrain,
+                pill: rpSessionPill,
+                clearBtn: rpClearBtn,
+                attachmentsEl: rpComposerAttachments,
+                sessionId: state.rpSessionId,
+            };
+        }
+        return {
+            kind: "chat",
+            input: input,
+            window: chatWindow,
+            send: sendBtn,
+            brain: brainSelect,
+            pill: sessionPill,
+            clearBtn: clearChatBtn,
+            attachmentsEl: composerAttachments,
+            sessionId: state.chatSessionId,
+        };
+    }
 
     const brandVersion = $("brand-version");
     const sysState = $("sys-state");
@@ -369,7 +425,16 @@
     // ── State ──────────────────────────────────────────────────────
     const state = {
         ws: null,
+        // Phase 9.12: ``sessionId`` always points to the *active tab*'s
+        // session. The two per-tab ids below are remembered so a tab
+        // switch restores the right session without going to the
+        // backend. ``sessionId`` syncs from one of them on every
+        // ``switchTab(chat|rp)`` call.
         sessionId: localStorage.getItem("lexy_last_session") || null,
+        chatSessionId: localStorage.getItem("lexy_last_chat_session")
+            || localStorage.getItem("lexy_last_session")
+            || null,
+        rpSessionId: localStorage.getItem("lexy_last_rp_session") || null,
         clientId: null,
         currentAssistantBubble: null,
         currentReasoningBubble: null,
@@ -382,6 +447,9 @@
         visualizer: null,
         mic: new MicRecorder(),
         micActive: false,
+        // Upload manifests waiting to be sent with the next chat message.
+        // Each entry: {kind, upload_id, filename, size, mime, url, data_url?, ...}
+        pendingAttachments: [],
         dashboardLayout: [],
         dashboardWidgets: {},
         dashboardEditing: false,
@@ -455,8 +523,16 @@
             wrapper.appendChild(actions);
         }
 
-        chatWindow.appendChild(wrapper);
-        chatWindow.scrollTop = chatWindow.scrollHeight;
+        // Phase 9.12: render into whichever tab the user's looking at.
+        // The streaming flow always lands in the *active* tab — the
+        // user just clicked Send there. Cross-tab notifications
+        // (character_pulse from a stale RP-session while the user is
+        // in chat) are routed separately by their explicit session_id.
+        const targetWindow = (state.activeTab === "rp" && rpChatWindow)
+            ? rpChatWindow
+            : chatWindow;
+        targetWindow.appendChild(wrapper);
+        targetWindow.scrollTop = targetWindow.scrollHeight;
         return wrapper.querySelector(".bubble");
     }
 
@@ -742,6 +818,7 @@
 
     // ── Tab navigation ─────────────────────────────────────────────
     function switchTab(name) {
+        const prev = state.activeTab;
         state.activeTab = name;
         qa(".tab-btn").forEach((btn) =>
             btn.classList.toggle("active", btn.dataset.tab === name)
@@ -749,6 +826,26 @@
         qa(".tab-panel").forEach((panel) =>
             panel.classList.toggle("active", panel.dataset.tab === name)
         );
+        // Phase 9.12: Wenn der User zwischen Chat- und RP-Tab wechselt,
+        // muss state.sessionId auf die zur Tab passende Session
+        // umschalten und der Backend-WS auf diese Session "abonnieren"
+        // (das Backend filtert WS-Broadcasts nicht; das macht der
+        // Frontend-Dispatcher anhand session_id, aber der Send-Path
+        // braucht trotzdem die richtige id).
+        if (name === "chat" && prev !== "chat") {
+            if (state.chatSessionId) {
+                state.sessionId = state.chatSessionId;
+                _syncSessionUI("chat");
+            }
+        }
+        if (name === "rp" && prev !== "rp") {
+            // RP-Session lazy laden — wenn Mike noch keine hat, legt
+            // loadRoleplay() implizit eine an.
+            if (state.rpSessionId) {
+                state.sessionId = state.rpSessionId;
+                _syncSessionUI("rp");
+            }
+        }
         if (name === "dashboard") loadDashboard();
         if (name === "memory") loadMemoryBrowse();
         if (name === "plugins") loadPlugins();
@@ -756,8 +853,23 @@
         if (name === "sessions") loadSessions();
         if (name === "scheduler") loadScheduler();
         if (name === "characters") loadCharacters();
+        if (name === "rp") loadRoleplay();
+        if (name === "lorebooks") loadLorebooks();
         if (name === "settings") loadSettings();
         if (name === "chat") state.visualizer.resize();
+    }
+
+    function _syncSessionUI(kind) {
+        // Update the session-pill of the active tab + the small
+        // header-id in the sidebar's "Session" line.
+        const pill = kind === "rp" ? rpSessionPill : sessionPill;
+        if (pill && state.sessionId) {
+            pill.textContent = state.sessionId.slice(0, 8) + "…";
+            pill.title = state.sessionId;
+        }
+        if (sysSession && state.sessionId) {
+            sysSession.textContent = state.sessionId.slice(0, 8) + "…";
+        }
     }
     qa(".tab-btn").forEach((btn) => {
         btn.addEventListener("click", () => switchTab(btn.dataset.tab));
@@ -814,6 +926,19 @@
             return true;
         }
         return false;
+    }
+
+    // Bridge for sub-IIFEs (coder approval modal, future panels) that
+    // need to send raw WS frames without re-importing the whole chat
+    // state. Set once after the IIFE so subsequent sub-modules can rely
+    // on it.
+    window._lexySendWs = wsSend;
+    // Mirror state.sessionId via a getter so sub-IIFEs don't snapshot
+    // a stale value at load-time.
+    if (!Object.getOwnPropertyDescriptor(window, "_lexySessionId")) {
+        Object.defineProperty(window, "_lexySessionId", {
+            get() { return state.sessionId || ""; },
+        });
     }
 
     function handleMessage(data) {
@@ -1162,6 +1287,37 @@
                 if (state.activeTab === "sessions") loadSessions();
                 break;
 
+            case "session_kind_changed":
+                // Phase 9.12: backend tagged a session as kind=rp (most
+                // commonly because a character was just attached). If
+                // the user is currently in the *chat* tab and the
+                // session in question is their active chat session,
+                // gently hint that the conversation has moved over.
+                if (data && data.kind === "rp" && data.session_id) {
+                    if (data.session_id === state.chatSessionId) {
+                        // Bookkeeping: chat-tab no longer owns this id.
+                        state.chatSessionId = null;
+                        try { localStorage.removeItem("lexy_last_chat_session"); } catch (_e) {}
+                    }
+                    if (data.session_id === state.sessionId &&
+                        state.activeTab === "chat") {
+                        toast(
+                            "Session ist jetzt RP",
+                            "Charakter angeheftet — wechsle in den 🎬 Rollenspiel-Tab.",
+                        );
+                        // Move it over to the RP tab's memory so
+                        // switchTab("rp") can pick it up.
+                        state.rpSessionId = data.session_id;
+                        try { localStorage.setItem("lexy_last_rp_session", data.session_id); } catch (_e) {}
+                    } else if (data.session_id === state.rpSessionId) {
+                        // Already in RP — nothing to do, but make sure
+                        // the localStorage anchor is fresh.
+                        try { localStorage.setItem("lexy_last_rp_session", data.session_id); } catch (_e) {}
+                    }
+                    if (state.activeTab === "sessions") loadSessions();
+                }
+                break;
+
             // ── Character chat ──
             case "character_list":
                 if (window._lexyCharacters) window._lexyCharacters.onList(data);
@@ -1207,6 +1363,19 @@
             case "character_turn":
                 if (window._lexyCharacters) window._lexyCharacters.onTurn(data);
                 break;
+            case "character_turn_updated":
+                if (window._lexyCharacters) window._lexyCharacters.onTurnUpdated(data);
+                break;
+            case "character_turn_deleted":
+                if (window._lexyCharacters) window._lexyCharacters.onTurnDeleted(data);
+                break;
+            case "character_turn_edit_ack":
+            case "character_turn_delete_ack":
+            case "character_turn_regenerate_ack":
+                if (data && data.ok === false) {
+                    showError(`Turn-Action: ${data.error || "Fehler"}`);
+                }
+                break;
             case "character_turn_audio":
                 if (window._lexyCharacters) window._lexyCharacters.onTurnAudio(data);
                 break;
@@ -1217,27 +1386,357 @@
                 if (window._lexyCharacters) window._lexyCharacters.onRoundError(data);
                 break;
 
+            case "rp_director_start_ack":
+                if (data && data.ok === false) {
+                    showError(`RP-Director: ${data.error || "konnte nicht starten"}`);
+                }
+                break;
+            case "rp_director_started":
+                // Echo broadcast from the plugin — user already sees the
+                // intent note from handleSlashCommand. Stay quiet here.
+                break;
+            case "rp_director_scenario_proposed":
+                if (data && data.scenario) {
+                    const s = data.scenario;
+                    const bits = [];
+                    if (s.setting) bits.push(`Setting: ${s.setting}`);
+                    if (s.mood) bits.push(`Stimmung: ${s.mood}`);
+                    toast("🎬 Director", bits.join(" · ") || "Scenario-Vorschlag aktualisiert", 4000);
+                }
+                break;
+            case "rp_director_characters_proposed":
+                if (data && Array.isArray(data.characters)) {
+                    const names = data.characters.map((c) => c && c.name).filter(Boolean).join(", ");
+                    toast("🎬 Director", `Charaktere: ${names || data.characters.length}`, 4000);
+                }
+                break;
+            case "rp_director_committed":
+                if (data) {
+                    const count = (data.characters || []).length;
+                    systemNote(`🎬 RP-Setup committed — ${count} Charakter${count === 1 ? "" : "e"} aktiv. Lexy übernimmt.`);
+                }
+                break;
+            case "rp_director_cancelled":
+                systemNote("🎬 RP-Setup abgebrochen.");
+                break;
+            case "rp_director_error":
+                showError(`RP-Director: ${(data && data.error) || "Fehler"}`);
+                break;
+
+            // ── Deep-Research console (Phase 12) ─────────────────────
+            case "deep_research_started":
+            case "deep_research_planned":
+            case "deep_research_searching":
+            case "deep_research_subquery_done":
+            case "deep_research_subquery_progress":
+            case "deep_research_synthesising":
+            case "deep_research_done":
+            case "deep_research_error":
+            case "deep_research_cancelled":
+                if (window._lexyResearch) window._lexyResearch.onEvent(data);
+                break;
+
+            // ── Coder approvals + console (Phase 10.B+C) ─────────────
+            case "coder_approval_request":
+                if (window._lexyCoder) window._lexyCoder.onApprovalRequest(data);
+                break;
+            case "coder_approval_ack":
+                // Server acknowledges — we already cleared the modal locally on click.
+                break;
+            case "coder_started":
+            case "coder_planned":
+            case "coder_step_attempt":
+            case "coder_step_done":
+            case "coder_step_retry":
+            case "coder_done":
+            case "coder_error":
+            case "coder_cancelled":
+                if (window._lexyCoder) window._lexyCoder.onTaskEvent(data);
+                break;
+
             default:
                 break;
         }
     }
 
+    // ── Slash commands ─────────────────────────────────────────────
+    // Lightweight prefix interception. Anything that doesn't match
+    // returns false and falls through to the normal chat path.
+    function handleSlashCommand(text) {
+        if (!text.startsWith("/")) return false;
+        const space = text.indexOf(" ");
+        const cmd = (space === -1 ? text : text.slice(0, space)).toLowerCase();
+        const rest = space === -1 ? "" : text.slice(space + 1).trim();
+        if (cmd === "/rp") {
+            if (!state.sessionId) {
+                showError("Keine aktive Session — neu starten.");
+                return true;
+            }
+            if (!wsSend({
+                type: "rp_director_start",
+                session_id: state.sessionId,
+                user_intent: rest,
+            })) {
+                showError("WebSocket not connected.");
+                return true;
+            }
+            appendMessage("user", text);
+            input.value = "";
+            const intentNote = rest ? ` (Wunsch: ${rest})` : "";
+            systemNote(`🎬 RP-Director aktiviert${intentNote}. Beschreib einfach, was du dir vorstellst.`);
+            return true;
+        }
+        return false;
+    }
+
+    // ── Upload handling ────────────────────────────────────────────
+    //
+    // Two buttons in the composer toolbar trigger hidden <input type=file>
+    // elements. Picked files are POSTed to the right /api/v1/uploads/<kind>
+    // endpoint and the manifest is stashed in state.pendingAttachments.
+    // sendMessage() picks up the array, includes it in the chat WS frame,
+    // and the bubble-renderer shows previews/links inline.
+
+    function inferUploadKind(file) {
+        // Image files are obvious from the MIME type.
+        const mime = (file.type || "").toLowerCase();
+        if (mime.startsWith("image/")) return "image";
+        if (mime.startsWith("audio/")) return "audio";
+        // Treat common code/config extensions as code so the LLM gets a
+        // language hint. Everything else falls through to "document".
+        const name = (file.name || "").toLowerCase();
+        const codeExts = [
+            "py","pyi","js","mjs","cjs","jsx","ts","tsx","go","rs","java",
+            "kt","kts","swift","c","h","cpp","cc","hpp","cs","rb","php",
+            "sh","bash","zsh","ps1","lua","r","jl","ex","exs","erl","hs",
+            "ml","fs","vue","svelte","css","scss","sass","less","sql",
+            "graphql","gql","proto","tf","hcl","json","yaml","yml","toml",
+            "xml","makefile","dockerfile","mk",
+        ];
+        const ext = name.includes(".") ? name.split(".").pop() : name;
+        if (codeExts.includes(ext)) return "code";
+        return "document";
+    }
+
+    async function uploadFile(file, forcedKind = null) {
+        const kind = forcedKind || inferUploadKind(file);
+        const form = new FormData();
+        form.append("session_id", state.sessionId || "default");
+        form.append("file", file);
+        const resp = await fetch(`/api/v1/uploads/${kind}`, {
+            method: "POST",
+            body: form,
+        });
+        if (!resp.ok) {
+            let detail = await resp.text();
+            try { detail = JSON.parse(detail).detail || detail; } catch (_e) {}
+            throw new Error(`Upload (${kind}) failed: ${detail}`);
+        }
+        const manifest = await resp.json();
+        // Backend doesn't echo `kind` in every legacy field — make sure it's set.
+        if (!manifest.kind) manifest.kind = kind;
+        return manifest;
+    }
+
+    async function handleFilePick(file, forcedKind = null) {
+        if (!file) return;
+        const btn = forcedKind === "image" ? uploadImageBtn : uploadFileBtn;
+        if (btn) btn.dataset.busy = "true";
+        try {
+            const manifest = await uploadFile(file, forcedKind);
+            state.pendingAttachments.push(manifest);
+            renderPendingAttachments();
+            if (window.LexyHolo && window.LexyHolo.sound) {
+                window.LexyHolo.sound.play("send");
+            }
+        } catch (err) {
+            console.error("upload failed", err);
+            showError(String(err && err.message ? err.message : err));
+        } finally {
+            if (btn) btn.dataset.busy = "false";
+        }
+    }
+
+    function renderPendingAttachments() {
+        if (!composerAttachments) return;
+        if (!state.pendingAttachments.length) {
+            composerAttachments.replaceChildren();
+            composerAttachments.hidden = true;
+            return;
+        }
+        composerAttachments.hidden = false;
+        composerAttachments.replaceChildren();
+        for (const att of state.pendingAttachments) {
+            composerAttachments.appendChild(buildAttachmentChip(att));
+        }
+    }
+
+    function buildAttachmentChip(att) {
+        const chip = document.createElement("div");
+        chip.className = "attachment-chip";
+
+        const isImage = att.kind === "image";
+        if (isImage && (att.data_url || att.url)) {
+            const img = document.createElement("img");
+            img.className = "chip-thumb";
+            img.src = att.data_url || att.url;
+            img.alt = att.filename || "image";
+            chip.appendChild(img);
+        } else {
+            const icon = document.createElement("div");
+            icon.className = "chip-icon";
+            icon.textContent = ({
+                document: "📄",
+                code: "📜",
+                audio: "🎵",
+                image: "🖼",
+            }[att.kind] || "📎");
+            chip.appendChild(icon);
+        }
+
+        const name = document.createElement("span");
+        name.className = "chip-name";
+        name.textContent = att.filename || `${att.kind || "file"}`;
+        name.title = att.filename || "";
+        chip.appendChild(name);
+
+        const meta = document.createElement("span");
+        meta.className = "chip-meta";
+        const sizeKb = att.size ? Math.max(1, Math.round(att.size / 1024)) : 0;
+        const parts = [];
+        if (sizeKb) parts.push(`${sizeKb} KB`);
+        if (att.kind === "code" && att.language) parts.push(att.language);
+        if (att.kind === "document" && typeof att.chunks_indexed === "number") {
+            parts.push(`${att.chunks_indexed} chunks`);
+        }
+        if (att.kind === "audio" && att.transcript) {
+            parts.push(`${att.transcript.length} chars`);
+        }
+        meta.textContent = parts.join(" · ");
+        chip.appendChild(meta);
+
+        const remove = document.createElement("button");
+        remove.className = "chip-remove";
+        remove.type = "button";
+        remove.textContent = "✕";
+        remove.title = "Anhang entfernen";
+        remove.addEventListener("click", () => {
+            const idx = state.pendingAttachments.indexOf(att);
+            if (idx !== -1) {
+                state.pendingAttachments.splice(idx, 1);
+                renderPendingAttachments();
+                // Best-effort server-side cleanup; ignore errors.
+                if (att.upload_id) {
+                    fetch(`/api/v1/uploads/${att.upload_id}`, { method: "DELETE" })
+                        .catch(() => {});
+                }
+            }
+        });
+        chip.appendChild(remove);
+        return chip;
+    }
+
+    function clearPendingAttachments() {
+        state.pendingAttachments.length = 0;
+        renderPendingAttachments();
+    }
+
+    function renderUserMessageWithAttachments(text, attachments) {
+        // Show the user message bubble plus a per-attachment row inside it.
+        // We don't reuse appendMessage's plain textContent because we need
+        // to inject <img> / file-link nodes safely.
+        const bubble = appendMessage("user", text || "");
+        if (!bubble) return;
+        for (const att of attachments) {
+            if (att.kind === "image") {
+                const img = document.createElement("img");
+                img.className = "bubble-image";
+                img.src = att.url || att.data_url || "";
+                img.alt = att.filename || "image";
+                bubble.appendChild(img);
+            } else {
+                const link = document.createElement("a");
+                link.className = "bubble-file";
+                link.href = att.url || "#";
+                link.target = "_blank";
+                link.rel = "noopener";
+                link.textContent = `📎 ${att.filename || att.kind} `;
+                const meta = document.createElement("span");
+                meta.style.color = "var(--muted)";
+                const sizeKb = att.size ? Math.max(1, Math.round(att.size / 1024)) : 0;
+                meta.textContent = sizeKb ? `(${sizeKb} KB)` : "";
+                link.appendChild(meta);
+                bubble.appendChild(link);
+            }
+        }
+    }
+
+    if (uploadImageBtn && uploadImageInput) {
+        uploadImageBtn.addEventListener("click", () => uploadImageInput.click());
+        uploadImageInput.addEventListener("change", async () => {
+            const file = uploadImageInput.files && uploadImageInput.files[0];
+            uploadImageInput.value = "";
+            if (file) await handleFilePick(file, "image");
+        });
+    }
+    if (uploadFileBtn && uploadFileInput) {
+        uploadFileBtn.addEventListener("click", () => uploadFileInput.click());
+        uploadFileInput.addEventListener("change", async () => {
+            const file = uploadFileInput.files && uploadFileInput.files[0];
+            uploadFileInput.value = "";
+            if (file) await handleFilePick(file);
+        });
+    }
+
+    // Drag-and-drop directly onto the composer.
+    if (input) {
+        const onDrag = (ev) => { ev.preventDefault(); ev.stopPropagation(); };
+        input.addEventListener("dragenter", onDrag);
+        input.addEventListener("dragover", onDrag);
+        input.addEventListener("drop", async (ev) => {
+            ev.preventDefault();
+            const files = ev.dataTransfer && ev.dataTransfer.files;
+            if (!files || !files.length) return;
+            for (const file of files) {
+                await handleFilePick(file);
+            }
+        });
+    }
+
     // ── Chat input ─────────────────────────────────────────────────
+    // Phase 9.12: ``sendMessage()`` works on whichever tab is active —
+    // Chat or Rollenspiel. The pre-Phase-9.12 version hard-coded
+    // ``input``, ``brainSelect``, ``state.sessionId``; we now resolve
+    // those from ``getActiveChatContext()`` so the same handler serves
+    // both tabs without duplicating the streaming pipeline.
     function sendMessage() {
-        const text = input.value.trim();
-        if (!text || state.sending) return;
+        const ctx = getActiveChatContext();
+        const text = ctx.input.value.trim();
+        const hasAttachments = state.pendingAttachments.length > 0;
+        // Allow sending with empty text if attachments exist — common when
+        // dropping an image and saying "describe this" implicitly.
+        if (!text && !hasAttachments) return;
+        if (state.sending) return;
+        if (handleSlashCommand(text)) return;
+        const attachments = state.pendingAttachments.slice();
+        // Make sure ``state.sessionId`` is in sync with the active tab
+        // before we send. Defensive: switchTab() already does this, but
+        // some entry-points (initial load, hot resume) bypass it.
+        const targetSessionId = ctx.sessionId || state.sessionId;
         if (!wsSend({
             type: "chat",
             text,
-            session_id: state.sessionId,
-            brain: brainSelect.value,
+            session_id: targetSessionId,
+            brain: ctx.brain.value,
+            attachments,
         })) {
             showError("WebSocket not connected.");
             return;
         }
         state.audio.stop();
-        appendMessage("user", text);
-        input.value = "";
+        renderUserMessageWithAttachments(text, attachments);
+        ctx.input.value = "";
+        clearPendingAttachments();
         state.currentAssistantText = "";
         state.sending = true;
         setSending(true);
@@ -1252,27 +1751,94 @@
         }
     });
 
+    // Phase 9.12: same handler for the RP composer.
+    if (rpSend) rpSend.addEventListener("click", sendMessage);
+    if (rpInput) rpInput.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter" && !ev.shiftKey) {
+            ev.preventDefault();
+            sendMessage();
+        }
+    });
+
     clearChatBtn.addEventListener("click", () => {
         chatWindow.innerHTML = "";
         systemNote("Chat cleared.");
+    });
+    if (rpClearBtn) rpClearBtn.addEventListener("click", () => {
+        if (rpChatWindow) rpChatWindow.innerHTML = "";
+        systemNote("RP-Window cleared.");
     });
 
     if (newSessionBtn) {
         newSessionBtn.addEventListener("click", newSession);
     }
+    // Phase 9.12: RP-Tab hat seinen eigenen "Neue Session"-Button.
+    // Beide rufen ``newSession()`` — die Funktion liest ``state.activeTab``
+    // und legt eine Chat- bzw. RP-Session an.
+    if (rpNewSessionBtn) {
+        rpNewSessionBtn.addEventListener("click", newSession);
+    }
 
-    if (sessionPill) {
-        sessionPill.addEventListener("click", async () => {
-            if (!state.sessionId) return;
-            try {
-                await navigator.clipboard.writeText(state.sessionId);
-                toast("Copied", state.sessionId, 3000);
-            } catch (err) {
-                // Clipboard API needs secure context or user permission —
-                // fall back to a system note
-                systemNote(`Session ID: ${state.sessionId}`);
-            }
+    function _copySessionToClipboard() {
+        if (!state.sessionId) return;
+        navigator.clipboard.writeText(state.sessionId).then(() => {
+            toast("Copied", state.sessionId, 3000);
+        }).catch(() => {
+            systemNote(`Session ID: ${state.sessionId}`);
         });
+    }
+    if (sessionPill) sessionPill.addEventListener("click", _copySessionToClipboard);
+    if (rpSessionPill) rpSessionPill.addEventListener("click", _copySessionToClipboard);
+
+    // RP TTS toggle mirrors the chat TTS toggle.
+    if (rpTtsToggle) rpTtsToggle.addEventListener("click", () => {
+        state.ttsEnabled = !state.ttsEnabled;
+        const label = state.ttsEnabled ? "TTS on" : "TTS off";
+        rpTtsToggle.dataset.active = state.ttsEnabled ? "true" : "false";
+        rpTtsToggle.textContent = label;
+        if (ttsToggle) {
+            ttsToggle.dataset.active = state.ttsEnabled ? "true" : "false";
+            ttsToggle.textContent = label;
+        }
+        if (state.ttsEnabled) state.audio.ensureContext();
+        else state.audio.stop();
+    });
+
+    // ── loadRoleplay (Phase 9.12) ──────────────────────────────────
+    async function loadRoleplay() {
+        // First time the user opens the RP tab we want SOME session
+        // to be active. Prefer the remembered ``rpSessionId``; if
+        // that's missing or doesn't exist on the server anymore,
+        // fall back to the most-recently-updated kind=rp session;
+        // failing that, create a fresh one.
+        if (state.rpSessionId) {
+            // Best-effort verify the session still exists. If it does,
+            // hop on it without re-rendering history (we trust the
+            // local UI). If the user wants to re-load, they click
+            // resume from the Sessions tab.
+            state.sessionId = state.rpSessionId;
+            _syncSessionUI("rp");
+            return;
+        }
+        try {
+            const resp = await fetch("/api/v1/sessions?kind=rp");
+            if (resp.ok) {
+                const body = await resp.json();
+                const sessions = body.sessions || [];
+                if (sessions.length > 0) {
+                    // sessions are pre-sorted by updated_at desc
+                    state.rpSessionId = sessions[0].id;
+                    state.sessionId = sessions[0].id;
+                    try { localStorage.setItem("lexy_last_rp_session", sessions[0].id); } catch (_e) {}
+                    _syncSessionUI("rp");
+                    return;
+                }
+            }
+        } catch (err) {
+            console.warn("loadRoleplay: failed to list rp sessions:", err);
+        }
+        // No RP session exists yet → create one.
+        await newSession();
     }
 
     refreshBtn.addEventListener("click", () => {
@@ -1669,11 +2235,32 @@
                 const action = p.enabled ? "disable" : "enable";
                 try {
                     const resp = await fetch(`/api/v1/plugins/${p.name}/${action}`, { method: "POST" });
-                    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-                    toast(`Plugin ${action}d`, p.name);
+                    let body = null;
+                    try { body = await resp.json(); } catch { /* non-json error */ }
+                    if (!resp.ok) {
+                        // Phase 9.10: backend returns 422 with
+                        // {detail:{code,plugin,error}} for hard
+                        // failures. Show that instead of "HTTP 500".
+                        const detail = body && body.detail;
+                        const msg = detail && (detail.error || detail.code)
+                            ? `${detail.error || detail.code}`
+                            : `HTTP ${resp.status}`;
+                        throw new Error(msg);
+                    }
+                    if (action === "enable" && body && body.degraded) {
+                        // Plugin loaded but its provider couldn't be
+                        // initialised (e.g. CosyVoice server down).
+                        // Don't claim success — show the reason.
+                        toast(
+                            `${p.name} enabled (degraded)`,
+                            body.last_error || "provider not available",
+                        );
+                    } else {
+                        toast(`Plugin ${action}d`, p.name);
+                    }
                     await loadPlugins();
                 } catch (err) {
-                    toast("Error", err.message);
+                    toast(`${action} failed: ${p.name}`, err.message);
                 }
             });
             card.querySelector('[data-action="config"]').addEventListener("click", () => {
@@ -1947,16 +2534,72 @@
         sessionsList.innerHTML = `<div class="muted">loading…</div>`;
         sessionsHistory.innerHTML = `<div class="muted">Select a session to see its history.</div>`;
         try {
-            const url = state.activeProjectId
-                ? `/api/v1/sessions?project_id=${encodeURIComponent(state.activeProjectId)}`
-                : "/api/v1/sessions";
+            // ``state.sessionsShowAll`` is the per-tab toggle. When on, we
+            // bypass the project filter so Mike can see every session
+            // across every project — escape hatch for "where did my
+            // session go?" moments.
+            const showAll = !!state.sessionsShowAll;
+            // Phase 9.12: optional kind filter (chat / rp / all). The
+            // dropdown writes to ``state.sessionsKindFilter``; missing
+            // means "all".
+            const kindFilter = state.sessionsKindFilter || "all";
+            const params = new URLSearchParams();
+            if (showAll) {
+                params.set("all", "true");
+            } else if (state.activeProjectId) {
+                params.set("project_id", state.activeProjectId);
+            }
+            if (kindFilter !== "all") {
+                params.set("kind", kindFilter);
+            }
+            const url = `/api/v1/sessions${params.toString() ? "?" + params : ""}`;
             const data = await (await fetch(url)).json();
-            const items = data.sessions || [];
+            let items = data.sessions || [];
+
+            // Empty-result helper: if the active project shows nothing,
+            // peek at "all" to find out whether sessions exist at all
+            // and offer Mike a one-click fix instead of a dead-end
+            // empty list.
+            let crossProjectHint = "";
+            if (items.length === 0 && !showAll) {
+                try {
+                    const allResp = await fetch("/api/v1/sessions?all=true");
+                    if (allResp.ok) {
+                        const allData = await allResp.json();
+                        const everywhere = allData.sessions || [];
+                        if (everywhere.length > 0) {
+                            // Sessions exist in OTHER projects. Render
+                            // them right away (effectively turning the
+                            // toggle on for this view) and prepend a
+                            // banner explaining the switch — no dead
+                            // end, no scavenger hunt for the toggle.
+                            items = everywhere;
+                            const projName =
+                                (state.projectsById[state.activeProjectId]
+                                    && state.projectsById[state.activeProjectId].name)
+                                || state.activeProjectId
+                                || "(this project)";
+                            crossProjectHint = (
+                                `<div class="session-cross-hint">` +
+                                `📂 Im Projekt <b>${escapeHtml(projName)}</b> ` +
+                                `gibt es keine Sessions — zeige dir hier ` +
+                                `alle aus allen Projekten an. ` +
+                                `Klick die Session an, dann wechselt Lexy ` +
+                                `automatisch ins richtige Projekt.</div>`
+                            );
+                        }
+                    }
+                } catch (_e) { /* best-effort fallback */ }
+            }
+
             if (items.length === 0) {
-                sessionsList.innerHTML = `<div class="muted">no sessions in this project</div>`;
+                const hint = showAll
+                    ? "no sessions yet"
+                    : "no sessions yet — start a chat to create one";
+                sessionsList.innerHTML = `<div class="muted">${hint}</div>`;
                 return;
             }
-            sessionsList.innerHTML = "";
+            sessionsList.innerHTML = crossProjectHint;
             for (const s of items) {
                 const div = document.createElement("div");
                 div.className = "session-item";
@@ -1979,6 +2622,12 @@
                 const inProgressBadge = s.in_progress
                     ? '<span class="sid-role sid-role-progress">⏳ in progress</span>'
                     : "";
+                // Phase 9.12: ein kleines Tab-Badge je Session, damit
+                // Mike auf den ersten Blick sieht, ob die Session Chat
+                // oder RP ist.
+                const kindBadge = s.kind === "rp"
+                    ? '<span class="sid-role sid-role-rp" title="Rollenspiel-Session">🎬 RP</span>'
+                    : '<span class="sid-role sid-role-chat" title="Chat-Session">💬</span>';
                 // Prefer the derived title over the raw session id when present
                 const headline = s.title
                     ? `<div class="sid sid-title">${escapeHtml(s.title)}</div>
@@ -1986,7 +2635,7 @@
                     : `<div class="sid">${escapeHtml(s.id)}${isActive ? ' <span class="sid-active">· active</span>' : ''}</div>`;
                 div.innerHTML = `
                     ${headline}
-                    <div class="smeta">${s.messages} messages ${roleBadge}${inProgressBadge}</div>
+                    <div class="smeta">${kindBadge} ${s.messages} messages ${roleBadge}${inProgressBadge}</div>
                     <div class="spreview">${lastRole === "assistant" ? "🤖" : "🙂"} ${escapeHtml(preview)}</div>
                     ${userHint}
                     <div class="session-actions">
@@ -2062,28 +2711,64 @@
             toast("Busy", "Warte bis die aktuelle Antwort fertig ist");
             return;
         }
+        // Phase 9.12: Welche Session wir gerade erneuern hängt vom
+        // aktiven Tab ab. Im RP-Tab erzeugen wir eine RP-Session und
+        // hinterlegen sie auch als ``state.rpSessionId`` (und PATCHen
+        // sie kurz nach Registrieren auf ``kind=rp``); im Chat-Tab
+        // bleibt es eine normale Chat-Session.
+        const isRP = state.activeTab === "rp";
         state.audio.stop();
         state.sessionId = generateSessionId();
         state.currentAssistantBubble = null;
         state.currentReasoningBubble = null;
         state.currentAssistantText = "";
-        chatWindow.innerHTML = "";
+        const targetWindow = isRP && rpChatWindow ? rpChatWindow : chatWindow;
+        targetWindow.innerHTML = "";
+        if (isRP) {
+            state.rpSessionId = state.sessionId;
+            try { localStorage.setItem("lexy_last_rp_session", state.sessionId); } catch (_e) {}
+        } else {
+            state.chatSessionId = state.sessionId;
+            try { localStorage.setItem("lexy_last_chat_session", state.sessionId); } catch (_e) {}
+        }
         updateSessionPill();
-        systemNote(`Neue Session gestartet: ${state.sessionId}`);
+        _syncSessionUI(isRP ? "rp" : "chat");
+        systemNote(`Neue ${isRP ? "RP-" : ""}Session gestartet: ${state.sessionId}`);
         // Persist the session on the backend right away so it survives
         // a restart even if the user never sends a message. Non-blocking
         // best-effort — if it fails we log and continue.
-        registerSessionWithBackend(state.sessionId).catch((err) => {
+        registerSessionWithBackend(state.sessionId).then(() => {
+            // Phase 9.12: für RP-Sessions kind sofort setzen, damit
+            // die Session in der RP-Filter-Liste auftaucht — auch
+            // wenn der User nie einen Charakter anheftet.
+            if (isRP) {
+                fetch(`/api/v1/sessions/${encodeURIComponent(state.sessionId)}`, {
+                    method: "PATCH",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({ kind: "rp" }),
+                }).catch((err) => console.warn("session kind PATCH failed:", err));
+            }
+        }).catch((err) => {
             console.warn("session register failed:", err);
         });
     }
 
     async function registerSessionWithBackend(sessionId, extra = {}) {
         if (!sessionId) return;
+        // Tag every newly-created session with the currently active
+        // project up front so the session-list filter doesn't hide it
+        // the moment the user switches projects. ``extra`` overrides
+        // win — the caller can pass an explicit project_id (or null
+        // to deliberately leave it unassigned).
+        const payload = { session_id: sessionId };
+        if (state.activeProjectId) {
+            payload.project_id = state.activeProjectId;
+        }
+        Object.assign(payload, extra);
         const resp = await fetch("/api/v1/sessions/register", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ session_id: sessionId, ...extra }),
+            body: JSON.stringify(payload),
         });
         if (!resp.ok) throw new Error(`register HTTP ${resp.status}`);
         return resp.json();
@@ -2101,28 +2786,59 @@
             if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
             const data = await resp.json();
             const messages = data.messages || [];
+            // ``data.project_id`` is the project the session belongs to.
+            // If it doesn't match the current active project, switch the
+            // active project so the sessions list and the chat agree —
+            // otherwise Mike resumes a session and then immediately
+            // can't find it again because the active project filter is
+            // still pointing at a different bucket.
+            const sessionProject = data.project_id || "default";
+            if (sessionProject !== state.activeProjectId) {
+                state.activeProjectId = sessionProject;
+                localStorage.setItem("lexy.activeProjectId", sessionProject);
+                if (typeof renderProjectsPanel === "function") {
+                    try { renderProjectsPanel(); } catch (_e) {}
+                }
+            }
+
+            // Phase 9.12: Wenn die Session ``kind=rp`` hat, schalten wir
+            // auf den Rollenspiel-Tab um. Sonst bleibt's der Chat-Tab.
+            const sessionKind = data.kind || "chat";
+            const targetTab = sessionKind === "rp" ? "rp" : "chat";
+            const targetWindow = sessionKind === "rp" && rpChatWindow
+                ? rpChatWindow
+                : chatWindow;
 
             // Swap state + UI
             state.audio.stop();
             state.sessionId = sessionId;
+            if (sessionKind === "rp") {
+                state.rpSessionId = sessionId;
+                try { localStorage.setItem("lexy_last_rp_session", sessionId); } catch (_e) {}
+            } else {
+                state.chatSessionId = sessionId;
+                try { localStorage.setItem("lexy_last_chat_session", sessionId); } catch (_e) {}
+            }
             state.currentAssistantBubble = null;
             state.currentReasoningBubble = null;
             state.currentAssistantText = "";
-            chatWindow.innerHTML = "";
+            targetWindow.innerHTML = "";
             updateSessionPill();
+            _syncSessionUI(targetTab);
 
             systemNote(`Session geladen: ${sessionId} (${messages.length} Nachrichten)`);
 
-            // Re-render each message as a normal bubble so edit / delete /
-            // regenerate action bars hook up automatically.
+            // Re-render each message as a normal bubble. We're already
+            // on the right tab so appendMessage() routes to the right
+            // window automatically.
+            switchTab(targetTab);
             for (const m of messages) {
                 if (m.role === "user" || m.role === "assistant") {
                     appendMessage(m.role, m.content || "");
                 }
             }
 
-            switchTab("chat");
-            toast("Session loaded", `${messages.length} messages`);
+            toast("Session loaded", `${messages.length} messages (${sessionKind})`);
         } catch (err) {
             toast("Error", err.message);
         }
@@ -2152,6 +2868,41 @@
     }
 
     sessionsRefreshBtn.addEventListener("click", loadSessions);
+
+    // "Alle Projekte" toggle — escape hatch for "where did my session go?"
+    // moments. Starts off; persists the user's choice across reloads.
+    const sessionsShowAllBtn = $("sessions-show-all-btn");
+    if (sessionsShowAllBtn) {
+        const persisted = localStorage.getItem("lexy.sessions.showAll") === "1";
+        state.sessionsShowAll = persisted;
+        sessionsShowAllBtn.dataset.active = persisted ? "true" : "false";
+        sessionsShowAllBtn.addEventListener("click", () => {
+            state.sessionsShowAll = !state.sessionsShowAll;
+            sessionsShowAllBtn.dataset.active = state.sessionsShowAll ? "true" : "false";
+            localStorage.setItem(
+                "lexy.sessions.showAll",
+                state.sessionsShowAll ? "1" : "0",
+            );
+            if (state.activeTab === "sessions") loadSessions();
+        });
+    }
+
+    // Phase 9.12: kind filter dropdown wires into ``state.sessionsKindFilter``
+    // and re-loads. Persisted across reloads so Mike's choice sticks.
+    const sessionsKindFilter = $("sessions-kind-filter");
+    if (sessionsKindFilter) {
+        const persisted = localStorage.getItem("lexy.sessions.kindFilter") || "all";
+        state.sessionsKindFilter = persisted;
+        sessionsKindFilter.value = persisted;
+        sessionsKindFilter.addEventListener("change", () => {
+            state.sessionsKindFilter = sessionsKindFilter.value;
+            localStorage.setItem(
+                "lexy.sessions.kindFilter",
+                state.sessionsKindFilter,
+            );
+            if (state.activeTab === "sessions") loadSessions();
+        });
+    }
 
     // ── Settings tab ───────────────────────────────────────────────
     const routingDefaultBrain = $("routing-default-brain");
@@ -4010,8 +4761,13 @@
     const charsShowArchived = $("chars-show-archived");
     const charsRefreshBtn = $("chars-refresh-btn");
 
-    const chatCharactersBtn = $("chat-characters-btn");
-    const chatCharacterBar = $("chat-character-bar");
+    // Phase 9.12: Charakter-Bar + 🎭-Rollen-Button leben jetzt im
+    // Rollenspiel-Tab. Die Variablen heißen aus Legacy-Gründen weiter
+    // ``chatCharacters*`` — Rename wäre eine 200+-Stellen-Diff und der
+    // Name ist nur noch für interne Wiring sichtbar (im UI sind die
+    // Buttons mit ``rp-`` gelabelt).
+    const chatCharactersBtn = $("rp-characters-btn");
+    const chatCharacterBar = $("rp-character-bar");
     const charSessionModal = $("character-session-modal");
     const charSessionClose = $("char-session-close");
     const charSessionDone = $("char-session-done");
@@ -4272,7 +5028,11 @@
         });
     }
 
-    // Silly-Tavern import
+    // Silly-Tavern import — supports JSON cards AND PNG cards
+    // (cards with the chara tEXt chunk). The REST endpoint
+    // ``/api/v1/plugins/character_chat/import`` auto-detects the format
+    // by magic bytes / extension / MIME — so the frontend just needs to
+    // hand the file over via multipart/form-data.
     if (charsImportBtn) charsImportBtn.addEventListener("click", () => {
         if (charsImportFile) charsImportFile.click();
     });
@@ -4280,18 +5040,567 @@
         charsImportFile.addEventListener("change", async () => {
             const file = charsImportFile.files && charsImportFile.files[0];
             if (!file) return;
+            charsImportBtn.disabled = true;
+            charsImportBtn.textContent = "…";
             try {
-                const text = await file.text();
-                const payload = JSON.parse(text);
-                wsSend({ type: "character_import", payload });
-                charsHint("Card importiert — prüfe die Liste.", "ok");
+                const form = new FormData();
+                form.append("file", file);
+                const resp = await fetch(
+                    "/api/v1/plugins/character_chat/import",
+                    { method: "POST", body: form },
+                );
+                if (!resp.ok) {
+                    let detail = await resp.text();
+                    try { detail = JSON.parse(detail).detail || detail; }
+                    catch (_e) {}
+                    throw new Error(`HTTP ${resp.status}: ${detail}`);
+                }
+                const data = await resp.json();
+                const name = (data.character && data.character.name) || "(?)";
+                charsHint(`Card "${name}" importiert.`, "ok");
+                // Server broadcasts character_created → list refreshes
+                // automatically, no manual reload needed.
             } catch (err) {
-                charsHint("Import fehlgeschlagen: " + err.message, "error");
+                charsHint("Import fehlgeschlagen: " + (err.message || err), "error");
             } finally {
+                charsImportBtn.disabled = false;
+                charsImportBtn.textContent = "📥 Import";
                 charsImportFile.value = "";
             }
         });
     }
+
+    // ─── Lorebooks tab (Phase 9.11) ─────────────────────────────────
+    //
+    // Two-pane editor over the character_chat plugin's lorebook REST
+    // endpoints. Local state lives on ``state.lore``: list of books,
+    // active book id, list of entries for that book, plus the live
+    // scope filter. We refresh the list on demand (tab switch, manual
+    // Refresh button, after every CRUD mutation). The plugin also
+    // broadcasts ``lorebook_*`` / ``lore_entry_*`` events over WS, but
+    // for the editor itself the ack from the REST call is enough — we
+    // refresh locally rather than waiting for the broadcast.
+
+    state.lore = {
+        books: [],
+        activeBookId: null,
+        entries: [],
+        scope: "all",      // matches the scope filter dropdown
+        scopeId: "",       // character_id / session_id when scope != all/global
+    };
+
+    const loreBooksPane = $("lore-books-pane");
+    const loreEntriesPane = $("lore-entries-pane");
+    const loreScopeFilter = $("lore-scope-filter");
+    const loreScopeIdFilter = $("lore-scope-id-filter");
+    const loreNewBookBtn = $("lore-new-book-btn");
+    const loreRefreshBtn = $("lore-refresh-btn");
+
+    // Book modal refs
+    const loreBookModal = $("lore-book-modal");
+    const loreBookForm = $("lore-book-form");
+    const loreBookId = $("lore-book-id");
+    const loreBookName = $("lore-book-name");
+    const loreBookDescription = $("lore-book-description");
+    const loreBookScope = $("lore-book-scope");
+    const loreBookScopeIdRow = $("lore-book-scope-id-row");
+    const loreBookScopeIdLabel = $("lore-book-scope-id-label");
+    const loreBookScopeId = $("lore-book-scope-id");
+    const loreBookTokenBudget = $("lore-book-token-budget");
+    const loreBookEnabled = $("lore-book-enabled");
+    const loreBookDelete = $("lore-book-delete");
+    const loreBookCancel = $("lore-book-cancel");
+    const loreBookModalClose = $("lore-book-modal-close");
+    const loreBookModalTitle = $("lore-book-modal-title");
+
+    // Entry modal refs
+    const loreEntryModal = $("lore-entry-modal");
+    const loreEntryForm = $("lore-entry-form");
+    const loreEntryId = $("lore-entry-id");
+    const loreEntryBookId = $("lore-entry-book-id");
+    const loreEntryName = $("lore-entry-name");
+    const loreEntryKeys = $("lore-entry-keys");
+    const loreEntryAlwaysOn = $("lore-entry-always-on");
+    const loreEntryContent = $("lore-entry-content");
+    const loreEntryPosition = $("lore-entry-position");
+    const loreEntryPriority = $("lore-entry-priority");
+    const loreEntryScanDepth = $("lore-entry-scan-depth");
+    const loreEntryEnabled = $("lore-entry-enabled");
+    const loreEntryDelete = $("lore-entry-delete");
+    const loreEntryCancel = $("lore-entry-cancel");
+    const loreEntryModalClose = $("lore-entry-modal-close");
+    const loreEntryModalTitle = $("lore-entry-modal-title");
+
+    // ── Top-level loader ──────────────────────────────────────────
+    async function loadLorebooks() {
+        if (!loreBooksPane) return;
+        loreBooksPane.innerHTML = '<div class="muted">loading…</div>';
+        // Build query based on scope filter.
+        const params = new URLSearchParams();
+        if (state.lore.scope && state.lore.scope !== "all") {
+            params.set("scope", state.lore.scope);
+            if (state.lore.scopeId) params.set("scope_id", state.lore.scopeId);
+        }
+        const qs = params.toString() ? `?${params}` : "";
+        try {
+            const resp = await fetch(`/api/v1/plugins/character_chat/lorebooks${qs}`);
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            const body = await resp.json();
+            state.lore.books = body.books || [];
+            renderLoreBooksList();
+            // If the active book disappeared (filtered out, deleted), clear it.
+            if (state.lore.activeBookId &&
+                !state.lore.books.find(b => b.id === state.lore.activeBookId)) {
+                state.lore.activeBookId = null;
+                state.lore.entries = [];
+                renderLoreEntries();
+            } else if (state.lore.activeBookId) {
+                // Refresh entries for the still-active book.
+                await loadLoreEntries(state.lore.activeBookId);
+            }
+        } catch (err) {
+            loreBooksPane.innerHTML = `<div class="muted">Fehler: ${err.message}</div>`;
+        }
+    }
+
+    function renderLoreBooksList() {
+        if (!loreBooksPane) return;
+        loreBooksPane.innerHTML = "";
+        if (!state.lore.books.length) {
+            loreBooksPane.innerHTML =
+                '<div class="muted">Keine Lorebooks. Klick „+ Neues Buch" um eines anzulegen.</div>';
+            return;
+        }
+        for (const book of state.lore.books) {
+            const card = document.createElement("div");
+            card.className = `lore-book-card scope-${book.scope}`;
+            if (book.id === state.lore.activeBookId) card.classList.add("active");
+            if (!book.enabled) card.classList.add("disabled");
+            const scopeLabel = scopeLabelFor(book);
+            card.innerHTML = `
+                <div class="lore-book-name">
+                    ${escapeHtml(book.name)}
+                    ${book.enabled ? "" : '<span class="muted">(off)</span>'}
+                </div>
+                <div class="lore-book-meta">
+                    <span class="lore-scope-badge scope-${book.scope}">${book.scope}</span>
+                    ${scopeLabel ? `<span>${escapeHtml(scopeLabel)}</span>` : ""}
+                    <span>budget: ${book.token_budget}</span>
+                </div>
+                ${book.description ? `<div class="lore-book-desc">${escapeHtml(book.description)}</div>` : ""}
+            `;
+            card.addEventListener("click", (e) => {
+                // Right-click / shift-click → edit book; plain click → load entries.
+                if (e.shiftKey || e.button === 2) {
+                    openBookModalForEdit(book);
+                } else {
+                    state.lore.activeBookId = book.id;
+                    renderLoreBooksList();
+                    loadLoreEntries(book.id);
+                }
+            });
+            card.addEventListener("contextmenu", (e) => {
+                e.preventDefault();
+                openBookModalForEdit(book);
+            });
+            loreBooksPane.appendChild(card);
+        }
+    }
+
+    function scopeLabelFor(book) {
+        if (book.scope === "global") return "alle Sessions";
+        if (book.scope === "character") {
+            const c = (state.characters || []).find(x => x.id === book.scope_id);
+            return c ? `→ ${c.name}` : `→ ${book.scope_id.slice(0, 8)}…`;
+        }
+        if (book.scope === "session") {
+            return `→ ${book.scope_id.slice(0, 8)}…`;
+        }
+        return "";
+    }
+
+    // ── Entry list (right pane) ───────────────────────────────────
+    async function loadLoreEntries(bookId) {
+        if (!loreEntriesPane) return;
+        loreEntriesPane.innerHTML = '<div class="muted">loading entries…</div>';
+        try {
+            const resp = await fetch(
+                `/api/v1/plugins/character_chat/lorebooks/${encodeURIComponent(bookId)}/entries`
+            );
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            const body = await resp.json();
+            state.lore.entries = body.entries || [];
+            renderLoreEntries();
+        } catch (err) {
+            loreEntriesPane.innerHTML =
+                `<div class="muted">Fehler beim Laden: ${err.message}</div>`;
+        }
+    }
+
+    function renderLoreEntries() {
+        if (!loreEntriesPane) return;
+        const book = state.lore.books.find(b => b.id === state.lore.activeBookId);
+        if (!book) {
+            loreEntriesPane.innerHTML =
+                '<div class="lore-empty muted">Wähle links ein Lorebook um seine Einträge zu sehen.</div>';
+            return;
+        }
+        const head = document.createElement("div");
+        head.className = "lore-entries-header";
+        head.innerHTML = `
+            <div>
+                <div class="lore-current-book-name">${escapeHtml(book.name)}</div>
+                <div class="lore-current-book-meta">
+                    <span class="lore-scope-badge scope-${book.scope}">${book.scope}</span>
+                    ${book.description ? escapeHtml(book.description) : "<span class=\"muted\">keine Beschreibung</span>"}
+                </div>
+            </div>
+            <div style="display:flex;gap:6px;">
+                <button class="btn" id="lore-edit-book-btn">📝 Buch bearbeiten</button>
+                <button class="btn primary" id="lore-new-entry-btn">+ Neuer Eintrag</button>
+            </div>
+        `;
+        loreEntriesPane.innerHTML = "";
+        loreEntriesPane.appendChild(head);
+
+        $("lore-edit-book-btn").addEventListener("click", () => openBookModalForEdit(book));
+        $("lore-new-entry-btn").addEventListener("click", () => openEntryModalForNew(book.id));
+
+        if (!state.lore.entries.length) {
+            const empty = document.createElement("div");
+            empty.className = "muted";
+            empty.style.padding = "30px 10px";
+            empty.style.textAlign = "center";
+            empty.textContent = "Noch keine Einträge — leg den ersten an.";
+            loreEntriesPane.appendChild(empty);
+            return;
+        }
+
+        const table = document.createElement("table");
+        table.className = "lore-entries-table";
+        table.innerHTML = `
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th>Trigger</th>
+                    <th>Position</th>
+                    <th>Prio</th>
+                    <th>Inhalt</th>
+                </tr>
+            </thead>
+            <tbody></tbody>
+        `;
+        const tbody = table.querySelector("tbody");
+        for (const entry of state.lore.entries) {
+            const row = document.createElement("tr");
+            row.className = "entry-row";
+            if (!entry.enabled) row.classList.add("disabled");
+            const keysHtml = entry.always_on
+                ? '<span class="lore-key-chip always-on">⏰ always-on</span>'
+                : (entry.keys || []).map(k =>
+                    `<span class="lore-key-chip">${escapeHtml(k)}</span>`
+                  ).join(" ") || '<span class="muted">— (kein Trigger)</span>';
+            const preview = (entry.content || "")
+                .replace(/\s+/g, " ")
+                .slice(0, 80);
+            row.innerHTML = `
+                <td><strong>${escapeHtml(entry.name)}</strong>${entry.enabled ? "" : ' <span class="muted">(off)</span>'}</td>
+                <td>${keysHtml}</td>
+                <td><span class="lore-position-pill">${entry.position}</span></td>
+                <td>${entry.priority}</td>
+                <td class="muted">${escapeHtml(preview)}${entry.content && entry.content.length > 80 ? "…" : ""}</td>
+            `;
+            row.addEventListener("click", () => openEntryModalForEdit(entry));
+            tbody.appendChild(row);
+        }
+        loreEntriesPane.appendChild(table);
+    }
+
+    // ── Book modal ────────────────────────────────────────────────
+    function openBookModalForNew() {
+        loreBookForm.reset();
+        loreBookId.value = "";
+        loreBookEnabled.checked = true;
+        loreBookTokenBudget.value = 1500;
+        loreBookScope.value = "global";
+        loreBookDelete.hidden = true;
+        loreBookModalTitle.textContent = "Neues Lorebook";
+        updateBookScopeIdRow();
+        loreBookModal.hidden = false;
+        loreBookName.focus();
+    }
+
+    function openBookModalForEdit(book) {
+        loreBookForm.reset();
+        loreBookId.value = book.id;
+        loreBookName.value = book.name;
+        loreBookDescription.value = book.description || "";
+        loreBookScope.value = book.scope;
+        loreBookTokenBudget.value = book.token_budget;
+        loreBookEnabled.checked = !!book.enabled;
+        loreBookDelete.hidden = false;
+        loreBookModalTitle.textContent = `Lorebook · ${book.name}`;
+        updateBookScopeIdRow(book.scope_id);
+        loreBookModal.hidden = false;
+        loreBookName.focus();
+    }
+
+    function updateBookScopeIdRow(currentValue = "") {
+        const scope = loreBookScope.value;
+        if (scope === "global") {
+            loreBookScopeIdRow.hidden = true;
+            return;
+        }
+        loreBookScopeIdRow.hidden = false;
+        loreBookScopeIdLabel.textContent = scope === "character" ? "Charakter" : "Session";
+        loreBookScopeId.innerHTML = "";
+        if (scope === "character") {
+            const chars = state.characters || [];
+            if (!chars.length) {
+                const opt = document.createElement("option");
+                opt.value = "";
+                opt.textContent = "(keine Charaktere — bitte erst einen anlegen)";
+                loreBookScopeId.appendChild(opt);
+            } else {
+                for (const c of chars) {
+                    const opt = document.createElement("option");
+                    opt.value = c.id;
+                    opt.textContent = c.name;
+                    if (c.id === currentValue) opt.selected = true;
+                    loreBookScopeId.appendChild(opt);
+                }
+            }
+        } else {
+            // Session: free-form input in a single option (we let the user
+            // paste IDs from the Sessions tab — the active session is the
+            // default if available).
+            const opt = document.createElement("option");
+            opt.value = currentValue || state.sessionId || "";
+            opt.textContent = currentValue
+                ? currentValue
+                : (state.sessionId ? `aktive Session (${state.sessionId.slice(0, 8)}…)` : "—");
+            loreBookScopeId.appendChild(opt);
+        }
+    }
+
+    if (loreBookScope) loreBookScope.addEventListener("change", () => updateBookScopeIdRow());
+    if (loreBookCancel) loreBookCancel.addEventListener("click", () => loreBookModal.hidden = true);
+    if (loreBookModalClose) loreBookModalClose.addEventListener("click", () => loreBookModal.hidden = true);
+
+    if (loreBookForm) loreBookForm.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const payload = {
+            name: loreBookName.value.trim(),
+            description: loreBookDescription.value,
+            scope: loreBookScope.value,
+            scope_id: loreBookScope.value === "global" ? "" : (loreBookScopeId.value || ""),
+            token_budget: parseInt(loreBookTokenBudget.value, 10) || 1500,
+            enabled: loreBookEnabled.checked,
+        };
+        const id = loreBookId.value;
+        try {
+            const resp = id
+                ? await fetch(
+                    `/api/v1/plugins/character_chat/lorebooks/${encodeURIComponent(id)}`,
+                    { method: "PATCH", headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify(payload) }
+                  )
+                : await fetch(
+                    "/api/v1/plugins/character_chat/lorebooks",
+                    { method: "POST", headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify(payload) }
+                  );
+            if (!resp.ok) {
+                const err = await resp.json().catch(() => ({ detail: `HTTP ${resp.status}` }));
+                throw new Error(err.detail || `HTTP ${resp.status}`);
+            }
+            const body = await resp.json();
+            loreBookModal.hidden = true;
+            // Make the just-created book the active one.
+            if (!id && body.book) state.lore.activeBookId = body.book.id;
+            await loadLorebooks();
+            toast(id ? "Lorebook aktualisiert" : "Lorebook erstellt", payload.name);
+        } catch (err) {
+            toast("Fehler", err.message);
+        }
+    });
+
+    if (loreBookDelete) loreBookDelete.addEventListener("click", async () => {
+        const id = loreBookId.value;
+        if (!id) return;
+        const book = state.lore.books.find(b => b.id === id);
+        if (!confirm(
+            `Lorebook „${book?.name || id}" wirklich löschen?\n` +
+            "Alle Einträge werden mit gelöscht (cascade). Nicht rückgängig machbar."
+        )) return;
+        try {
+            const resp = await fetch(
+                `/api/v1/plugins/character_chat/lorebooks/${encodeURIComponent(id)}`,
+                { method: "DELETE" }
+            );
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            loreBookModal.hidden = true;
+            if (state.lore.activeBookId === id) {
+                state.lore.activeBookId = null;
+                state.lore.entries = [];
+            }
+            await loadLorebooks();
+            toast("Lorebook gelöscht", book?.name || id);
+        } catch (err) {
+            toast("Fehler", err.message);
+        }
+    });
+
+    // ── Entry modal ───────────────────────────────────────────────
+    function openEntryModalForNew(bookId) {
+        loreEntryForm.reset();
+        loreEntryId.value = "";
+        loreEntryBookId.value = bookId;
+        loreEntryEnabled.checked = true;
+        loreEntryAlwaysOn.checked = false;
+        loreEntryPosition.value = "before_scenario";
+        loreEntryPriority.value = 100;
+        loreEntryScanDepth.value = 4;
+        loreEntryDelete.hidden = true;
+        loreEntryModalTitle.textContent = "Neuer Eintrag";
+        loreEntryModal.hidden = false;
+        loreEntryName.focus();
+    }
+
+    function openEntryModalForEdit(entry) {
+        loreEntryForm.reset();
+        loreEntryId.value = entry.id;
+        loreEntryBookId.value = entry.lorebook_id;
+        loreEntryName.value = entry.name;
+        loreEntryKeys.value = (entry.keys || []).join(", ");
+        loreEntryAlwaysOn.checked = !!entry.always_on;
+        loreEntryContent.value = entry.content || "";
+        loreEntryPosition.value = entry.position;
+        loreEntryPriority.value = entry.priority;
+        loreEntryScanDepth.value = entry.scan_depth;
+        loreEntryEnabled.checked = !!entry.enabled;
+        loreEntryDelete.hidden = false;
+        loreEntryModalTitle.textContent = `Eintrag · ${entry.name}`;
+        loreEntryModal.hidden = false;
+        loreEntryName.focus();
+    }
+
+    if (loreEntryCancel) loreEntryCancel.addEventListener("click", () => loreEntryModal.hidden = true);
+    if (loreEntryModalClose) loreEntryModalClose.addEventListener("click", () => loreEntryModal.hidden = true);
+
+    if (loreEntryForm) loreEntryForm.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const keys = (loreEntryKeys.value || "")
+            .split(",")
+            .map(k => k.trim())
+            .filter(Boolean);
+        if (!keys.length && !loreEntryAlwaysOn.checked) {
+            toast("Eintrag braucht Trigger", "Mindestens ein Key oder Always-On.");
+            return;
+        }
+        const payload = {
+            name: loreEntryName.value.trim(),
+            keys: keys,
+            content: loreEntryContent.value,
+            position: loreEntryPosition.value,
+            priority: parseInt(loreEntryPriority.value, 10) || 100,
+            always_on: loreEntryAlwaysOn.checked,
+            scan_depth: parseInt(loreEntryScanDepth.value, 10) || 4,
+            enabled: loreEntryEnabled.checked,
+        };
+        const id = loreEntryId.value;
+        const bookId = loreEntryBookId.value;
+        try {
+            const resp = id
+                ? await fetch(
+                    `/api/v1/plugins/character_chat/lore_entries/${encodeURIComponent(id)}`,
+                    { method: "PATCH", headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify(payload) }
+                  )
+                : await fetch(
+                    `/api/v1/plugins/character_chat/lorebooks/${encodeURIComponent(bookId)}/entries`,
+                    { method: "POST", headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify(payload) }
+                  );
+            if (!resp.ok) {
+                const err = await resp.json().catch(() => ({ detail: `HTTP ${resp.status}` }));
+                throw new Error(err.detail || `HTTP ${resp.status}`);
+            }
+            loreEntryModal.hidden = true;
+            await loadLoreEntries(bookId);
+            toast(id ? "Eintrag aktualisiert" : "Eintrag erstellt", payload.name);
+        } catch (err) {
+            toast("Fehler", err.message);
+        }
+    });
+
+    if (loreEntryDelete) loreEntryDelete.addEventListener("click", async () => {
+        const id = loreEntryId.value;
+        const bookId = loreEntryBookId.value;
+        if (!id) return;
+        const entry = state.lore.entries.find(en => en.id === id);
+        if (!confirm(`Eintrag „${entry?.name || id}" wirklich löschen?`)) return;
+        try {
+            const resp = await fetch(
+                `/api/v1/plugins/character_chat/lore_entries/${encodeURIComponent(id)}`,
+                { method: "DELETE" }
+            );
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            loreEntryModal.hidden = true;
+            await loadLoreEntries(bookId);
+            toast("Eintrag gelöscht", entry?.name || id);
+        } catch (err) {
+            toast("Fehler", err.message);
+        }
+    });
+
+    // ── Scope filter + buttons ────────────────────────────────────
+    if (loreScopeFilter) loreScopeFilter.addEventListener("change", () => {
+        state.lore.scope = loreScopeFilter.value;
+        // Show / hide the scope-id select based on the chosen scope.
+        if (state.lore.scope === "character") {
+            populateLoreScopeIdFilter("character");
+            loreScopeIdFilter.hidden = false;
+        } else if (state.lore.scope === "session") {
+            populateLoreScopeIdFilter("session");
+            loreScopeIdFilter.hidden = false;
+        } else {
+            loreScopeIdFilter.hidden = true;
+            state.lore.scopeId = "";
+        }
+        loadLorebooks();
+    });
+
+    if (loreScopeIdFilter) loreScopeIdFilter.addEventListener("change", () => {
+        state.lore.scopeId = loreScopeIdFilter.value;
+        loadLorebooks();
+    });
+
+    function populateLoreScopeIdFilter(kind) {
+        loreScopeIdFilter.innerHTML = "";
+        const blank = document.createElement("option");
+        blank.value = "";
+        blank.textContent = kind === "character" ? "(alle Charaktere)" : "(aktuelle Session)";
+        loreScopeIdFilter.appendChild(blank);
+        if (kind === "character") {
+            for (const c of state.characters || []) {
+                const opt = document.createElement("option");
+                opt.value = c.id;
+                opt.textContent = c.name;
+                loreScopeIdFilter.appendChild(opt);
+            }
+        } else if (kind === "session" && state.sessionId) {
+            const opt = document.createElement("option");
+            opt.value = state.sessionId;
+            opt.textContent = `aktive (${state.sessionId.slice(0, 8)}…)`;
+            opt.selected = true;
+            loreScopeIdFilter.appendChild(opt);
+            state.lore.scopeId = state.sessionId;
+        }
+    }
+
+    if (loreNewBookBtn) loreNewBookBtn.addEventListener("click", openBookModalForNew);
+    if (loreRefreshBtn) loreRefreshBtn.addEventListener("click", loadLorebooks);
 
     // ─── Character session modal (chat toolbar) ─────────────────────
 
@@ -4491,11 +5800,33 @@
     // ─── Character turn rendering ──────────────────────────────────
 
     function appendCharacterTurn(turn) {
-        if (!chatWindow) return;
+        // Phase 9.12: Charakter-Turns gehören eigentlich immer in den
+        // Rollenspiel-Tab. Falls aus Legacy-Gründen ein Char-Turn für
+        // eine Chat-Session reinkommt (alter Sim-Modus, Pre-9.12-Turn-
+        // Replay), zeigen wir ihn als Fallback im chat-Tab. Routing
+        // anhand turn.session_id stellt sicher, dass ein Pulse, der
+        // von einer Hintergrund-Session kommt, im richtigen Window
+        // landet — auch wenn der User gerade einen anderen Tab offen
+        // hat.
+        let targetWindow = rpChatWindow;
+        if (turn.session_id && turn.session_id === state.chatSessionId) {
+            targetWindow = chatWindow;
+        } else if (!turn.session_id) {
+            // Kein session_id im Payload (alte Backends) → aktuelle
+            // Tab-Wahl als Best-Guess nehmen.
+            targetWindow = (state.activeTab === "rp" && rpChatWindow)
+                ? rpChatWindow
+                : chatWindow;
+        }
+        if (!targetWindow) return;
         const card = charactersState.list.find((c) => c.id === turn.character_id);
         const wrapper = document.createElement("div");
         wrapper.className = "msg character" + (turn.skipped ? " skipped" : "");
         wrapper.style.setProperty("--char-color", (card && card.color) || "#7aa2f7");
+        // Tag the wrapper with the turn_id so the WS update/delete
+        // broadcasts can find and patch this exact bubble later.
+        if (turn.turn_id) wrapper.dataset.turnId = turn.turn_id;
+        if (turn.character_id) wrapper.dataset.characterId = turn.character_id;
 
         const avatar = document.createElement("div");
         avatar.className = "char-bubble-avatar";
@@ -4520,10 +5851,114 @@
             ? `*${turn.character_name} schweigt*`
             : (turn.content || "");
         body.appendChild(text);
+
+        // Action bar — at parity with normal-chat bubbles. Edit / delete /
+        // regenerate dispatch via WS to the character_chat plugin's
+        // _ws_turn_* handlers.
+        if (turn.turn_id) {
+            const actions = buildCharacterTurnActions(wrapper, turn);
+            body.appendChild(actions);
+        }
         wrapper.appendChild(body);
 
-        chatWindow.appendChild(wrapper);
-        chatWindow.scrollTop = chatWindow.scrollHeight;
+        targetWindow.appendChild(wrapper);
+        targetWindow.scrollTop = targetWindow.scrollHeight;
+    }
+
+    function buildCharacterTurnActions(wrapper, turn) {
+        const bar = document.createElement("div");
+        bar.className = "msg-actions char-msg-actions";
+
+        const editBtn = document.createElement("button");
+        editBtn.className = "msg-action";
+        editBtn.textContent = "✎ Edit";
+        editBtn.title = "Diesen Turn-Text bearbeiten";
+        editBtn.addEventListener("click", (ev) => {
+            ev.stopPropagation();
+            startEditCharacterTurn(wrapper, turn);
+        });
+        bar.appendChild(editBtn);
+
+        const regenBtn = document.createElement("button");
+        regenBtn.className = "msg-action primary";
+        regenBtn.textContent = "↻ Regenerate";
+        regenBtn.title = "Diesen Turn neu generieren (denselben Trigger)";
+        regenBtn.addEventListener("click", (ev) => {
+            ev.stopPropagation();
+            if (!confirm(`${turn.character_name}'s Antwort neu generieren?`)) return;
+            wsSend({ type: "character_turn_regenerate", turn_id: turn.turn_id });
+            regenBtn.disabled = true;
+            regenBtn.textContent = "…";
+        });
+        bar.appendChild(regenBtn);
+
+        const delBtn = document.createElement("button");
+        delBtn.className = "msg-action danger";
+        delBtn.textContent = "🗑 Delete";
+        delBtn.title = "Diesen Turn löschen";
+        delBtn.addEventListener("click", (ev) => {
+            ev.stopPropagation();
+            if (!confirm(`Turn von ${turn.character_name} löschen?`)) return;
+            wsSend({ type: "character_turn_delete", turn_id: turn.turn_id });
+        });
+        bar.appendChild(delBtn);
+        return bar;
+    }
+
+    function startEditCharacterTurn(wrapper, turn) {
+        const textEl = wrapper.querySelector(".char-bubble-text");
+        if (!textEl) return;
+        const original = turn.skipped ? "" : (turn.content || "");
+        const ta = document.createElement("textarea");
+        ta.className = "char-edit-textarea";
+        ta.value = original;
+        ta.rows = Math.min(12, Math.max(2, original.split("\n").length + 1));
+        textEl.replaceWith(ta);
+        ta.focus();
+        ta.select();
+
+        const oldBar = wrapper.querySelector(".char-msg-actions");
+        const newBar = document.createElement("div");
+        newBar.className = "msg-actions char-msg-actions";
+        const saveBtn = document.createElement("button");
+        saveBtn.className = "msg-action primary";
+        saveBtn.textContent = "Speichern";
+        const cancelBtn = document.createElement("button");
+        cancelBtn.className = "msg-action";
+        cancelBtn.textContent = "Abbrechen";
+        newBar.appendChild(saveBtn);
+        newBar.appendChild(cancelBtn);
+        if (oldBar) oldBar.replaceWith(newBar);
+
+        const restore = (newContent) => {
+            const restoredText = document.createElement("div");
+            restoredText.className = "char-bubble-text";
+            restoredText.textContent = newContent || (turn.skipped ? `*${turn.character_name} schweigt*` : "");
+            ta.replaceWith(restoredText);
+            const restoredBar = buildCharacterTurnActions(wrapper, {
+                ...turn, content: newContent, skipped: false,
+            });
+            newBar.replaceWith(restoredBar);
+        };
+
+        saveBtn.addEventListener("click", () => {
+            const newContent = ta.value.trim();
+            if (!newContent) {
+                toast("Edit", "Inhalt darf nicht leer sein");
+                return;
+            }
+            wsSend({
+                type: "character_turn_edit",
+                turn_id: turn.turn_id,
+                content: newContent,
+            });
+            restore(newContent);
+            // The server broadcast will arrive shortly and patch via
+            // onTurnUpdated (idempotent — same content already applied).
+        });
+        cancelBtn.addEventListener("click", () => {
+            restore(original);
+        });
     }
 
     // ─── WS dispatch for character_chat messages (hook into existing switch) ──
@@ -4579,6 +6014,26 @@
             if (data.session_id !== state.sessionId) return;
             appendCharacterTurn(data);
         },
+        onTurnUpdated: (data) => {
+            if (!data || !data.turn_id) return;
+            const wrapper = chatWindow && chatWindow.querySelector(
+                `.msg.character[data-turn-id="${CSS.escape(data.turn_id)}"]`
+            );
+            if (!wrapper) return;
+            const textEl = wrapper.querySelector(".char-bubble-text");
+            if (textEl) {
+                textEl.textContent = data.skipped
+                    ? `*${data.character_name || "?"} schweigt*`
+                    : (data.content || "");
+            }
+        },
+        onTurnDeleted: (data) => {
+            if (!data || !data.turn_id) return;
+            const wrapper = chatWindow && chatWindow.querySelector(
+                `.msg.character[data-turn-id="${CSS.escape(data.turn_id)}"]`
+            );
+            if (wrapper) wrapper.remove();
+        },
         onTurnAudio: (data) => {
             // Per-character voice: backend sends us the turn text already
             // rendered as WAV bytes base64-encoded. Only play when the
@@ -4625,4 +6080,340 @@
     loadHealth();
     loadProjects();
     systemNote("Willkommen bei Lexy AI. Klick TTS on oder halte das Mic-Icon.");
+})();
+
+
+/* ─── Coder UI (approval modal + live task console, Phase 10.B+C) ──── */
+(() => {
+    const $ = (id) => document.getElementById(id);
+
+    const overlay     = $("coder-approval-overlay");
+    const modalRisk   = $("coder-approval-risk");
+    const modalTitle  = $("coder-approval-title");
+    const modalAction = $("coder-approval-action");
+    const modalPreview= $("coder-approval-preview");
+    const modalPayload= $("coder-approval-payload");
+    const btnApprove  = $("coder-approve-btn");
+    const btnDeny     = $("coder-deny-btn");
+    const btnSession  = $("coder-approve-session-btn");
+    const consoleEl   = $("coder-console");
+    const consoleBody = $("coder-console-body");
+    const consoleClose= $("coder-console-close");
+
+    // No coder UI on this page (e.g. older index.html) — bail safely.
+    if (!overlay || !consoleEl) {
+        window._lexyCoder = { onApprovalRequest: () => {}, onTaskEvent: () => {} };
+        return;
+    }
+
+    // ── Modal state ────────────────────────────────────────────────
+    let pendingRequest = null;
+
+    function getActiveSessionId() {
+        try {
+            return window._lexySessionId
+                || localStorage.getItem("lexy_last_session")
+                || "";
+        } catch (_e) { return ""; }
+    }
+
+    function wsSendCoder(payload) {
+        // We don't have direct access to the chat IIFE's wsSend helper, so
+        // we open a tiny shortcut via window-level event the chat module
+        // listens for. The chat IIFE registered `window.LexyHolo` etc., but
+        // not its ws — so we use a CustomEvent and register the listener
+        // back in the chat IIFE if needed. For now, dispatch directly via
+        // the global ws if the chat IIFE exposed it.
+        if (window._lexySendWs) {
+            return window._lexySendWs(payload);
+        }
+        console.warn("coder: no ws sender exposed; approval ignored");
+        return false;
+    }
+
+    function showModal(req) {
+        pendingRequest = req || null;
+        if (!req) return;
+        const risk = (req.risk || "med").toLowerCase();
+        modalRisk.dataset.risk = risk;
+        modalRisk.textContent = risk.toUpperCase();
+        modalTitle.textContent = "Lexy fragt nach Genehmigung…";
+        modalAction.textContent = req.action || "(unknown)";
+        modalPreview.textContent = req.preview || "(no preview)";
+        try {
+            modalPayload.textContent = JSON.stringify(req.payload || {}, null, 2);
+        } catch (_e) {
+            modalPayload.textContent = String(req.payload || "");
+        }
+        // For HIGH risk, hide the session-approve shortcut so Mike can't
+        // accidentally rubber-stamp dangerous actions.
+        btnSession.hidden = (risk === "high");
+        overlay.hidden = false;
+    }
+
+    function closeModal() {
+        overlay.hidden = true;
+        pendingRequest = null;
+    }
+
+    function decide(decision) {
+        if (!pendingRequest) {
+            closeModal();
+            return;
+        }
+        wsSendCoder({
+            type: "coder_approval_response",
+            request_id: pendingRequest.request_id,
+            decision,
+            session_id: getActiveSessionId(),
+            action: pendingRequest.action,
+        });
+        closeModal();
+    }
+
+    btnApprove.addEventListener("click", () => decide("approve"));
+    btnDeny.addEventListener("click", () => decide("deny"));
+    btnSession.addEventListener("click", () => decide("approve_session"));
+    overlay.addEventListener("click", (ev) => {
+        // Click outside the modal panel = treat as deny (safer default).
+        if (ev.target === overlay) decide("deny");
+    });
+    document.addEventListener("keydown", (ev) => {
+        if (overlay.hidden) return;
+        if (ev.key === "Escape") decide("deny");
+        if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) decide("approve");
+    });
+
+    // ── Console state ──────────────────────────────────────────────
+    const tasks = new Map();   // task_id → DOM element
+
+    function showConsole() {
+        consoleEl.hidden = false;
+    }
+    consoleClose.addEventListener("click", () => {
+        consoleEl.hidden = true;
+    });
+
+    function renderTask(task) {
+        let card = tasks.get(task.task_id);
+        if (!card) {
+            card = document.createElement("div");
+            card.className = "coder-task-card";
+            card.dataset.taskId = task.task_id;
+            consoleBody.prepend(card);
+            tasks.set(task.task_id, card);
+        }
+        const stateBadge = `<span class="coder-task-state" data-state="${task.state}">${task.state}</span>`;
+        const desc = (task.description || "").slice(0, 80) || "(no description)";
+        const stepsHtml = (task.steps || []).map((s, idx) => {
+            const completed = s.completed ? "true" : "false";
+            const isCurrent = !s.completed && (task.steps || []).slice(0, idx).every(p => p.completed);
+            const cls = isCurrent && task.state === "running" ? "coder-task-step current" : "coder-task-step";
+            const retryHint = s.retries > 0 ? ` <span style="color:var(--muted)">(retry ${s.retries})</span>` : "";
+            return `<div class="${cls}" data-completed="${completed}">${escapeHtml(s.description.slice(0, 70))}${retryHint}</div>`;
+        }).join("");
+        const errorHtml = task.last_error
+            ? `<div class="coder-task-error" title="${escapeHtml(task.last_error)}">${escapeHtml(task.last_error.slice(0, 90))}</div>`
+            : "";
+        card.innerHTML = `
+            <div class="coder-task-head">
+                ${stateBadge}
+                <span class="coder-task-desc" title="${escapeHtml(task.description || "")}">${escapeHtml(desc)}</span>
+            </div>
+            ${stepsHtml ? `<div class="coder-task-steps">${stepsHtml}</div>` : ""}
+            ${errorHtml}
+        `;
+        showConsole();
+    }
+
+    function escapeHtml(str) {
+        return String(str || "")
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#39;");
+    }
+
+    // ── Public API for the chat module ─────────────────────────────
+    window._lexyCoder = {
+        onApprovalRequest(req) {
+            if (!req) return;
+            showModal(req);
+        },
+        onTaskEvent(task) {
+            if (!task || !task.task_id) return;
+            renderTask(task);
+        },
+    };
+})();
+
+
+/* ─── Deep-Research UI (live progress + markdown report, Phase 12) ─── */
+(() => {
+    const $ = (id) => document.getElementById(id);
+
+    const consoleEl   = $("research-console");
+    const consoleBody = $("research-console-body");
+    const consoleClose= $("research-console-close");
+
+    if (!consoleEl || !consoleBody) {
+        window._lexyResearch = { onEvent: () => {} };
+        return;
+    }
+
+    consoleClose.addEventListener("click", () => { consoleEl.hidden = true; });
+
+    const tasks = new Map(); // research_id → DOM card
+
+    function showConsole() { consoleEl.hidden = false; }
+
+    function escapeHtml(str) {
+        return String(str ?? "")
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#39;");
+    }
+
+    /**
+     * Bare-bones markdown → HTML renderer for the report bubble. Covers
+     * the subset the synthesiser actually emits (headings, links, lists,
+     * inline code). Anything else falls through as escaped text — we
+     * deliberately don't pull in marked.js for this.
+     */
+    function renderMarkdown(md) {
+        if (!md) return "";
+        const lines = md.split(/\r?\n/);
+        const out = [];
+        let inList = false;
+        const closeList = () => { if (inList) { out.push("</ul>"); inList = false; } };
+
+        for (let raw of lines) {
+            let line = raw;
+            const headingMatch = line.match(/^(#{1,3})\s+(.*)$/);
+            if (headingMatch) {
+                closeList();
+                const level = headingMatch[1].length;
+                out.push(`<h${level}>${inlineMd(headingMatch[2])}</h${level}>`);
+                continue;
+            }
+            const liMatch = line.match(/^[-*]\s+(.*)$/);
+            if (liMatch) {
+                if (!inList) { out.push("<ul>"); inList = true; }
+                out.push(`<li>${inlineMd(liMatch[1])}</li>`);
+                continue;
+            }
+            // Numbered "[1] Title — URL" sources lines render as a link.
+            const sourceMatch = line.match(/^\[(\d+)\]\s+(.+?)\s+—\s+(https?:\/\/\S+)$/);
+            if (sourceMatch) {
+                closeList();
+                const [, n, title, url] = sourceMatch;
+                out.push(
+                    `<div>[${n}] <a href="${escapeHtml(url)}" target="_blank" rel="noopener">` +
+                    `${escapeHtml(title)}</a></div>`,
+                );
+                continue;
+            }
+            closeList();
+            if (line.trim() === "") {
+                out.push("");
+            } else {
+                out.push(`<p>${inlineMd(line)}</p>`);
+            }
+        }
+        closeList();
+        return out.join("\n");
+    }
+
+    function inlineMd(text) {
+        // Citations like [1] or [1, 2] stay as-is but get a CSS hook later.
+        let out = escapeHtml(text);
+        // Bold + italics (very loose).
+        out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+        out = out.replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, "<em>$1</em>");
+        // Inline code.
+        out = out.replace(/`([^`]+)`/g, "<code>$1</code>");
+        // Auto-link bare http(s) URLs.
+        out = out.replace(
+            /(https?:\/\/[^\s<>"']+)/g,
+            (m) => `<a href="${m}" target="_blank" rel="noopener">${m}</a>`,
+        );
+        return out;
+    }
+
+    function renderTask(task) {
+        let card = tasks.get(task.research_id);
+        if (!card) {
+            card = document.createElement("div");
+            card.className = "research-task-card";
+            card.dataset.researchId = task.research_id;
+            consoleBody.prepend(card);
+            tasks.set(task.research_id, card);
+        }
+
+        const state = task.state || "pending";
+        const progress = task.progress || {};
+        const subqueriesHtml = (task.subqueries || task.plan || []).map((sq, idx) => {
+            // task.subqueries is the structured list (with state); task.plan is just strings.
+            const desc = typeof sq === "string" ? sq : (sq.query || `step ${idx+1}`);
+            const completed = typeof sq === "object" && sq.completed === true;
+            const sources = typeof sq === "object" && Array.isArray(sq.sources)
+                ? sq.sources.length
+                : 0;
+            const fetched = typeof sq === "object" && Array.isArray(sq.sources)
+                ? sq.sources.filter(s => s.fetched).length
+                : 0;
+            const marker = completed ? "✓" : (state === "searching" ? "→" : "·");
+            const countText = sources
+                ? ` ${fetched}/${sources}`
+                : "";
+            return `
+                <div class="research-task-subquery" data-completed="${completed}">
+                    <span class="sq-marker">${marker}</span>
+                    <span class="sq-text" title="${escapeHtml(desc)}">${escapeHtml(desc)}</span>
+                    <span class="sq-count">${escapeHtml(countText)}</span>
+                </div>
+            `;
+        }).join("");
+
+        const meta = [];
+        if (progress.sources_fetched != null) {
+            meta.push(`${progress.sources_fetched}/${progress.sources_total || "?"} Quellen`);
+        }
+        if (progress.sources_relevant != null && progress.sources_relevant > 0) {
+            meta.push(`${progress.sources_relevant} relevant`);
+        }
+        const metaHtml = meta.length
+            ? `<div class="research-task-meta">${escapeHtml(meta.join(" · "))}</div>`
+            : "";
+
+        const errorHtml = task.last_error
+            ? `<div class="research-task-error" title="${escapeHtml(task.last_error)}">${escapeHtml(task.last_error.slice(0,160))}</div>`
+            : "";
+
+        const reportHtml = (state === "done" && task.report)
+            ? `<div class="research-task-report">${renderMarkdown(task.report)}</div>`
+            : "";
+
+        card.innerHTML = `
+            <div class="research-task-head">
+                <span class="research-task-state" data-state="${state}">${state}</span>
+                <span class="research-task-topic" title="${escapeHtml(task.topic || "")}">${escapeHtml(task.topic || "")}</span>
+            </div>
+            ${metaHtml}
+            ${subqueriesHtml ? `<div class="research-task-subqueries">${subqueriesHtml}</div>` : ""}
+            ${errorHtml}
+            ${reportHtml}
+        `;
+        showConsole();
+    }
+
+    window._lexyResearch = {
+        onEvent(data) {
+            if (!data || !data.research_id) return;
+            renderTask(data);
+        },
+    };
 })();

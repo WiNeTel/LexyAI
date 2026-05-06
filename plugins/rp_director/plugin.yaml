@@ -1,0 +1,26 @@
+name: rp_director
+version: 1.0.0
+description: "Conversational RP-Setup Director. Universal game-master persona that interviews the user and commits a full RP setup (scenario + characters + relationships) into character_chat."
+entry: plugin.RPDirectorPlugin
+requires: [character_chat]
+optional: [orchestrator, scheduler]
+capabilities: [tool, event, ws_handler, hook]
+
+config_defaults:
+  # Path to the Director persona YAML, relative to the project root. The
+  # plugin loads it once on enable and caches the assembled prompt. Edit
+  # the file and call `reload_director_persona` (WS) to hot-reload.
+  persona_path: "config/personas/director.yaml"
+  # Hook priority — runs AFTER orchestrator (55) so the Director prompt
+  # cleanly REPLACES Lexy's persona for the active session, instead of
+  # being prepended/appended.
+  hook_priority: 65
+  # Auto-cancel a Director session that's been idle for this long
+  # (seconds). Prevents zombie director-mode sessions if the user just
+  # walks away mid-setup. 0 = disabled.
+  idle_timeout_seconds: 1800
+  # When True, the Director will silently call `set_character_mode` on
+  # commit so the next user message goes to the character orchestrator.
+  # When False, Director only writes characters; the user activates the
+  # mode manually. Default True — that's the whole point of the feature.
+  auto_activate_character_mode: true
