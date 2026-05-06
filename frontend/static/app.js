@@ -3667,6 +3667,40 @@
         wsSend({ type: "get_dashboard_widgets" });
     }
 
+    // Tolerate two layout-item shapes:
+    //   * Frontend-native (what we save):  {id, col, row}
+    //         where col/row are CSS-grid spans like "1 / 3".
+    //   * Legacy YAML shape (default in dashboard plugin.yaml):
+    //         {widget, x, y, w, h}  with integer grid coords (0-based).
+    // The second one shipped before Phase 11; users with no saved
+    // layout in their DB get hit by it after a wipe. We translate
+    // here so the renderer can stay simple downstream — and so
+    // imports of older yaml-shaped layouts keep working.
+    function _normaliseLayoutItem(raw) {
+        if (!raw || typeof raw !== "object") return null;
+        // Native shape: pass through if it has an id.
+        if (typeof raw.id === "string" && raw.id) {
+            return {
+                id: raw.id,
+                col: raw.col || undefined,
+                row: raw.row || undefined,
+            };
+        }
+        // Legacy shape: translate widget→id and x,y,w,h → col/row spans.
+        const widgetId = typeof raw.widget === "string" ? raw.widget : null;
+        if (!widgetId) return null;
+        const x = Number.isFinite(raw.x) ? raw.x : 0;
+        const y = Number.isFinite(raw.y) ? raw.y : 0;
+        const w = Number.isFinite(raw.w) && raw.w > 0 ? raw.w : 1;
+        const h = Number.isFinite(raw.h) && raw.h > 0 ? raw.h : 1;
+        // CSS Grid is 1-based, the YAML is 0-based — add 1.
+        return {
+            id: widgetId,
+            col: `${x + 1} / ${x + 1 + w}`,
+            row: `${y + 1} / ${y + 1 + h}`,
+        };
+    }
+
     function renderDashboardGrid(layout, widgetData) {
         if (!dashboardGrid) return;
         // Clear any running clock interval
@@ -3677,7 +3711,7 @@
         dashboardGrid.innerHTML = "";
 
         // Default layout if none provided
-        const items = (layout && layout.length > 0) ? layout : [
+        const DEFAULT_ITEMS = [
             { id: "clock",         col: "1 / 2",   row: "1 / 2"   },
             { id: "weather",       col: "2 / 3",   row: "1 / 2"   },
             { id: "system_status", col: "3 / 5",   row: "1 / 2"   },
@@ -3687,8 +3721,14 @@
             { id: "notes",         col: "1 / 3",   row: "3 / 4"   },
             { id: "search",        col: "3 / 5",   row: "3 / 4"   },
         ];
+        const items = (layout && layout.length > 0)
+            ? layout.map(_normaliseLayoutItem).filter(Boolean)
+            : DEFAULT_ITEMS;
+        // After normalisation: if every entry was malformed → fall back
+        // to the embedded defaults so the user always sees SOMETHING.
+        const renderItems = items.length > 0 ? items : DEFAULT_ITEMS;
 
-        for (const item of items) {
+        for (const item of renderItems) {
             const card = document.createElement("div");
             card.className = "dashboard-widget";
             card.dataset.widgetId = item.id;
