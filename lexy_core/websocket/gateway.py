@@ -771,6 +771,60 @@ def build_app(lexy: "LexyApp") -> FastAPI:
             raise HTTPException(404, "entry not found")
         return {"id": entry_id}
 
+    @api.get(
+        "/api/v1/plugins/character_chat/sessions/{session_id}/turns"
+    )
+    async def get_session_character_turns(
+        session_id: str, request: Request, limit: int = 500,
+    ) -> dict[str, Any]:
+        """Return all character_turns for a session, chronologically.
+
+        Phase 11 fix — Mike reported that resuming an RP session only
+        showed user messages because ``/sessions/{id}/history`` reads
+        from the agent's session_store (which has user/assistant rows
+        only). Character bubbles persist in a SEPARATE table
+        (``character_turns`` in ``data/plugins/character_chat/...``)
+        so the frontend has to fetch them as a second step.
+
+        Returns turns in chronological order with everything the UI
+        needs to render an action bar (turn_id, character_id, content,
+        round_id + trigger_text for interleaving with user messages).
+        """
+        app = _app(request)
+        plugin = _character_chat_plugin(app)
+        # Use the plugin's own DB connection (same one persisting
+        # the rows in ``_persist_and_broadcast_turns``) — no chance
+        # of read-write desync between ack and SELECT.
+        db = await plugin.api.get_db()
+        cursor = await db.execute(
+            "SELECT id, character_id, character_name, round_id, "
+            "order_num, content, skipped, trigger_kind, trigger_text, "
+            "created_at FROM character_turns "
+            "WHERE session_id = ? "
+            "ORDER BY created_at ASC, order_num ASC LIMIT ?",
+            (session_id, max(1, min(2000, int(limit)))),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return {
+            "session_id": session_id,
+            "turns": [
+                {
+                    "turn_id": r[0],
+                    "character_id": r[1],
+                    "character_name": r[2],
+                    "round_id": r[3],
+                    "order": int(r[4] or 0),
+                    "content": r[5] or "",
+                    "skipped": bool(r[6]),
+                    "trigger_kind": r[7] or "",
+                    "trigger_text": r[8] or "",
+                    "created_at": float(r[9] or 0.0),
+                }
+                for r in rows
+            ],
+        }
+
     # ─── Skill packager (Phase 11 — agentskills.io) ────────────────
     #
     # Two endpoints flank the existing skill_writer WS handlers:

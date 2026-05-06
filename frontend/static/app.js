@@ -2852,6 +2852,123 @@
         return resp.json();
     }
 
+    // Phase 11 fix — RP-session resume needs to render BOTH user
+    // messages (from the agent's session_store) AND character_turns
+    // (from the character_chat plugin's separate DB). We try to
+    // interleave them so the conversation reads in order: user
+    // message → matching round's character turns → next user message.
+    // The match heuristic walks rounds in chronological order and
+    // pins each ``trigger_kind=user`` round to the user message
+    // whose content matches its trigger_text. Pulse-triggered or
+    // unmatchable rounds are appended at the end so nothing gets
+    // lost. On any error we fall back to the dumb "user-msgs only"
+    // path so the resume flow degrades gracefully.
+    async function _renderInterleavedRPHistory(sessionId, userMessages) {
+        let turns = [];
+        try {
+            const resp = await fetch(
+                `/api/v1/plugins/character_chat/sessions/${encodeURIComponent(sessionId)}/turns`
+            );
+            if (resp.ok) {
+                const body = await resp.json();
+                turns = Array.isArray(body.turns) ? body.turns : [];
+            } else {
+                console.warn("character-turns fetch returned", resp.status);
+            }
+        } catch (err) {
+            console.warn("character-turns fetch failed:", err);
+        }
+
+        // Group turns by round_id (preserving DB order) and remember
+        // each round's earliest trigger info + creation time.
+        const roundsById = new Map();
+        for (const t of turns) {
+            const rid = t.round_id || "_orphan";
+            let r = roundsById.get(rid);
+            if (!r) {
+                r = {
+                    round_id: rid,
+                    turns: [],
+                    trigger_kind: t.trigger_kind || "",
+                    trigger_text: t.trigger_text || "",
+                    created_at: t.created_at || 0,
+                };
+                roundsById.set(rid, r);
+            }
+            r.turns.push(t);
+            // Keep the earliest created_at as the round's anchor.
+            if (t.created_at && (!r.created_at || t.created_at < r.created_at)) {
+                r.created_at = t.created_at;
+            }
+        }
+        // Sort each round's turns by order_num so multi-character
+        // rounds render in the right speaker sequence.
+        for (const r of roundsById.values()) {
+            r.turns.sort((a, b) => (a.order || 0) - (b.order || 0));
+        }
+        const allRounds = Array.from(roundsById.values()).sort(
+            (a, b) => (a.created_at || 0) - (b.created_at || 0)
+        );
+
+        // Build the merge plan. Walk user messages in order; for
+        // each, pop off the earliest unconsumed user-triggered round
+        // whose trigger_text matches.
+        const consumed = new Set();
+        function _matchTrigger(roundTrigger, userText) {
+            const a = (roundTrigger || "").trim();
+            const b = (userText || "").trim();
+            if (!a || !b) return false;
+            // The trigger_text typically equals the user message,
+            // but very long messages get clipped on persist. Treat
+            // a 40-char prefix match as good enough — collisions
+            // would need two near-identical messages back-to-back,
+            // which is rare and not catastrophic.
+            const head = (s) => s.slice(0, 40);
+            return head(a) === head(b) || a.startsWith(b) || b.startsWith(a);
+        }
+
+        const events = [];
+        for (const um of userMessages) {
+            if (um.role !== "user" && um.role !== "assistant") continue;
+            events.push({ kind: "msg", role: um.role, content: um.content || "" });
+            if (um.role !== "user") continue;
+            for (const r of allRounds) {
+                if (consumed.has(r.round_id)) continue;
+                if (r.trigger_kind && r.trigger_kind !== "user") continue;
+                if (_matchTrigger(r.trigger_text, um.content)) {
+                    events.push({ kind: "round", round: r });
+                    consumed.add(r.round_id);
+                    break;
+                }
+            }
+        }
+        // Drop any leftover rounds (pulses, mismatches, orphans)
+        // at the end so the user can still see them.
+        for (const r of allRounds) {
+            if (!consumed.has(r.round_id)) {
+                events.push({ kind: "round", round: r });
+            }
+        }
+
+        for (const ev of events) {
+            if (ev.kind === "msg") {
+                appendMessage(ev.role, ev.content);
+            } else {
+                for (const t of ev.round.turns) {
+                    appendCharacterTurn({
+                        turn_id: t.turn_id,
+                        character_id: t.character_id,
+                        character_name: t.character_name,
+                        content: t.content,
+                        skipped: t.skipped,
+                        order: t.order,
+                        session_id: sessionId,
+                    });
+                }
+            }
+        }
+    }
+
     async function resumeSession(sessionId) {
         if (state.sending) {
             toast("Busy", "Warte bis die aktuelle Antwort fertig ist");
@@ -2910,9 +3027,19 @@
             // on the right tab so appendMessage() routes to the right
             // window automatically.
             switchTab(targetTab);
-            for (const m of messages) {
-                if (m.role === "user" || m.role === "assistant") {
-                    appendMessage(m.role, m.content || "");
+            if (sessionKind === "rp") {
+                // Phase 11 hotfix — character_turns live in a SEPARATE
+                // table (data/plugins/character_chat/character_chat.db);
+                // ``/sessions/{id}/history`` only knows about the
+                // session_store's user/assistant rows. Without the
+                // call below, RP sessions on resume would only show
+                // user messages — Mike's report. Fetch + interleave.
+                await _renderInterleavedRPHistory(sessionId, messages);
+            } else {
+                for (const m of messages) {
+                    if (m.role === "user" || m.role === "assistant") {
+                        appendMessage(m.role, m.content || "");
+                    }
                 }
             }
 
