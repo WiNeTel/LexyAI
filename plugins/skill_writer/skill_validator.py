@@ -9,11 +9,18 @@ Performs static analysis using the ``ast`` module to block:
 * Missing ``execute()`` entry point
 * Syntax errors
 * Oversized files
+
+Phase 11 (agentskills.io) note: skills now live in folders rather than
+flat ``.py`` files. The validator API is unchanged — callers feed it
+the source of ``<folder>/scripts/skill.py`` (or the bytes thereof).
+A new convenience method ``validate_folder()`` walks every ``.py`` in
+``scripts/`` so importers can flag broken skills before they hit disk.
 """
 
 from __future__ import annotations
 
 import ast
+from pathlib import Path
 from typing import Any
 
 from lexy_core.utils.logging import get_logger
@@ -80,7 +87,9 @@ class SkillValidator:
         self._allowed_imports: set[str] = set(allowed_imports)
         self._max_size_bytes = max_size_bytes
 
-    def validate(self, source: str) -> tuple[bool, str]:
+    def validate(
+        self, source: str, *, expect_execute: bool = True
+    ) -> tuple[bool, str]:
         """
         Validate skill source code.
 
@@ -89,10 +98,16 @@ class SkillValidator:
         2. Syntax check (compilable Python)
         3. AST walk: forbidden imports
         4. AST walk: forbidden function calls
-        5. ``async def execute(api, **kwargs)`` exists
+        5. ``async def execute(api, **kwargs)`` exists  *(only when
+           ``expect_execute=True`` — helper modules in ``scripts/``
+           don't need an execute() signature)*
 
         Args:
             source: Complete Python source code of the skill.
+            expect_execute: Enforce the ``async def execute()`` entry-
+                point signature. Default ``True`` (the primary script
+                must have it). Set to ``False`` for helper modules
+                that live alongside the primary in ``scripts/``.
 
         Returns:
             Tuple of ``(is_valid, error_message)``.
@@ -125,10 +140,11 @@ class SkillValidator:
         if call_err is not None:
             return False, call_err
 
-        # 5. execute()-Funktion vorhanden
-        exec_err = self._check_execute_function(tree)
-        if exec_err is not None:
-            return False, exec_err
+        # 5. execute()-Funktion vorhanden (only for primary script)
+        if expect_execute:
+            exec_err = self._check_execute_function(tree)
+            if exec_err is not None:
+                return False, exec_err
 
         log.debug("skill_validator.passed", size_bytes=source_bytes)
         return True, ""
@@ -244,3 +260,64 @@ class SkillValidator:
                 )
 
         return "Skill must define 'async def execute(api, **kwargs)' at module level"
+
+    # ─── Phase 11: folder-level validation ──────────────────────────
+
+    def validate_folder(
+        self,
+        folder: Path,
+        *,
+        primary_script: str | None = None,
+    ) -> tuple[bool, str]:
+        """Validate every ``.py`` in ``<folder>/scripts/``.
+
+        The primary script (default ``scripts/skill.py`` per Lexy
+        convention) MUST exist and pass full validation. Other Python
+        files in ``scripts/`` are validated too — a broken helper
+        would crash the skill at runtime, so we want to catch it at
+        import time.
+
+        Args:
+            folder: Skill folder (the one containing ``SKILL.md``).
+            primary_script: Relative path of the primary script.
+                When ``None`` we look for ``scripts/skill.py``; the
+                check passes if the skill bundles no scripts at all
+                (docs-only skills are valid per spec).
+
+        Returns:
+            ``(True, "")`` if every script passes, otherwise
+            ``(False, "<file>: <reason>")``.
+        """
+        scripts_dir = folder / "scripts"
+        if not scripts_dir.is_dir():
+            # Docs-only skill — fine per spec, no scripts to check.
+            return True, ""
+
+        py_files = sorted(p for p in scripts_dir.rglob("*.py") if p.is_file())
+        if not py_files:
+            return True, ""
+
+        # If the caller specified a primary script (or default), it
+        # must exist and be the first thing we check — gives the
+        # cleanest error message when it's missing.
+        primary = primary_script or "scripts/skill.py"
+        primary_abs = folder / primary
+        if not primary_abs.is_file():
+            return False, f"primary script not found: {primary}"
+
+        # Validate the primary first with the full check (execute
+        # signature included), then helpers without that requirement.
+        primary_resolved = primary_abs.resolve()
+        for py_path in py_files:
+            try:
+                source = py_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                return False, f"{py_path.name}: read failed: {exc}"
+
+            is_primary = py_path.resolve() == primary_resolved
+            ok, err = self.validate(source, expect_execute=is_primary)
+            if not ok:
+                rel = py_path.relative_to(folder).as_posix()
+                return False, f"{rel}: {err}"
+
+        return True, ""

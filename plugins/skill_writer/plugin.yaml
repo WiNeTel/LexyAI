@@ -1,6 +1,9 @@
 name: skill_writer
-version: 1.0.0
-description: "Self-improvement: Lexy writes skills, spawns autonomous agents"
+version: 2.0.0   # Phase 11 — agentskills.io spec compliance
+description: >-
+  Self-improvement: Lexy writes spec-compliant Agent Skills
+  (agentskills.io format), validates them, and runs them — plus
+  spawns autonomous sub-agents.
 entry: skill_writer_plugin.SkillWriterPlugin
 requires: []
 optional: [dashboard]
@@ -14,6 +17,9 @@ config_defaults:
   max_agents: 5
   agent_max_iterations: 10
   agent_timeout: 120.0
+  # Phase 11: default license stamped onto auto-generated skills.
+  # Empty string omits the license: field from the frontmatter.
+  default_license: ""
   sandbox_allowed_imports:
     - json
     - re

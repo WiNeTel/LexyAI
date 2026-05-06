@@ -1,14 +1,21 @@
 """
-Lexy AI - Skill Writer Plugin.
+Lexy AI - Skill Writer Plugin (Phase 11 — agentskills.io compliant).
 
-Self-improvement system: Lexy can write, validate, and execute custom
-skills (Python micro-scripts), and spawn autonomous sub-agents for
-independent tasks.
+Self-improvement system: Lexy writes, validates, and executes custom
+skills, and spawns autonomous sub-agents for independent tasks.
+
+Phase 11 brings the on-disk format onto the open agentskills.io
+standard (originally Anthropic's "Agent Skills"; now adopted by
+Claude Code, Cursor, OpenCode, GitHub Copilot, Goose, Letta, …).
+A skill is now a *folder* with ``SKILL.md`` (YAML frontmatter +
+markdown body) and an optional ``scripts/skill.py`` entry point —
+identical layout to every other skills-compatible agent, so Mike's
+skills round-trip seamlessly between Lexy and Cursor.
 
 Features:
 
-* **write_skill** — LLM writes a validated Python skill to disk.
-* **run_skill** — Execute a skill with sandboxed imports.
+* **write_skill** — LLM writes a validated SKILL.md + scripts/skill.py.
+* **run_skill** — Execute the primary script with sandboxed imports.
 * **list_skills / delete_skill** — Manage the skill registry.
 * **spawn_agent** — Launch an autonomous agent with own conversation loop.
 * **list_agents / stop_agent / agent_result** — Manage running agents.
@@ -20,6 +27,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -29,8 +37,10 @@ from lexy_core.plugin_system import BasePlugin
 from lexy_core.utils.logging import get_logger
 
 from .auto_agent import AgentManager
+from .skill_loader import SkillLoaderError, load_skill_folder
 from .skill_registry import SkillRegistry
-from .skill_template import generate_skill_file, sanitize_skill_name
+from .skill_spec import SkillSpecError
+from .skill_template import emit_skill_folder, sanitize_skill_name
 from .skill_validator import SkillValidator
 
 log = get_logger(module="skill_writer_plugin")
@@ -44,23 +54,56 @@ WRITE_SKILL_SCHEMA: dict[str, Any] = {
     "properties": {
         "name": {
             "type": "string",
-            "description": "Skill name in snake_case (e.g. 'calc_bmi')",
+            "description": (
+                "Skill name in agentskills.io format: 1-64 chars, "
+                "lowercase letters / digits / single hyphens "
+                "(e.g. 'calc-bmi'). Must equal the on-disk folder name."
+            ),
         },
         "description": {
             "type": "string",
-            "description": "One-line description of what the skill does",
+            "description": (
+                "1-1024 chars. Describes WHAT the skill does AND "
+                "WHEN to use it (the agent reads this at discovery)."
+            ),
         },
         "code": {
             "type": "string",
             "description": (
-                "The Python code body for the execute() function. "
+                "Python body for scripts/skill.py's execute() function. "
                 "Must use 'api' parameter and return a dict. "
                 "No imports of os/subprocess/sys allowed."
             ),
         },
+        "body_md": {
+            "type": "string",
+            "description": (
+                "(optional) Markdown body for SKILL.md — step-by-step "
+                "instructions, examples, edge cases. Recommended to "
+                "stay under ~500 lines. The agent loads this on "
+                "activation but not at boot (progressive disclosure)."
+            ),
+        },
+        "license": {
+            "type": "string",
+            "description": (
+                "(optional) License name, e.g. 'Apache-2.0' or "
+                "'Proprietary'. Lands as 'license:' in the frontmatter."
+            ),
+        },
+        "compatibility": {
+            "type": "string",
+            "description": (
+                "(optional) Environment requirements, max 500 chars. "
+                "E.g. 'Requires Python 3.11+ and httpx'."
+            ),
+        },
         "tags": {
             "type": "string",
-            "description": "Comma-separated tags (e.g. 'math,utility')",
+            "description": (
+                "(optional) Comma-separated tags, persisted in "
+                "metadata.tags."
+            ),
         },
     },
     "required": ["name", "description", "code"],
@@ -202,7 +245,11 @@ class SkillWriterPlugin(BasePlugin):
         # DB + Registry
         db = await self.api.get_db()
 
-        # Skill-Proposals Tabelle
+        # Skill-Proposals Tabelle. Phase 11 erweitert um die
+        # Frontmatter-Felder, sodass eine genehmigte Proposal direkt
+        # einen kompletten ``data/skills/<name>/`` Folder produziert.
+        # ``code`` enthält jetzt nur noch den Python-Body (für
+        # scripts/skill.py) statt der ganzen .py-Datei mit Header.
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS skill_proposals (
@@ -214,10 +261,32 @@ class SkillWriterPlugin(BasePlugin):
                 source      TEXT NOT NULL DEFAULT 'auto',
                 status      TEXT NOT NULL DEFAULT 'pending',
                 created_at  REAL NOT NULL,
-                reviewed_at REAL
+                reviewed_at REAL,
+                body_md       TEXT NOT NULL DEFAULT '',
+                license       TEXT,
+                compatibility TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                allowed_tools TEXT
             )
             """
         )
+        # Idempotente Migration für DBs aus der Pre-Phase-11-Zeit.
+        for col_name, col_decl in (
+            ("body_md", "TEXT NOT NULL DEFAULT ''"),
+            ("license", "TEXT"),
+            ("compatibility", "TEXT"),
+            ("metadata_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("allowed_tools", "TEXT"),
+        ):
+            try:
+                await db.execute(
+                    f"ALTER TABLE skill_proposals "
+                    f"ADD COLUMN {col_name} {col_decl}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc).lower()
+                if "duplicate column" not in msg and "already exists" not in msg:
+                    raise
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_proposals_status "
             "ON skill_proposals(status)"
@@ -364,9 +433,21 @@ class SkillWriterPlugin(BasePlugin):
         name: str,
         description: str,
         code: str,
+        body_md: str | None = None,
+        license: str | None = None,
+        compatibility: str | None = None,
         tags: str | None = None,
     ) -> dict[str, Any]:
-        """Validate, write, and register a new skill."""
+        """Validate, write, and register a new skill (Phase 11 — folder).
+
+        ``code`` lands as the body of ``scripts/skill.py``'s ``execute()``
+        function; ``body_md`` (if provided) becomes the SKILL.md
+        markdown body. Optional frontmatter fields land in metadata.
+
+        When ``require_approval`` is set, the skill goes through the
+        proposal table first — the genehmigte Proposal landet dann
+        eins-zu-eins als Folder auf Disk.
+        """
         if self._validator is None or self._registry is None:
             return {"error": "Skill writer not initialised"}
 
@@ -376,20 +457,20 @@ class SkillWriterPlugin(BasePlugin):
             if tags
             else []
         )
+        metadata_dict: dict[str, str] = {}
+        if tag_list:
+            metadata_dict["tags"] = ",".join(tag_list)
 
-        # Komplette Skill-Datei generieren
-        source = generate_skill_file(
-            name=clean_name,
-            description=description,
-            code=code,
-            author="lexy_auto",
-            version="1.0",
-            tags=tag_list,
-        )
-
-        # Validierung
-        valid, error = self._validator.validate(source)
+        # Pre-flight Validierung: nur die Python-Quelle, bevor wir
+        # was auf Disk schreiben. Bei Approval bleibt der Code so im
+        # Proposal-Tabelle bis Mike approved.
+        valid, error = self._validator.validate(code, expect_execute=False)
+        # ``expect_execute=False`` weil ``code`` nur der Body ist;
+        # die volle Funktion mit Signatur baut das Template.
         if not valid:
+            # Wir tun denselben Check nochmal nach dem Folder-Build
+            # gegen die fertige scripts/skill.py — aber meistens
+            # schlägt's hier schon zu, mit klarer Meldung.
             log.warning(
                 "skill_writer.validation_failed",
                 name=clean_name,
@@ -397,21 +478,24 @@ class SkillWriterPlugin(BasePlugin):
             )
             return {"error": f"Validation failed: {error}"}
 
-        # Approval-Modus: Proposal erstellen statt direkt speichern
+        # Approval-Modus: Proposal erstellen statt direkt speichern.
         if self._require_approval:
             proposal_id = await self._create_proposal(
                 name=clean_name,
                 description=description,
-                code=source,
+                code=code,
                 tags=",".join(tag_list),
                 source_tag="auto",
+                body_md=body_md or "",
+                license=license,
+                compatibility=compatibility,
+                metadata=metadata_dict,
             )
             log.info(
                 "skill_writer.proposal_created",
                 name=clean_name,
                 proposal_id=proposal_id,
             )
-            # WS-Broadcast: neuer Vorschlag
             await self.api.ws_broadcast({
                 "type": "skill_proposal_new",
                 "proposal_id": proposal_id,
@@ -432,50 +516,98 @@ class SkillWriterPlugin(BasePlugin):
         return await self._write_and_register(
             name=clean_name,
             description=description,
-            source=source,
+            code=code,
+            body_md=body_md or "",
+            license=license,
+            compatibility=compatibility,
+            metadata=metadata_dict,
             source_tag="auto",
         )
 
     async def _write_and_register(
         self,
+        *,
         name: str,
         description: str,
-        source: str,
+        code: str,
+        body_md: str = "",
+        license: str | None = None,
+        compatibility: str | None = None,
+        metadata: dict[str, str] | None = None,
         source_tag: str = "auto",
     ) -> dict[str, Any]:
-        """Write skill file to disk and register in DB."""
-        if self._registry is None:
+        """Emit the skill folder + register it in the DB.
+
+        Phase 11: skill ist ein Folder. Wir bauen den Folder via
+        :func:`emit_skill_folder`, validieren das Resultat, registrieren
+        es und broadcasten das Event.
+        """
+        if self._registry is None or self._validator is None:
             return {"error": "Registry not initialised"}
 
-        file_path = self._skills_path / f"{name}.py"
-
-        # Duplikat-Check
+        # Duplikat-Check (gegen Registry und gegen Disk-Folder).
         existing = await self._registry.get(name)
         if existing is not None:
             return {"error": f"Skill '{name}' already exists"}
+        if (self._skills_path / name).exists():
+            return {"error": f"Skill folder already exists on disk: {name}"}
 
-        # Datei schreiben
-        file_path.write_text(source, encoding="utf-8")
+        # Folder emittieren.
+        try:
+            folder = emit_skill_folder(
+                name=name,
+                description=description,
+                code=code,
+                target_root=self._skills_path,
+                body_md=body_md or None,
+                license=license,
+                compatibility=compatibility,
+                metadata=metadata,
+            )
+        except (SkillSpecError, FileExistsError) as exc:
+            return {"error": f"Folder build failed: {exc}"}
 
-        # In Registry registrieren
+        # Vollständige Folder-Validierung (Frontmatter + alle scripts).
+        ok, err = self._validator.validate_folder(folder)
+        if not ok:
+            # Cleanup damit Disk + Registry konsistent bleiben.
+            try:
+                from .skill_template import _rm_tree
+                _rm_tree(folder)
+            except OSError:  # noqa: BLE001
+                pass
+            return {"error": f"Folder validation failed: {err}"}
+
+        # Frontmatter aus dem fertigen Folder laden, damit die Registry
+        # die Spec-konformen Felder direkt von der Source-of-truth nimmt.
+        try:
+            card = await load_skill_folder(folder)
+        except (SkillLoaderError, SkillSpecError) as exc:
+            return {"error": f"Loader failed after build: {exc}"}
+
         skill_id = await self._registry.register(
-            name=name,
-            description=description,
-            file_path=str(file_path.resolve()),
+            name=card.name,
+            description=card.description,
+            file_path=str(card.folder),
             source=source_tag,
+            license=card.frontmatter.license,
+            compatibility=card.frontmatter.compatibility,
+            metadata=card.frontmatter.metadata,
+            allowed_tools=card.frontmatter.allowed_tools,
+            body_md=card.frontmatter.body,
         )
 
-        log.info("skill_writer.written", name=name, file=str(file_path))
+        log.info("skill_writer.written", name=card.name, folder=str(card.folder))
         await self.api.emit(
             "skill.created",
-            {"name": name, "id": skill_id, "source": source_tag},
+            {"name": card.name, "id": skill_id, "source": source_tag},
         )
 
         return {
             "status": "created",
             "skill_id": skill_id,
-            "name": name,
-            "file": str(file_path),
+            "name": card.name,
+            "folder": str(card.folder),
         }
 
     # ─── Tool: list_skills ──────────────────────────────────────────
@@ -484,7 +616,7 @@ class SkillWriterPlugin(BasePlugin):
         self,
         status: str | None = None,
     ) -> dict[str, Any]:
-        """List all registered skills."""
+        """List all registered skills (Phase 11 — includes spec fields)."""
         if self._registry is None:
             return {"error": "Registry not initialised"}
 
@@ -501,6 +633,12 @@ class SkillWriterPlugin(BasePlugin):
                     "success_count": e.success_count,
                     "failure_count": e.failure_count,
                     "created_at": e.created_at,
+                    # Phase 11 — agentskills.io frontmatter exposure
+                    "license": e.license,
+                    "compatibility": e.compatibility,
+                    "metadata": dict(e.metadata),
+                    "allowed_tools": e.allowed_tools,
+                    "folder": e.file_path,
                 }
                 for e in entries
             ],
@@ -513,7 +651,7 @@ class SkillWriterPlugin(BasePlugin):
         skill_name: str,
         args: str | None = None,
     ) -> dict[str, Any]:
-        """Load and execute a registered skill."""
+        """Load and execute a registered skill (Phase 11 — folder-based)."""
         if self._registry is None:
             return {"error": "Registry not initialised"}
 
@@ -535,21 +673,53 @@ class SkillWriterPlugin(BasePlugin):
             except json.JSONDecodeError as exc:
                 return {"error": f"Invalid args JSON: {exc}"}
 
-        # Skill-Modul laden
-        file_path = Path(entry.file_path)
-        if not file_path.exists():
+        # Phase 11: ``entry.file_path`` zeigt auf den Folder. Wir laden
+        # die SkillCard frisch vom Disk damit ``primary_script`` und
+        # die Frontmatter-Validierung zur Run-Zeit nochmal greifen.
+        folder = Path(entry.file_path)
+        if not folder.is_dir():
             await self._registry.set_status(skill_name, "failed")
-            return {"error": f"Skill file not found: {file_path}"}
+            return {"error": f"Skill folder not found: {folder}"}
 
         try:
+            card = await load_skill_folder(folder)
+        except (SkillLoaderError, SkillSpecError) as exc:
+            await self._registry.set_status(skill_name, "failed")
+            return {"error": f"Skill folder invalid: {exc}"}
+
+        if card.primary_script is None:
+            await self._registry.set_status(skill_name, "failed")
+            return {
+                "error": (
+                    f"Skill '{skill_name}' has no executable script "
+                    "(scripts/skill.py missing)"
+                )
+            }
+
+        primary_path = card.primary_script_path()
+        if primary_path is None or not primary_path.is_file():
+            await self._registry.set_status(skill_name, "failed")
+            return {"error": f"Primary script missing: {card.primary_script}"}
+
+        # Modul-Name eindeutig pro Skill, sonst kollidieren Helper-
+        # Imports zwischen Skills im Modul-Cache.
+        module_name = f"lexy_skill_{skill_name.replace('-', '_')}"
+        try:
             spec = importlib.util.spec_from_file_location(
-                f"skill_{skill_name}", str(file_path)
+                module_name, str(primary_path)
             )
             if spec is None or spec.loader is None:
-                return {"error": f"Could not load skill module: {file_path}"}
-
+                return {
+                    "error": f"Could not load skill module: {primary_path}"
+                }
             module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)  # type: ignore[union-attr]
+            # Cache-pinning damit Helper-Module die in scripts/ liegen
+            # über ``import skill`` o.ä. den richtigen Namespace finden.
+            sys.modules[module_name] = module
+            try:
+                spec.loader.exec_module(module)  # type: ignore[union-attr]
+            finally:
+                sys.modules.pop(module_name, None)
         except Exception as exc:  # noqa: BLE001
             log.error(
                 "skill_writer.load_error",
@@ -584,7 +754,7 @@ class SkillWriterPlugin(BasePlugin):
         self,
         skill_name: str,
     ) -> dict[str, Any]:
-        """Delete a skill (file + registry entry)."""
+        """Delete a skill (folder + registry entry)."""
         if self._registry is None:
             return {"error": "Registry not initialised"}
 
@@ -592,11 +762,24 @@ class SkillWriterPlugin(BasePlugin):
         if entry is None:
             return {"error": f"Skill '{skill_name}' not found"}
 
-        # Datei loeschen
-        file_path = Path(entry.file_path)
-        if file_path.exists():
-            file_path.unlink()
-            log.info("skill_writer.file_deleted", file=str(file_path))
+        # Phase 11: file_path zeigt auf den Folder. Recursive remove.
+        target = Path(entry.file_path)
+        if target.exists():
+            try:
+                if target.is_dir():
+                    from .skill_template import _rm_tree
+                    _rm_tree(target)
+                else:
+                    # Defensive: ältere Einträge könnten noch auf
+                    # eine .py-Datei zeigen (Pre-Phase-11).
+                    target.unlink()
+                log.info("skill_writer.deleted_from_disk", target=str(target))
+            except OSError as exc:
+                log.warning(
+                    "skill_writer.delete_disk_failed",
+                    target=str(target),
+                    error=str(exc),
+                )
 
         # Aus Registry entfernen
         await self._registry.delete(skill_name)
@@ -856,18 +1039,35 @@ class SkillWriterPlugin(BasePlugin):
         code: str,
         tags: str,
         source_tag: str,
+        *,
+        body_md: str = "",
+        license: str | None = None,
+        compatibility: str | None = None,
+        metadata: dict[str, str] | None = None,
+        allowed_tools: str | None = None,
     ) -> str:
-        """Create a pending skill proposal in the DB."""
+        """Create a pending skill proposal in the DB.
+
+        Phase 11: persists the full agentskills.io frontmatter so the
+        approval flow can rebuild the folder verbatim — no info loss
+        between proposal and the final skill.
+        """
         proposal_id = uuid.uuid4().hex[:12]
         now = time.time()
+        metadata_json = json.dumps(metadata or {}, ensure_ascii=False)
         db = await self.api.get_db()
         await db.execute(
             """
             INSERT INTO skill_proposals
-                (id, name, description, code, tags, source, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+                (id, name, description, code, tags, source, status,
+                 created_at, body_md, license, compatibility,
+                 metadata_json, allowed_tools)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
             """,
-            (proposal_id, name, description, code, tags, source_tag, now),
+            (
+                proposal_id, name, description, code, tags, source_tag, now,
+                body_md, license, compatibility, metadata_json, allowed_tools,
+            ),
         )
         await db.commit()
         return proposal_id
@@ -875,11 +1075,18 @@ class SkillWriterPlugin(BasePlugin):
     async def _approve_proposal(
         self, proposal_id: str
     ) -> dict[str, Any]:
-        """Approve a proposal: write skill to disk and register it."""
+        """Approve a proposal: emit folder + register it.
+
+        Phase 11: includes the persisted frontmatter so approval
+        produces the exact same folder layout the writer originally
+        proposed.
+        """
         db = await self.api.get_db()
         cursor = await db.execute(
             """
-            SELECT id, name, description, code, tags, source
+            SELECT id, name, description, code, tags, source,
+                   body_md, license, compatibility, metadata_json,
+                   allowed_tools
             FROM skill_proposals
             WHERE id = ? AND status = 'pending'
             """,
@@ -891,13 +1098,28 @@ class SkillWriterPlugin(BasePlugin):
         if row is None:
             return {"error": f"Proposal '{proposal_id}' not found or not pending"}
 
-        _pid, name, description, code, _tags, source_tag = row
+        (
+            _pid, name, description, code, _tags, source_tag,
+            body_md, license_val, compatibility_val, metadata_json,
+            _allowed_tools,
+        ) = row
 
-        # Schreiben + registrieren
+        try:
+            metadata = json.loads(metadata_json) if metadata_json else {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+        except (TypeError, ValueError):
+            metadata = {}
+
+        # Folder bauen + registrieren.
         result = await self._write_and_register(
             name=name,
             description=description,
-            source=code,
+            code=code,
+            body_md=body_md or "",
+            license=license_val,
+            compatibility=compatibility_val,
+            metadata={str(k): str(v) for k, v in metadata.items()},
             source_tag=source_tag,
         )
 

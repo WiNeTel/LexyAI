@@ -1,12 +1,17 @@
-"""Tests for the Skill Writer plugin -- validator, template, registry, auto_agent.
+"""Tests for the Skill Writer plugin (Phase 11 — agentskills.io aware).
 
 Covers:
-* parse_skill_header() and generate_skill_file()
-* sanitize_skill_name()
-* SkillValidator: allowed/forbidden imports, calls, execute() check, size limit
-* SkillRegistry CRUD (real aiosqlite)
-* AutoAgent creation and field defaults
-* AgentManager spawn/stop/list
+* :func:`emit_skill_folder` — produces a spec-compliant folder
+* :func:`sanitize_skill_name` — slug-style naming per spec
+* :class:`SkillValidator` — allowed/forbidden imports, calls,
+  execute() check, size limit, ``validate_folder``
+* :class:`SkillRegistry` CRUD (real aiosqlite, folder paths)
+* :class:`AutoAgent` creation and field defaults
+* :class:`AgentManager` spawn/stop/list
+
+The pre-Phase-11 ``parse_skill_header`` / ``generate_skill_file`` API
+is gone; equivalent coverage now lives in
+``tests/test_skill_spec.py`` (frontmatter parser).
 """
 
 from __future__ import annotations
@@ -25,114 +30,181 @@ from plugins.skill_writer.skill_validator import (
     FORBIDDEN_MODULES,
 )
 from plugins.skill_writer.skill_template import (
-    parse_skill_header,
-    generate_skill_file,
+    emit_skill_folder,
     sanitize_skill_name,
 )
+from plugins.skill_writer.skill_spec import parse_skill_md
 from plugins.skill_writer.skill_registry import SkillRegistry, SkillEntry
 from plugins.skill_writer.auto_agent import AutoAgent, AgentManager
 
 
 # ─── Allowed imports for the validator ────────────────────────────────────
+#
+# Mirrors what ``SkillWriterPlugin.on_load`` configures: the plugin
+# auto-adds ``__future__`` and ``typing`` so the auto-generated skill
+# template's ``from typing import Any`` line passes.
 
-ALLOWED = ["json", "re", "datetime", "math", "collections", "pathlib", "__future__"]
+ALLOWED = [
+    "json", "re", "datetime", "math", "collections", "pathlib",
+    "__future__", "typing",
+]
 
 
-# ─── SkillTemplate ────────────────────────────────────────────────────────
+# ─── emit_skill_folder ───────────────────────────────────────────────────
 
 
-class TestParseSkillHeader:
-    def test_extracts_all_fields(self) -> None:
-        src = (
-            '"""\n'
-            "Skill: my_skill\n"
-            "Description: Does stuff\n"
-            "Author: lexy_auto\n"
-            "Version: 2.0\n"
-            "Created: 2025-01-01T00:00:00Z\n"
-            "Tags: web, search\n"
-            '"""\n'
+class TestEmitSkillFolder:
+    """The Phase-11 replacement for ``generate_skill_file``."""
+
+    def test_creates_folder_with_skill_md_and_script(
+        self, tmp_path: Path,
+    ) -> None:
+        folder = emit_skill_folder(
+            name="hello-world",
+            description="Says hello.",
+            code='return {"hello": "world"}',
+            target_root=tmp_path,
         )
-        header = parse_skill_header(src)
-        assert header["skill"] == "my_skill"
-        assert header["description"] == "Does stuff"
-        assert header["author"] == "lexy_auto"
-        assert header["version"] == "2.0"
-        assert header["created"] == "2025-01-01T00:00:00Z"
-        assert header["tags"] == "web, search"
+        assert folder == tmp_path / "hello-world"
+        assert (folder / "SKILL.md").is_file()
+        assert (folder / "scripts" / "skill.py").is_file()
 
-    def test_empty_source_returns_defaults(self) -> None:
-        header = parse_skill_header("")
-        assert header["skill"] == ""
-        assert header["description"] == ""
-        assert header["author"] == ""
+    def test_skill_md_is_valid_frontmatter(self, tmp_path: Path) -> None:
+        folder = emit_skill_folder(
+            name="round-trip",
+            description="Round-trip test.",
+            code='return {}',
+            target_root=tmp_path,
+        )
+        text = (folder / "SKILL.md").read_text(encoding="utf-8")
+        fm = parse_skill_md(text, parent_dir_name="round-trip")
+        assert fm.name == "round-trip"
+        assert fm.description == "Round-trip test."
 
-    def test_no_docstring_returns_defaults(self) -> None:
-        header = parse_skill_header("import json\n\nx = 1\n")
-        assert header["skill"] == ""
+    def test_script_is_valid_python(self, tmp_path: Path) -> None:
+        folder = emit_skill_folder(
+            name="syntax-ok",
+            description="d",
+            code='return {"x": 1}',
+            target_root=tmp_path,
+        )
+        source = (folder / "scripts" / "skill.py").read_text(encoding="utf-8")
+        compile(source, "skill.py", "exec")
+        # The execute() body should be indented under the function.
+        assert '    return {"x": 1}' in source
 
-    def test_partial_header(self) -> None:
-        src = '"""\nSkill: partial_one\n"""\n'
-        header = parse_skill_header(src)
-        assert header["skill"] == "partial_one"
-        assert header["description"] == ""
+    def test_preserves_already_indented_code(self, tmp_path: Path) -> None:
+        folder = emit_skill_folder(
+            name="indented",
+            description="d",
+            code='    result = 1\n    return {"r": result}',
+            target_root=tmp_path,
+        )
+        source = (folder / "scripts" / "skill.py").read_text(encoding="utf-8")
+        assert "    result = 1" in source
 
-    def test_unclosed_docstring(self) -> None:
-        src = '"""\nSkill: never_closed\nDescription: oops'
-        header = parse_skill_header(src)
-        assert header["skill"] == ""  # No closing quotes found
+    def test_empty_code_gets_default_body(self, tmp_path: Path) -> None:
+        folder = emit_skill_folder(
+            name="empty-body",
+            description="d",
+            code="",
+            target_root=tmp_path,
+        )
+        source = (folder / "scripts" / "skill.py").read_text(encoding="utf-8")
+        assert 'return {"status": "ok"}' in source
 
+    def test_metadata_lands_in_frontmatter(self, tmp_path: Path) -> None:
+        folder = emit_skill_folder(
+            name="with-meta",
+            description="d",
+            code="return {}",
+            target_root=tmp_path,
+            license="MIT",
+            metadata={"version": "2.0", "author": "lexy"},
+        )
+        text = (folder / "SKILL.md").read_text(encoding="utf-8")
+        fm = parse_skill_md(text, parent_dir_name="with-meta")
+        assert fm.license == "MIT"
+        assert fm.metadata == {"version": "2.0", "author": "lexy"}
 
-class TestGenerateSkillFile:
-    def test_generates_valid_python(self) -> None:
-        code = 'return {"hello": "world"}'
-        result = generate_skill_file("test_skill", "A test skill", code)
-        assert "Skill: test_skill" in result
-        assert "Description: A test skill" in result
-        assert "async def execute" in result
-        # Must be valid Python
-        compile(result, "skill.py", "exec")
+    def test_existing_folder_without_overwrite_raises(
+        self, tmp_path: Path,
+    ) -> None:
+        emit_skill_folder(
+            name="dup",
+            description="d",
+            code="return {}",
+            target_root=tmp_path,
+        )
+        with pytest.raises(FileExistsError):
+            emit_skill_folder(
+                name="dup",
+                description="d",
+                code="return {}",
+                target_root=tmp_path,
+            )
 
-    def test_auto_indents_code(self) -> None:
-        code = 'return {"x": 1}'
-        result = generate_skill_file("indent_test", "desc", code)
-        # Body should be indented inside the function
-        assert '    return {"x": 1}' in result
+    def test_overwrite_replaces_folder(self, tmp_path: Path) -> None:
+        first = emit_skill_folder(
+            name="dup-overwrite",
+            description="first",
+            code="return {}",
+            target_root=tmp_path,
+        )
+        # Sanity: original SKILL.md says "first"
+        assert "first" in (first / "SKILL.md").read_text(encoding="utf-8")
+        emit_skill_folder(
+            name="dup-overwrite",
+            description="second",
+            code="return {}",
+            target_root=tmp_path,
+            overwrite=True,
+        )
+        assert "second" in (first / "SKILL.md").read_text(encoding="utf-8")
 
-    def test_preserves_already_indented_code(self) -> None:
-        code = '    result = api.llm_chat()\n    return {"ok": True}'
-        result = generate_skill_file("pre_indented", "desc", code)
-        assert "    result = api.llm_chat()" in result
-
-    def test_tags_default_to_general(self) -> None:
-        result = generate_skill_file("name", "desc", "return {}")
-        assert "Tags: general" in result
-
-    def test_custom_tags(self) -> None:
-        result = generate_skill_file("name", "desc", "return {}", tags=["web", "ai"])
-        assert "Tags: web, ai" in result
-
-    def test_empty_code_gets_default(self) -> None:
-        result = generate_skill_file("name", "desc", "")
-        assert 'return {"status": "ok"}' in result
+    def test_invalid_name_raises_before_disk_write(
+        self, tmp_path: Path,
+    ) -> None:
+        with pytest.raises(ValueError):
+            emit_skill_folder(
+                name="UPPERCASE",
+                description="d",
+                code="return {}",
+                target_root=tmp_path,
+            )
+        # Folder must NOT have been created.
+        assert not (tmp_path / "UPPERCASE").exists()
 
 
 class TestSanitizeSkillName:
-    def test_basic_sanitization(self) -> None:
-        assert sanitize_skill_name("My Skill!") == "my_skill"
+    """Slug-style names per the agentskills.io spec."""
 
-    def test_leading_digits_removed(self) -> None:
-        assert sanitize_skill_name("123skill") == "skill"
+    def test_spaces_become_hyphens(self) -> None:
+        assert sanitize_skill_name("My Skill!") == "my-skill"
 
-    def test_double_underscores_collapsed(self) -> None:
-        assert sanitize_skill_name("a__b___c") == "a_b_c"
+    def test_underscores_become_hyphens(self) -> None:
+        assert sanitize_skill_name("hello_world") == "hello-world"
 
-    def test_empty_returns_unnamed(self) -> None:
-        assert sanitize_skill_name("") == "unnamed_skill"
-        assert sanitize_skill_name("!!!") == "unnamed_skill"
+    def test_consecutive_special_chars_collapse(self) -> None:
+        assert sanitize_skill_name("a___b   c") == "a-b-c"
+
+    def test_leading_trailing_special_chars_stripped(self) -> None:
+        assert sanitize_skill_name("---foo---") == "foo"
+
+    def test_empty_returns_default(self) -> None:
+        assert sanitize_skill_name("") == "unnamed-skill"
+        assert sanitize_skill_name("!!!") == "unnamed-skill"
 
     def test_already_valid(self) -> None:
-        assert sanitize_skill_name("web_search") == "web_search"
+        assert sanitize_skill_name("pdf-extract") == "pdf-extract"
+
+    def test_truncates_to_64_chars(self) -> None:
+        long = "x" * 100
+        result = sanitize_skill_name(long)
+        assert len(result) <= 64
+
+    def test_uppercase_lowercased(self) -> None:
+        assert sanitize_skill_name("UPPER") == "upper"
 
 
 # ─── SkillValidator ───────────────────────────────────────────────────────
@@ -259,10 +331,92 @@ class TestForbiddenSets:
         assert "socket" in FORBIDDEN_MODULES
 
 
+class TestValidateFolder:
+    """Phase-11 method: validates the whole skill folder, not just one file."""
+
+    def setup_method(self) -> None:
+        self.v = SkillValidator(allowed_imports=ALLOWED)
+
+    def test_emitted_skill_validates_clean(self, tmp_path: Path) -> None:
+        folder = emit_skill_folder(
+            name="ok-skill",
+            description="d",
+            code='return {"ok": True}',
+            target_root=tmp_path,
+        )
+        ok, err = self.v.validate_folder(folder)
+        assert ok is True, err
+
+    def test_docs_only_skill_passes(self, tmp_path: Path) -> None:
+        """Spec allows skills without scripts/."""
+        folder = tmp_path / "docs-only"
+        folder.mkdir()
+        (folder / "SKILL.md").write_text(
+            "---\nname: docs-only\ndescription: D.\n---\n", encoding="utf-8"
+        )
+        ok, err = self.v.validate_folder(folder)
+        assert ok is True
+
+    def test_helper_does_not_need_execute(self, tmp_path: Path) -> None:
+        """Helper scripts in scripts/ don't need execute()."""
+        folder = emit_skill_folder(
+            name="with-helper",
+            description="d",
+            code="return {}",
+            target_root=tmp_path,
+        )
+        # Drop a helper that's just utility functions.
+        helper = folder / "scripts" / "utils.py"
+        helper.write_text(
+            "from typing import Any\n\n"
+            "def add(x: int, y: int) -> int:\n"
+            "    return x + y\n",
+            encoding="utf-8",
+        )
+        ok, err = self.v.validate_folder(folder)
+        assert ok is True, err
+
+    def test_helper_with_forbidden_import_rejected(
+        self, tmp_path: Path,
+    ) -> None:
+        folder = emit_skill_folder(
+            name="bad-helper",
+            description="d",
+            code="return {}",
+            target_root=tmp_path,
+        )
+        bad = folder / "scripts" / "evil.py"
+        bad.write_text("import os\n", encoding="utf-8")
+        ok, err = self.v.validate_folder(folder)
+        assert ok is False
+        assert "evil.py" in err and "os" in err
+
+    def test_missing_primary_script_rejected(self, tmp_path: Path) -> None:
+        folder = tmp_path / "no-primary"
+        folder.mkdir()
+        (folder / "SKILL.md").write_text(
+            "---\nname: no-primary\ndescription: D.\n---\n", encoding="utf-8"
+        )
+        scripts = folder / "scripts"
+        scripts.mkdir()
+        # Only a helper, no skill.py — Phase-11 convention requires
+        # the primary to exist when scripts/ is non-empty.
+        (scripts / "utils.py").write_text(
+            "def helper():\n    return 1\n", encoding="utf-8",
+        )
+        ok, err = self.v.validate_folder(folder)
+        assert ok is False
+        assert "primary" in err.lower()
+
+
 # ─── SkillRegistry ────────────────────────────────────────────────────────
 
 
 class TestSkillRegistry:
+    """Phase 11: ``file_path`` now stores folder paths, plus new
+    frontmatter columns (license, compatibility, metadata, body_md)
+    persist."""
+
     @pytest.mark.asyncio
     async def test_register_and_get(self, tmp_path: Path) -> None:
         async with aiosqlite.connect(":memory:") as db:
@@ -270,19 +424,47 @@ class TestSkillRegistry:
             await registry.init_tables()
 
             skill_id = await registry.register(
-                name="hello_world",
+                name="hello-world",
                 description="Says hello",
-                file_path="/skills/hello_world.py",
+                file_path=str(tmp_path / "hello-world"),
                 source="manual",
             )
             assert len(skill_id) == 12
 
-            entry = await registry.get("hello_world")
+            entry = await registry.get("hello-world")
             assert entry is not None
-            assert entry.name == "hello_world"
+            assert entry.name == "hello-world"
             assert entry.description == "Says hello"
             assert entry.status == "active"
             assert entry.usage_count == 0
+            # New Phase-11 columns default sensibly when not provided
+            assert entry.license is None
+            assert entry.metadata == {}
+            assert entry.body_md == ""
+
+    @pytest.mark.asyncio
+    async def test_register_with_frontmatter(self, tmp_path: Path) -> None:
+        """Phase 11 columns round-trip cleanly."""
+        async with aiosqlite.connect(":memory:") as db:
+            registry = SkillRegistry(db, tmp_path / "skills")
+            await registry.init_tables()
+            await registry.register(
+                name="full-card",
+                description="d",
+                file_path=str(tmp_path / "full-card"),
+                license="MIT",
+                compatibility="Python 3.11+",
+                metadata={"author": "lexy", "version": "1.0"},
+                allowed_tools="Bash Read",
+                body_md="# step 1\n",
+            )
+            entry = await registry.get("full-card")
+            assert entry is not None
+            assert entry.license == "MIT"
+            assert entry.compatibility == "Python 3.11+"
+            assert entry.metadata == {"author": "lexy", "version": "1.0"}
+            assert entry.allowed_tools == "Bash Read"
+            assert "step 1" in entry.body_md
 
     @pytest.mark.asyncio
     async def test_get_nonexistent_returns_none(self, tmp_path: Path) -> None:
@@ -298,8 +480,8 @@ class TestSkillRegistry:
             registry = SkillRegistry(db, tmp_path / "skills")
             await registry.init_tables()
 
-            await registry.register("s1", "desc1", "/s1.py")
-            await registry.register("s2", "desc2", "/s2.py")
+            await registry.register("s1", "desc1", str(tmp_path / "s1"))
+            await registry.register("s2", "desc2", str(tmp_path / "s2"))
 
             all_skills = await registry.list_all()
             assert len(all_skills) == 2
@@ -310,20 +492,20 @@ class TestSkillRegistry:
             registry = SkillRegistry(db, tmp_path / "skills")
             await registry.init_tables()
 
-            await registry.register("active_skill", "d", "/a.py")
-            await registry.register("disabled_skill", "d", "/d.py")
-            await registry.set_status("disabled_skill", "disabled")
+            await registry.register("active-skill", "d", str(tmp_path / "a"))
+            await registry.register("disabled-skill", "d", str(tmp_path / "d"))
+            await registry.set_status("disabled-skill", "disabled")
 
             active = await registry.list_all(status="active")
             assert len(active) == 1
-            assert active[0].name == "active_skill"
+            assert active[0].name == "active-skill"
 
     @pytest.mark.asyncio
     async def test_update_stats_success(self, tmp_path: Path) -> None:
         async with aiosqlite.connect(":memory:") as db:
             registry = SkillRegistry(db, tmp_path / "skills")
             await registry.init_tables()
-            await registry.register("s1", "d", "/s1.py")
+            await registry.register("s1", "d", str(tmp_path / "s1"))
 
             await registry.update_stats("s1", success=True)
             entry = await registry.get("s1")
@@ -338,7 +520,7 @@ class TestSkillRegistry:
         async with aiosqlite.connect(":memory:") as db:
             registry = SkillRegistry(db, tmp_path / "skills")
             await registry.init_tables()
-            await registry.register("s1", "d", "/s1.py")
+            await registry.register("s1", "d", str(tmp_path / "s1"))
 
             await registry.update_stats("s1", success=False)
             entry = await registry.get("s1")
@@ -352,11 +534,11 @@ class TestSkillRegistry:
         async with aiosqlite.connect(":memory:") as db:
             registry = SkillRegistry(db, tmp_path / "skills")
             await registry.init_tables()
-            await registry.register("to_delete", "d", "/d.py")
+            await registry.register("to-delete", "d", str(tmp_path / "to-delete"))
 
-            deleted = await registry.delete("to_delete")
+            deleted = await registry.delete("to-delete")
             assert deleted is True
-            assert await registry.get("to_delete") is None
+            assert await registry.get("to-delete") is None
 
     @pytest.mark.asyncio
     async def test_delete_nonexistent(self, tmp_path: Path) -> None:
@@ -372,12 +554,74 @@ class TestSkillRegistry:
         async with aiosqlite.connect(":memory:") as db:
             registry = SkillRegistry(db, tmp_path / "skills")
             await registry.init_tables()
-            await registry.register("s1", "d", "/s1.py")
+            await registry.register("s1", "d", str(tmp_path / "s1"))
 
             await registry.set_status("s1", "failed")
             entry = await registry.get("s1")
             assert entry is not None
             assert entry.status == "failed"
+
+    @pytest.mark.asyncio
+    async def test_init_tables_idempotent_alter(self, tmp_path: Path) -> None:
+        """Schema migration must be safe to run twice in a row.
+
+        Pre-Phase-11 DBs only have the original 12 columns; running
+        ``init_tables`` again should add the 5 new columns silently.
+        """
+        async with aiosqlite.connect(":memory:") as db:
+            registry = SkillRegistry(db, tmp_path / "skills")
+            await registry.init_tables()
+            # Second call must succeed — the ALTER would otherwise
+            # raise "duplicate column" if not swallowed properly.
+            await registry.init_tables()
+
+    @pytest.mark.asyncio
+    async def test_update_metadata(self, tmp_path: Path) -> None:
+        async with aiosqlite.connect(":memory:") as db:
+            registry = SkillRegistry(db, tmp_path / "skills")
+            await registry.init_tables()
+            await registry.register(
+                name="updateable",
+                description="old",
+                file_path=str(tmp_path / "updateable"),
+            )
+            ok = await registry.update_metadata(
+                "updateable",
+                description="new",
+                license="Apache-2.0",
+                metadata={"version": "2.0"},
+            )
+            assert ok is True
+            entry = await registry.get("updateable")
+            assert entry is not None
+            assert entry.description == "new"
+            assert entry.license == "Apache-2.0"
+            assert entry.metadata == {"version": "2.0"}
+
+    @pytest.mark.asyncio
+    async def test_scan_disk_picks_up_folders(self, tmp_path: Path) -> None:
+        """``scan_disk`` walks folders and registers ones not yet in DB."""
+        skills_root = tmp_path / "skills"
+        skills_root.mkdir()
+        # Create a valid skill folder on disk.
+        skill_dir = skills_root / "scanned-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: scanned-skill\ndescription: Demo.\n---\n",
+            encoding="utf-8",
+        )
+
+        async with aiosqlite.connect(":memory:") as db:
+            registry = SkillRegistry(db, skills_root)
+            await registry.init_tables()
+            added = await registry.scan_disk()
+            assert added == 1
+            entry = await registry.get("scanned-skill")
+            assert entry is not None
+            assert entry.description == "Demo."
+            # Second scan finds nothing new.
+            again = await registry.scan_disk()
+            assert again == 0
 
 
 # ─── AutoAgent ────────────────────────────────────────────────────────────

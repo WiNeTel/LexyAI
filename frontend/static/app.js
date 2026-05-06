@@ -2223,7 +2223,10 @@
                         <span class="dot ${p.enabled ? "ok" : "warn"}"></span>
                         ${p.enabled ? "enabled" : p.loaded ? "loaded" : "off"}
                     </span>
-                    <div style="display:flex;gap:6px;">
+                    <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                        ${p.name === "skill_writer" ? `
+                            <button class="btn plugin-import-btn" data-action="skill-import" title="Agent-Skill (.zip) importieren">📥 Import Skill</button>
+                        ` : ""}
                         <button class="btn plugin-config-btn" data-action="config">Config</button>
                         <button class="btn" data-action="toggle">
                             ${p.enabled ? "Disable" : "Enable"}
@@ -2266,7 +2269,72 @@
             card.querySelector('[data-action="config"]').addEventListener("click", () => {
                 openPluginConfig(p.name);
             });
+            // Phase 11: skill_writer hat einen Import-Button für
+            // agentskills.io-konforme .zip-Pakete. Click → File-Dialog
+            // → POST multipart an die neue REST-Route.
+            const importBtn = card.querySelector('[data-action="skill-import"]');
+            if (importBtn) {
+                importBtn.addEventListener("click", () => triggerSkillImport());
+            }
             pluginsGrid.appendChild(card);
+        }
+    }
+
+    // Phase 11 — Agent Skill Importer (.zip from agentskills.io
+    // ecosystem). Spawns a hidden <input type="file"> on demand,
+    // POSTs multipart to the gateway, surfaces the Toast.
+    async function triggerSkillImport() {
+        const input = document.createElement("input");
+        input.type = "file";
+        input.accept = ".zip,application/zip";
+        input.style.display = "none";
+        input.addEventListener("change", async () => {
+            const file = input.files && input.files[0];
+            if (!file) return;
+            await uploadSkillZip(file);
+        });
+        document.body.appendChild(input);
+        input.click();
+        // Cleanup once a selection (or cancel) is registered.
+        setTimeout(() => input.remove(), 1000);
+    }
+
+    async function uploadSkillZip(file, { overwrite = false } = {}) {
+        const fd = new FormData();
+        fd.append("file", file);
+        if (overwrite) fd.append("overwrite", "true");
+        try {
+            const resp = await fetch(
+                "/api/v1/plugins/skill_writer/skills/import",
+                { method: "POST", body: fd },
+            );
+            const body = await resp.json().catch(() => null);
+            if (resp.status === 409) {
+                // Conflict — ask the user before overwriting.
+                if (!overwrite && confirm(
+                    `Ein Skill mit dem Namen aus '${file.name}' existiert bereits. ` +
+                    "Überschreiben?"
+                )) {
+                    await uploadSkillZip(file, { overwrite: true });
+                }
+                return;
+            }
+            if (!resp.ok) {
+                const detail = body && body.detail
+                    ? body.detail
+                    : `HTTP ${resp.status}`;
+                throw new Error(detail);
+            }
+            const skillName = body && body.skill && body.skill.name;
+            const wasOverwrite = body && body.overwrote_existing;
+            toast(
+                wasOverwrite ? "Skill aktualisiert" : "Skill importiert",
+                skillName || file.name,
+            );
+            // Refresh plugin tab so the skill_writer card reflects new state.
+            if (state.activeTab === "plugins") loadPlugins();
+        } catch (err) {
+            toast("Skill-Import fehlgeschlagen", String(err && err.message || err));
         }
     }
 
