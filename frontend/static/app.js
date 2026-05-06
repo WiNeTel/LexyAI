@@ -1328,6 +1328,42 @@
                 }
                 break;
 
+            case "memory_captured":
+                // Phase 12: memory_capture plugin (or the core
+                // memory_store tool) tells the UI it just persisted
+                // a fact. The ``kind`` field tells us *which* layer
+                // fired:
+                //   * "trigger_phrase"   — Mike said "merke dir das"
+                //   * "implicit_capture" — LLM classifier picked it
+                //   * "tool"             — Lexy used memory_store herself
+                //
+                // We surface a small toast so the user has confidence
+                // the system actually did something — without one, an
+                // explicit "merke dir das" feels like a no-op.
+                if (data && data.fact) {
+                    const icon = data.kind === "trigger_phrase"
+                        ? "📌"
+                        : data.kind === "implicit_capture"
+                            ? "🤖"
+                            : "💾";
+                    const title = data.kind === "trigger_phrase"
+                        ? "Fakt gespeichert"
+                        : data.kind === "implicit_capture"
+                            ? "Fakt automatisch erkannt"
+                            : "Memory aktualisiert";
+                    const fact = String(data.fact).slice(0, 120);
+                    toast(title, `${icon} ${fact}${fact.length >= 120 ? "…" : ""}`, 4500);
+                }
+                break;
+
+            case "session_deleted":
+                // Phase 11 RP-isolation hotfix — backend pushes this
+                // after a session + its character data are wiped.
+                // Refresh the Sessions tab so the deleted entry
+                // disappears immediately.
+                if (state.activeTab === "sessions") loadSessions();
+                break;
+
             // ── Character chat ──
             case "character_list":
                 if (window._lexyCharacters) window._lexyCharacters.onList(data);

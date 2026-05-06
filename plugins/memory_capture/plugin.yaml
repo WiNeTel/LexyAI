@@ -1,0 +1,33 @@
+name: memory_capture
+version: 1.0.0
+description: >-
+  Auto-capture user facts when explicit trigger phrases ("merke dir
+  das", "remember this") are detected, plus optional implicit
+  capture via a tiny LLM classifier.
+entry: plugin.MemoryCapturePlugin
+requires: []
+optional: []
+capabilities: [hook, event]
+
+config_defaults:
+  # Languages to scan with regex trigger patterns.
+  enabled_languages:
+    - de
+    - en
+  # Cooldown (seconds) per fact-text — the same fact stored within
+  # this window is treated as a duplicate so a user can't accidentally
+  # spam-store ten copies via repeated "merke dir das" presses.
+  cooldown_seconds: 60
+  # Phase 12.C — implicit fact extraction via LLM classifier.
+  # Off by default; flip to true once Mike is happy with explicit
+  # triggers and wants the smarter (but pricier per message) layer.
+  implicit_capture_enabled: false
+  # Minimum classifier confidence (0-1) before we persist an
+  # implicit fact. Higher = fewer false positives, more misses.
+  implicit_confidence_min: 0.7
+  # Brain to use for the implicit classifier. e4b is fast/cheap
+  # and good enough for "is this a stable user fact, yes/no".
+  implicit_brain: e4b
+  # Per-session cooldown for the LLM classifier so we're not making
+  # an extra LLM call on every single message in a busy session.
+  implicit_classify_cooldown: 30

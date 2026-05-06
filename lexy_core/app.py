@@ -49,6 +49,72 @@ from lexy_core.websocket import WSServer, build_app
 log = get_logger(module="app")
 
 
+# ─── Core memory tool schemas (Phase 12) ─────────────────────────────
+#
+# Exposed to the main chat agent so the LLM can persist + retrieve user
+# facts on its own. Defined at module scope so they're easy to find and
+# don't bloat ``LexyApp.__init__``. Each tool's handler lives on
+# ``LexyApp`` (``_tool_memory_store`` / ``_tool_memory_recall``).
+
+_MEMORY_STORE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "text": {
+            "type": "string",
+            "description": (
+                "Der reine Fakt — NICHT der ganze Befehlssatz. "
+                "Beispiel: für 'merke dir, ich wohne am Nordpol' "
+                "schreibe 'User wohnt am Nordpol', nicht den ganzen "
+                "Satz inklusive 'merke dir'."
+            ),
+        },
+        "collection": {
+            "type": "string",
+            "enum": ["facts", "context", "solutions", "errors"],
+            "description": (
+                "Default 'facts' für stabile User-Fakts (Adresse, "
+                "Vorlieben, Allergien). 'context' für flüchtige "
+                "Konversations-Snippets."
+            ),
+        },
+        "tags": {
+            "type": "string",
+            "description": (
+                "Optionale komma-separierte Tags für späteres Filtern, "
+                "z.B. 'user_info,address' oder 'preference'."
+            ),
+        },
+    },
+    "required": ["text"],
+}
+
+_MEMORY_RECALL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "query": {
+            "type": "string",
+            "description": (
+                "Die Suchfrage in natürlicher Sprache. Lexy übersetzt "
+                "z.B. 'wo wohnt der User' in eine gute Query."
+            ),
+        },
+        "collection": {
+            "type": "string",
+            "enum": ["facts", "context", "solutions", "errors"],
+            "description": (
+                "Default 'facts'. Auf 'context' setzen für Recall "
+                "aus früheren Konversationen."
+            ),
+        },
+        "limit": {
+            "type": "integer",
+            "description": "Max Treffer 1-20, default 5.",
+        },
+    },
+    "required": ["query"],
+}
+
+
 class LexyApp:
     """The Lexy AI core application object."""
 
@@ -182,6 +248,20 @@ class LexyApp:
         await self.plugin_loader.discover_and_load()
         log.info("app.plugins_loaded", count=self.plugin_loader.loaded_count)
 
+        # 10b. Core memory tools (Phase 12).
+        #
+        # ``memory_store`` / ``memory_recall`` were previously only
+        # available via the PluginAPI (i.e. plugin code could call
+        # them, but the LLM in the main chat couldn't). After Phase 11
+        # Mike asked: "if I tell Lexy 'merke dir das', shouldn't that
+        # land in facts?" — and the answer was no, because the tool
+        # wasn't registered. We now expose both as core tools so the
+        # main agent's tool-call path can hit them. Plugins that
+        # registered the same names earlier in their on_enable still
+        # win (the registry logs an "overwrite" warning if so) — we
+        # only register here if they're not already taken.
+        self._register_core_memory_tools()
+
         # 11. Agent
         self.agent = LexyAgent(self)
 
@@ -249,6 +329,172 @@ class LexyApp:
                 "app.plugin_overrides_loaded",
                 plugins=list(self.plugin_overrides.keys()),
             )
+
+    # ─── Core memory tools (Phase 12) ──────────────────────────────
+
+    def _register_core_memory_tools(self) -> None:
+        """Register ``memory_store`` + ``memory_recall`` as LLM tools.
+
+        These were previously available only to plugins via the
+        PluginAPI; the main chat agent had no tool to persist or
+        recall facts. Phase 12 closes the gap so a user message like
+        "merke dir das" can land in the ``facts`` collection without
+        any extra plugin.
+
+        We skip registration if a plugin already claimed the same
+        name in its ``on_enable`` (the registry would log an
+        overwrite warning otherwise — better to defer to the plugin
+        which presumably has more context-aware behaviour).
+        """
+        if self.tool_registry is None or self.memory is None:
+            log.warning(
+                "app.core_memory_tools_skipped",
+                reason="tool_registry or memory unavailable",
+            )
+            return
+
+        # Defer to plugin-registered tools of the same name (they
+        # presumably have richer behaviour); only register here if
+        # the slot is free.
+        if self.tool_registry.get_tool("memory_store") is None:
+            self.tool_registry.register(
+                name="memory_store",
+                handler=self._tool_memory_store,
+                schema=_MEMORY_STORE_SCHEMA,
+                description=(
+                    "Speichere einen Fakt oder eine Information dauerhaft "
+                    "im Memory. Nutze dies wenn der User dich explizit "
+                    "bittet etwas zu merken (z.B. 'merke dir das', "
+                    "'remember this'), ODER wenn ein wichtiger stabiler "
+                    "Fakt über den User auftaucht (Adresse, Vorlieben, "
+                    "Allergien, Beruf). Nicht für aktuelle Stimmungen "
+                    "oder kurzfristige Aktivitäten."
+                ),
+                source="core",
+            )
+
+        if self.tool_registry.get_tool("memory_recall") is None:
+            self.tool_registry.register(
+                name="memory_recall",
+                handler=self._tool_memory_recall,
+                schema=_MEMORY_RECALL_SCHEMA,
+                description=(
+                    "Suche im Memory nach gespeicherten Facts, "
+                    "Erinnerungen oder Kontext. Nutze dies BEVOR du "
+                    "den User nach Information fragst, die er dir "
+                    "möglicherweise früher schon mal mitgeteilt hat "
+                    "(Adresse, Vorlieben, wichtige Personen). Wenn "
+                    "nichts zurückkommt, dann darfst du nachfragen."
+                ),
+                source="core",
+            )
+
+    async def _tool_memory_store(
+        self,
+        text: str,
+        collection: str = "facts",
+        tags: str = "",
+    ) -> dict[str, Any]:
+        """Tool handler — persist a fact via the memory manager."""
+        if not text or not text.strip():
+            return {"ok": False, "error": "text required"}
+        if self.memory is None:
+            return {"ok": False, "error": "memory not available"}
+
+        valid_collections = {"facts", "context", "solutions", "errors"}
+        if collection not in valid_collections:
+            collection = "facts"
+
+        metadata: dict[str, Any] = {"source": "user_chat"}
+        if tags:
+            cleaned = ",".join(
+                t.strip() for t in tags.split(",") if t.strip()
+            )
+            if cleaned:
+                metadata["tags"] = cleaned
+
+        try:
+            result_id = await self.memory.store(
+                text=text.strip(),
+                collection=collection,
+                metadata=metadata,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("app.memory_tool_store_failed", error=str(exc))
+            return {"ok": False, "error": str(exc)}
+
+        log.info(
+            "app.memory_tool_stored",
+            id=result_id,
+            collection=collection,
+            preview=text.strip()[:80],
+        )
+        # Surface a broadcast so the frontend can show a "Fakt
+        # gespeichert" toast without each plugin having to do this
+        # for itself.
+        if self.ws_server is not None:
+            try:
+                await self.ws_server.broadcast({
+                    "type": "memory_captured",
+                    "kind": "tool",
+                    "fact": text.strip()[:200],
+                    "collection": collection,
+                })
+            except Exception:  # noqa: BLE001
+                pass
+        return {"ok": True, "id": result_id, "collection": collection}
+
+    async def _tool_memory_recall(
+        self,
+        query: str,
+        collection: str = "facts",
+        limit: int = 5,
+    ) -> dict[str, Any]:
+        """Tool handler — recall facts from the memory manager."""
+        if not query or not query.strip():
+            return {"ok": False, "error": "query required"}
+        if self.memory is None:
+            return {"ok": False, "error": "memory not available"}
+
+        valid_collections = {"facts", "context", "solutions", "errors"}
+        if collection not in valid_collections:
+            collection = "facts"
+
+        try:
+            limit = max(1, min(20, int(limit)))
+        except (TypeError, ValueError):
+            limit = 5
+
+        try:
+            hits = await self.memory.recall(
+                query=query.strip(),
+                collection=collection,
+                limit=limit,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("app.memory_tool_recall_failed", error=str(exc))
+            return {"ok": False, "error": str(exc)}
+
+        # ``MemoryManager.recall`` returns dicts with ``content`` (the
+        # ChromaDB document) plus ``score``, ``metadata``, etc. Older
+        # mocks in tests may return ``text``/``document`` instead, so
+        # we fall through several names for defensive reuse.
+        return {
+            "ok": True,
+            "count": len(hits),
+            "hits": [
+                {
+                    "text": (
+                        h.get("content")
+                        or h.get("text")
+                        or h.get("document")
+                        or ""
+                    ),
+                    "score": float(h.get("score", 0.0) or 0.0),
+                }
+                for h in hits
+            ],
+        }
 
     # ─── Built-in WebSocket handlers ────────────────────────────────
 
