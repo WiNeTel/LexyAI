@@ -1563,9 +1563,67 @@ def build_app(lexy: "LexyApp") -> FastAPI:
 
     @api.delete("/api/v1/sessions/{session_id}")
     async def clear_session(session_id: str, request: Request) -> dict[str, Any]:
+        """Delete a session everywhere it's persisted.
+
+        Phase 11 hotfix — used to only call ``session_store.clear``
+        which left:
+          * ``character_turns`` rows (per-RP character bubbles)
+          * ``character_sessions`` rows (the mode mapping)
+          * ChromaDB ``context`` items tagged with this session_id
+            (per-character memory snippets persisted under
+            ``_memory_strict_isolation``)
+          * FTS mirror rows
+        That was Mike's "fire bleeds into the next RP" report —
+        deleting one RP didn't actually delete its memory, so the
+        next session re-surfaced it. Now we wipe ALL of those.
+        """
         app = _app(request)
+
+        # 1. Session-store messages (user/assistant).
         dropped = app.session_store.clear(session_id)
-        return {"status": "cleared", "dropped": dropped}
+        report: dict[str, Any] = {"messages": dropped}
+
+        # 2. Cross-collection ChromaDB + FTS purge for this session.
+        if app.memory is not None:
+            try:
+                report["memory_items"] = await app.memory.delete_all_for_session(
+                    session_id
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "session.delete_memory_failed",
+                    session_id=session_id, error=str(exc),
+                )
+                report["memory_items"] = 0
+
+        # 3. character_chat: turns + char_sessions row + pulse timers.
+        if app.plugin_loader is not None:
+            cc_plugin = app.plugin_loader.get_plugin("character_chat")
+            if cc_plugin is not None and hasattr(cc_plugin, "wipe_session_data"):
+                try:
+                    cc_report = await cc_plugin.wipe_session_data(session_id)
+                    report["character_chat"] = cc_report
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "session.delete_character_chat_failed",
+                        session_id=session_id, error=str(exc),
+                    )
+
+        # 4. Broadcast so any open Sessions/RP tabs refresh.
+        if app.ws_server is not None:
+            try:
+                await app.ws_server.broadcast({
+                    "type": "session_deleted",
+                    "session_id": session_id,
+                })
+            except Exception:  # noqa: BLE001
+                pass
+
+        log.info(
+            "session.deleted",
+            session_id=session_id, dropped=dropped, **report,
+        )
+        return {"status": "cleared", "dropped": dropped, "report": report}
 
     @api.patch("/api/v1/sessions/{session_id}/messages/{index}")
     async def edit_session_message(

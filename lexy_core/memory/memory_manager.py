@@ -292,6 +292,91 @@ class MemoryManager:
         )
         return {"chroma": int(prev_count), "fts": int(fts_deleted)}
 
+    async def delete_all_for_session(
+        self,
+        session_id: str,
+        collection: str | None = None,
+    ) -> int:
+        """Wipe every memory item bound to ``session_id``.
+
+        Used when a session is fully deleted (DELETE
+        /api/v1/sessions/{id}). Mike's report: deleting an RP-Chat
+        left the character's "fire" context behind, which then
+        bled into the next RP. This method is the cleanup hammer:
+        every Chroma item with ``metadata.session_id == session_id``
+        gets dropped, plus the matching FTS rows.
+
+        Args:
+            session_id: the session to purge.
+            collection: a single collection to scope to, or ``None``
+                to scrub every registered collection (the default —
+                that's what session-delete should do).
+
+        Returns the total number of items removed across all
+        collections that were touched.
+        """
+        if self._client is None or not session_id:
+            return 0
+        targets: list[str]
+        if collection is None:
+            targets = list(self._collections.keys())
+        else:
+            targets = [collection] if collection in self._collections else []
+        total = 0
+        for col_name in targets:
+            col = self._collections[col_name]
+            try:
+                got = col.get(
+                    where={"session_id": session_id},
+                    include=[],  # we only need ids
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "memory.delete_all_for_session_failed",
+                    session_id=session_id,
+                    collection=col_name,
+                    error=str(exc),
+                )
+                continue
+            ids: list[str] = list(got.get("ids") or [])
+            if not ids:
+                continue
+            try:
+                col.delete(ids=ids)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "memory.delete_all_chroma_failed",
+                    session_id=session_id,
+                    collection=col_name,
+                    error=str(exc),
+                )
+                continue
+            total += len(ids)
+            log.info(
+                "memory.deleted_all_for_session",
+                session_id=session_id,
+                collection=col_name,
+                count=len(ids),
+            )
+            if self._fts is not None:
+                # Delete in a single sweep — the FTS schema doesn't
+                # have session_id directly, but it has the id column,
+                # and we know all the ids we want gone.
+                placeholders = ",".join("?" * len(ids))
+                try:
+                    await self._fts.execute(
+                        f"DELETE FROM items_fts WHERE id IN ({placeholders})",
+                        ids,
+                    )
+                    await self._fts.commit()
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "memory.delete_all_fts_failed",
+                        session_id=session_id,
+                        error=str(exc),
+                    )
+        return total
+
     async def delete_last_for_session(
         self,
         session_id: str,

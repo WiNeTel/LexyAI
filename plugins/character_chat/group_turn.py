@@ -121,9 +121,11 @@ class GroupTurnResult:
 LLMChat = Callable[..., Awaitable[str]]
 
 # Optional per-character memory fetch. Called as
-# ``recall_fn(character_id=..., query=..., limit=...)`` just before a turn's
-# LLM call so the character's own remembered snippets can be threaded into
-# their prompt. ``None`` disables the feature.
+# ``recall_fn(character_id=..., query=..., limit=..., session_id=...)`` just
+# before a turn's LLM call so the character's own remembered snippets can be
+# threaded into their prompt. The session_id arg scopes recall to the
+# current RP — without it a character leaks memory across sessions
+# (Mike's "fire from another RP" bug). ``None`` disables the feature.
 MemoryRecallFn = Callable[..., Awaitable[list[dict[str, Any]]]]
 
 
@@ -501,10 +503,15 @@ class GroupTurnOrchestrator:
                 or card.name
             )
             try:
+                # Pass session_id so the recall filter is scoped to
+                # this RP — without it a character would see memories
+                # from every other session it ever participated in
+                # (Mike's "fire bleeding into a no-fire RP" report).
                 own_memories = await self._recall_fn(
                     character_id=card.id,
                     query=query,
                     limit=self._recall_limit,
+                    session_id=req.session_id,
                 )
             except Exception as exc:  # noqa: BLE001
                 log.warning(

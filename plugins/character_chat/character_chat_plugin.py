@@ -394,25 +394,50 @@ class CharacterChatPlugin(BasePlugin):
         )
 
     async def _character_recall(
-        self, *, character_id: str, query: str, limit: int = 3
+        self,
+        *,
+        character_id: str,
+        query: str,
+        limit: int = 3,
+        session_id: str = "",
     ) -> list[dict[str, Any]]:
         """Per-character memory fetch with strict isolation.
 
-        Uses the extended ``memory_recall`` API (Phase 3b) to filter by
-        ``character_id`` metadata so Luna only ever sees her own memory,
-        never Lexy's. Returns raw recall items.
+        Filters by ``character_id`` so Luna only ever sees her own
+        memory, never Lexy's. **And** by ``session_id`` so the same
+        character spawned in two different RPs doesn't leak state
+        between them — Mike reported the bug: a character that
+        experienced a fire in Session A reacted to a fire in Session B
+        even though Session B never had one. Without session-scoping
+        we'd be feeding the LLM stale context from a totally
+        different RP.
+
+        ``session_id`` is OPTIONAL for backwards-compat — if a caller
+        omits it (none of the production code does after the audit
+        but tests / older plugin entry points might), we fall back to
+        character-only filter and log a warning.
         """
+        meta_filter: dict[str, Any] = {"character_id": character_id}
+        if session_id:
+            meta_filter["session_id"] = session_id
+        else:
+            log.warning(
+                "character_chat.recall_no_session_id",
+                character_id=character_id,
+                hint="cross-session memory leak risk; pass session_id",
+            )
         try:
             return await self.api.memory_recall(
                 query=query,
                 collection="context",
                 limit=limit,
-                metadata_equals={"character_id": character_id},
+                metadata_equals=meta_filter,
             )
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "character_chat.recall_unavailable",
                 character_id=character_id,
+                session_id=session_id,
                 error=str(exc),
             )
             return []
@@ -892,6 +917,13 @@ class CharacterChatPlugin(BasePlugin):
           then a character round runs so characters react to both the
           user AND Lexy's response. Natural mode for a family RP where
           Lexy and her children all participate.
+
+        **Phase 9.12+ Tab-Isolation guard:** the session's ``meta.kind``
+        is the authoritative answer to "is this an RP session". If it's
+        ``"chat"`` we skip the hook entirely, even if a stale
+        ``character_sessions`` row from before the kind-field existed
+        still says ``character_mode=1``. Without this guard Mike was
+        seeing characters answer in his Chat-Tab.
         """
         if self._store is None or self._orchestrator is None:
             return ctx
@@ -899,6 +931,20 @@ class CharacterChatPlugin(BasePlugin):
         session_id = str(ctx.get("session_id", "") or "")
         if not session_id:
             return ctx
+
+        # Phase 9.12 guard: only react to RP-kind sessions. Looks up
+        # the session_store's meta directly so we get the same source
+        # of truth the gateway and the frontend use.
+        try:
+            session_store = getattr(self.api._app, "session_store", None)
+            if session_store is not None:
+                meta = session_store.get_meta(session_id) or {}
+                if (meta.get("kind") or "chat") == "chat":
+                    return ctx
+        except Exception:  # noqa: BLE001
+            # Defensive: session_store missing in some test stubs —
+            # fall through to the legacy mode check rather than crash.
+            pass
 
         state = await self._get_session_state(session_id)
         mode = int(state.get("character_mode") or 0)
@@ -1372,6 +1418,96 @@ class CharacterChatPlugin(BasePlugin):
 
         # Flip character_mode off.
         await self._set_session_state(session_id, character_mode=False)
+
+    # ─── Session deletion cleanup ─────────────────────────────────────
+
+    async def wipe_session_data(self, session_id: str) -> dict[str, int]:
+        """Wipe every per-session record this plugin owns.
+
+        Called from the gateway's ``DELETE /api/v1/sessions/{id}``
+        route after the agent's ``session_store.clear(session_id)``
+        runs. Mike's report: deleting an RP-Chat left character_turns
+        + character_sessions rows behind, plus the per-character
+        memory entries in the ``context`` collection. The next RP
+        with the same character then re-surfaced stale memories from
+        the deleted session ("Charakter hat auf Feuer reagiert was es
+        in dem neuen chat nicht gab"). This method is the single
+        cleanup hammer that touches everything per-session this
+        plugin persists:
+
+        * ``character_turns``     (the turn DB rows)
+        * ``character_sessions``  (the mode + scene mapping)
+        * Pulse timers active for any character in the session
+        * Detach all currently-bound characters (frees the slot for
+          a fresh RP without leftover binding).
+
+        Cross-collection memory wipe (Chroma + FTS) is handled by
+        the gateway calling ``memory.delete_all_for_session()`` —
+        this method only owns the plugin's local state.
+
+        Returns a dict ``{turns, sessions, detached, timers}`` with
+        the count per category for log/UX use.
+        """
+        if not session_id:
+            return {"turns": 0, "sessions": 0, "detached": 0, "timers": 0}
+
+        report = {"turns": 0, "sessions": 0, "detached": 0, "timers": 0}
+        db = await self.api.get_db()
+
+        # 1. Detach all currently-bound characters (also cancels pulse
+        # timers via _cancel_pulse_timer). This must happen BEFORE we
+        # blow away character_sessions so we still have the mapping.
+        if self._store is not None:
+            try:
+                bound = await self._store.list_in_session(session_id)
+            except Exception:  # noqa: BLE001
+                bound = []
+            for card in bound:
+                try:
+                    await self._store.detach_from_session(card.id, session_id)
+                    await self._cancel_pulse_timer(card.id, session_id)
+                    report["detached"] += 1
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "character_chat.wipe_detach_failed "
+                        "character=%s session=%s error=%s",
+                        card.id, session_id, exc,
+                    )
+
+        # 2. character_turns: every turn from this session.
+        try:
+            cur = await db.execute(
+                "DELETE FROM character_turns WHERE session_id = ?",
+                (session_id,),
+            )
+            report["turns"] = int(cur.rowcount or 0)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "character_chat.wipe_turns_failed",
+                session_id=session_id, error=str(exc),
+            )
+
+        # 3. character_sessions: the mode + scene mapping.
+        try:
+            cur = await db.execute(
+                "DELETE FROM character_sessions WHERE session_id = ?",
+                (session_id,),
+            )
+            report["sessions"] = int(cur.rowcount or 0)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "character_chat.wipe_sessions_failed",
+                session_id=session_id, error=str(exc),
+            )
+
+        await db.commit()
+
+        log.info(
+            "character_chat.session_wiped",
+            session_id=session_id,
+            **report,
+        )
+        return report
 
     # ─── Session character_mode bookkeeping ──────────────────────────────
 
