@@ -889,6 +889,16 @@
             sysWs.style.color = "var(--ok)";
             ws.send(JSON.stringify({ type: "get_signals" }));
             ws.send(JSON.stringify({ type: "get_plugins" }));
+            // Phase 11 fix — re-trigger the active tab's data fetch
+            // now that the WS is open. Without this, a tab that was
+            // opened during WS reconnect (or before the initial
+            // connect completed) sits with stale/empty state until
+            // the user manually clicks Refresh. Dashboard is the
+            // most visible victim — Mike's report.
+            if (state.activeTab === "dashboard") loadDashboard();
+            else if (state.activeTab === "scheduler") loadScheduler();
+            else if (state.activeTab === "characters") loadCharacters();
+            else if (state.activeTab === "rp") loadRoleplay();
         };
 
         ws.onclose = () => {
@@ -3641,6 +3651,18 @@
     const dashboardRefreshBtn = $("dashboard-refresh-btn");
 
     function loadDashboard() {
+        // Render synchronously with whatever cached state we have.
+        // Phase 11 fix — Mike reported: after a Phase-9.12 frontend
+        // restart, opening the Dashboard tab showed only the header
+        // (Edit Layout / Refresh) but no widget cards. Cause: the
+        // pre-fix code only rendered when a WS response arrived; if
+        // the WS was still connecting (or the dashboard plugin was
+        // disabled, or a response was lost), `renderDashboardGrid`
+        // never fired and the grid `<div>` stayed empty. Now we
+        // render the default 8-widget layout immediately so users
+        // always see something, and the WS responses refresh in
+        // place when they land.
+        renderDashboardGrid(state.dashboardLayout, state.dashboardWidgets);
         wsSend({ type: "get_dashboard_layout" });
         wsSend({ type: "get_dashboard_widgets" });
     }
