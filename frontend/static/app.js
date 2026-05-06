@@ -889,6 +889,16 @@
             sysWs.style.color = "var(--ok)";
             ws.send(JSON.stringify({ type: "get_signals" }));
             ws.send(JSON.stringify({ type: "get_plugins" }));
+            // Phase 11 fix — re-trigger the active tab's data fetch
+            // now that the WS is open. Without this, a tab that was
+            // opened during WS reconnect (or before the initial
+            // connect completed) sits with stale/empty state until
+            // the user manually clicks Refresh. Dashboard is the
+            // most visible victim — Mike's report.
+            if (state.activeTab === "dashboard") loadDashboard();
+            else if (state.activeTab === "scheduler") loadScheduler();
+            else if (state.activeTab === "characters") loadCharacters();
+            else if (state.activeTab === "rp") loadRoleplay();
         };
 
         ws.onclose = () => {
@@ -2223,7 +2233,10 @@
                         <span class="dot ${p.enabled ? "ok" : "warn"}"></span>
                         ${p.enabled ? "enabled" : p.loaded ? "loaded" : "off"}
                     </span>
-                    <div style="display:flex;gap:6px;">
+                    <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                        ${p.name === "skill_writer" ? `
+                            <button class="btn plugin-import-btn" data-action="skill-import" title="Agent-Skill (.zip) importieren">📥 Import Skill</button>
+                        ` : ""}
                         <button class="btn plugin-config-btn" data-action="config">Config</button>
                         <button class="btn" data-action="toggle">
                             ${p.enabled ? "Disable" : "Enable"}
@@ -2266,7 +2279,72 @@
             card.querySelector('[data-action="config"]').addEventListener("click", () => {
                 openPluginConfig(p.name);
             });
+            // Phase 11: skill_writer hat einen Import-Button für
+            // agentskills.io-konforme .zip-Pakete. Click → File-Dialog
+            // → POST multipart an die neue REST-Route.
+            const importBtn = card.querySelector('[data-action="skill-import"]');
+            if (importBtn) {
+                importBtn.addEventListener("click", () => triggerSkillImport());
+            }
             pluginsGrid.appendChild(card);
+        }
+    }
+
+    // Phase 11 — Agent Skill Importer (.zip from agentskills.io
+    // ecosystem). Spawns a hidden <input type="file"> on demand,
+    // POSTs multipart to the gateway, surfaces the Toast.
+    async function triggerSkillImport() {
+        const input = document.createElement("input");
+        input.type = "file";
+        input.accept = ".zip,application/zip";
+        input.style.display = "none";
+        input.addEventListener("change", async () => {
+            const file = input.files && input.files[0];
+            if (!file) return;
+            await uploadSkillZip(file);
+        });
+        document.body.appendChild(input);
+        input.click();
+        // Cleanup once a selection (or cancel) is registered.
+        setTimeout(() => input.remove(), 1000);
+    }
+
+    async function uploadSkillZip(file, { overwrite = false } = {}) {
+        const fd = new FormData();
+        fd.append("file", file);
+        if (overwrite) fd.append("overwrite", "true");
+        try {
+            const resp = await fetch(
+                "/api/v1/plugins/skill_writer/skills/import",
+                { method: "POST", body: fd },
+            );
+            const body = await resp.json().catch(() => null);
+            if (resp.status === 409) {
+                // Conflict — ask the user before overwriting.
+                if (!overwrite && confirm(
+                    `Ein Skill mit dem Namen aus '${file.name}' existiert bereits. ` +
+                    "Überschreiben?"
+                )) {
+                    await uploadSkillZip(file, { overwrite: true });
+                }
+                return;
+            }
+            if (!resp.ok) {
+                const detail = body && body.detail
+                    ? body.detail
+                    : `HTTP ${resp.status}`;
+                throw new Error(detail);
+            }
+            const skillName = body && body.skill && body.skill.name;
+            const wasOverwrite = body && body.overwrote_existing;
+            toast(
+                wasOverwrite ? "Skill aktualisiert" : "Skill importiert",
+                skillName || file.name,
+            );
+            // Refresh plugin tab so the skill_writer card reflects new state.
+            if (state.activeTab === "plugins") loadPlugins();
+        } catch (err) {
+            toast("Skill-Import fehlgeschlagen", String(err && err.message || err));
         }
     }
 
@@ -3573,8 +3651,54 @@
     const dashboardRefreshBtn = $("dashboard-refresh-btn");
 
     function loadDashboard() {
+        // Render synchronously with whatever cached state we have.
+        // Phase 11 fix — Mike reported: after a Phase-9.12 frontend
+        // restart, opening the Dashboard tab showed only the header
+        // (Edit Layout / Refresh) but no widget cards. Cause: the
+        // pre-fix code only rendered when a WS response arrived; if
+        // the WS was still connecting (or the dashboard plugin was
+        // disabled, or a response was lost), `renderDashboardGrid`
+        // never fired and the grid `<div>` stayed empty. Now we
+        // render the default 8-widget layout immediately so users
+        // always see something, and the WS responses refresh in
+        // place when they land.
+        renderDashboardGrid(state.dashboardLayout, state.dashboardWidgets);
         wsSend({ type: "get_dashboard_layout" });
         wsSend({ type: "get_dashboard_widgets" });
+    }
+
+    // Tolerate two layout-item shapes:
+    //   * Frontend-native (what we save):  {id, col, row}
+    //         where col/row are CSS-grid spans like "1 / 3".
+    //   * Legacy YAML shape (default in dashboard plugin.yaml):
+    //         {widget, x, y, w, h}  with integer grid coords (0-based).
+    // The second one shipped before Phase 11; users with no saved
+    // layout in their DB get hit by it after a wipe. We translate
+    // here so the renderer can stay simple downstream — and so
+    // imports of older yaml-shaped layouts keep working.
+    function _normaliseLayoutItem(raw) {
+        if (!raw || typeof raw !== "object") return null;
+        // Native shape: pass through if it has an id.
+        if (typeof raw.id === "string" && raw.id) {
+            return {
+                id: raw.id,
+                col: raw.col || undefined,
+                row: raw.row || undefined,
+            };
+        }
+        // Legacy shape: translate widget→id and x,y,w,h → col/row spans.
+        const widgetId = typeof raw.widget === "string" ? raw.widget : null;
+        if (!widgetId) return null;
+        const x = Number.isFinite(raw.x) ? raw.x : 0;
+        const y = Number.isFinite(raw.y) ? raw.y : 0;
+        const w = Number.isFinite(raw.w) && raw.w > 0 ? raw.w : 1;
+        const h = Number.isFinite(raw.h) && raw.h > 0 ? raw.h : 1;
+        // CSS Grid is 1-based, the YAML is 0-based — add 1.
+        return {
+            id: widgetId,
+            col: `${x + 1} / ${x + 1 + w}`,
+            row: `${y + 1} / ${y + 1 + h}`,
+        };
     }
 
     function renderDashboardGrid(layout, widgetData) {
@@ -3587,7 +3711,7 @@
         dashboardGrid.innerHTML = "";
 
         // Default layout if none provided
-        const items = (layout && layout.length > 0) ? layout : [
+        const DEFAULT_ITEMS = [
             { id: "clock",         col: "1 / 2",   row: "1 / 2"   },
             { id: "weather",       col: "2 / 3",   row: "1 / 2"   },
             { id: "system_status", col: "3 / 5",   row: "1 / 2"   },
@@ -3597,8 +3721,14 @@
             { id: "notes",         col: "1 / 3",   row: "3 / 4"   },
             { id: "search",        col: "3 / 5",   row: "3 / 4"   },
         ];
+        const items = (layout && layout.length > 0)
+            ? layout.map(_normaliseLayoutItem).filter(Boolean)
+            : DEFAULT_ITEMS;
+        // After normalisation: if every entry was malformed → fall back
+        // to the embedded defaults so the user always sees SOMETHING.
+        const renderItems = items.length > 0 ? items : DEFAULT_ITEMS;
 
-        for (const item of items) {
+        for (const item of renderItems) {
             const card = document.createElement("div");
             card.className = "dashboard-widget";
             card.dataset.widgetId = item.id;

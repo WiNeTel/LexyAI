@@ -771,6 +771,149 @@ def build_app(lexy: "LexyApp") -> FastAPI:
             raise HTTPException(404, "entry not found")
         return {"id": entry_id}
 
+    # ─── Skill packager (Phase 11 — agentskills.io) ────────────────
+    #
+    # Two endpoints flank the existing skill_writer WS handlers:
+    # * POST /api/v1/plugins/skill_writer/skills/import (multipart .zip)
+    # * GET  /api/v1/plugins/skill_writer/skills/{name}/export
+    #
+    # Both delegate to plugins.skill_writer.skill_packager which has
+    # the path-traversal/zip-bomb/spec-validation guards. The plugin
+    # itself stays in the loop so registry + WS broadcast stay in
+    # sync — REST is just a different transport.
+
+    def _skill_writer_plugin(app: Any) -> Any:
+        if app.plugin_loader is None:
+            raise HTTPException(503, "Plugin loader not initialised")
+        plugin = app.plugin_loader.get_plugin("skill_writer")
+        if plugin is None:
+            raise HTTPException(404, "skill_writer plugin not loaded")
+        if (
+            getattr(plugin, "_validator", None) is None
+            or getattr(plugin, "_registry", None) is None
+        ):
+            raise HTTPException(503, "skill_writer not ready")
+        return plugin
+
+    @api.post("/api/v1/plugins/skill_writer/skills/import")
+    async def import_skill(
+        request: Request,
+        file: UploadFile = File(...),
+        overwrite: bool = Form(False),
+    ) -> dict[str, Any]:
+        """Import an agentskills.io-shaped skill from a .zip upload.
+
+        Body (multipart):
+        * ``file`` — the ZIP archive (top-level folder is the skill).
+        * ``overwrite`` — set ``true`` to replace an existing skill of
+          the same name. Default ``false`` returns 409 on conflict.
+
+        Returns ``{ok, skill: SkillCardPublic, overwrote_existing}``.
+        """
+        from plugins.skill_writer.skill_packager import (
+            SkillImportConflict,
+            SkillPackageError,
+            import_skill_zip,
+        )
+
+        app = _app(request)
+        plugin = _skill_writer_plugin(app)
+        data = await file.read()
+        if not data:
+            raise HTTPException(400, "empty upload")
+
+        try:
+            result = await import_skill_zip(
+                data,
+                dest_root=plugin._skills_path,
+                validator=plugin._validator,
+                overwrite=overwrite,
+            )
+        except SkillImportConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except SkillPackageError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+        # Sync the registry: insert (or update_metadata if overwriting)
+        # so the imported skill shows up in list_skills immediately.
+        existing = await plugin._registry.get(result.card.name)
+        if existing is None:
+            await plugin._registry.register(
+                name=result.card.name,
+                description=result.card.description,
+                file_path=str(result.card.folder),
+                source="imported",
+                license=result.card.frontmatter.license,
+                compatibility=result.card.frontmatter.compatibility,
+                metadata=result.card.frontmatter.metadata,
+                allowed_tools=result.card.frontmatter.allowed_tools,
+                body_md=result.card.frontmatter.body,
+            )
+        else:
+            await plugin._registry.update_metadata(
+                result.card.name,
+                description=result.card.description,
+                license=result.card.frontmatter.license,
+                compatibility=result.card.frontmatter.compatibility,
+                metadata=result.card.frontmatter.metadata,
+                allowed_tools=result.card.frontmatter.allowed_tools,
+                body_md=result.card.frontmatter.body,
+            )
+
+        # Broadcast so any open Skills tab refreshes.
+        try:
+            await app.ws_server.broadcast({
+                "type": "skill_imported",
+                "name": result.card.name,
+                "overwrote_existing": result.overwrote_existing,
+            })
+        except Exception:  # noqa: BLE001
+            pass
+
+        return {
+            "ok": True,
+            "overwrote_existing": result.overwrote_existing,
+            "skill": result.card.to_public(),
+        }
+
+    @api.get("/api/v1/plugins/skill_writer/skills/{name}/export")
+    async def export_skill(
+        name: str, request: Request,
+    ) -> Response:
+        """Pack the named skill into a downloadable ZIP."""
+        from plugins.skill_writer.skill_packager import (
+            SkillPackageError,
+            export_skill_zip,
+        )
+
+        app = _app(request)
+        plugin = _skill_writer_plugin(app)
+        entry = await plugin._registry.get(name)
+        if entry is None:
+            raise HTTPException(404, f"skill not found: {name}")
+
+        from pathlib import Path as _Path
+        folder = _Path(entry.file_path)
+        if not folder.is_dir():
+            raise HTTPException(
+                404, f"skill folder missing on disk: {folder}"
+            )
+
+        try:
+            zip_bytes = await export_skill_zip(folder)
+        except SkillPackageError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+        return Response(
+            content=zip_bytes,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="{name}.zip"'
+                ),
+            },
+        )
+
     # ─── Chat-attachment uploads ──────────────────────────────────────
     #
     # Four endpoints, one per kind. They all return a dict the frontend

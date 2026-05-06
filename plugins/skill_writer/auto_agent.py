@@ -293,12 +293,37 @@ class AgentManager:
         agent_id = uuid.uuid4().hex[:12]
 
         if not system_prompt:
+            # Phase 11 — wenn der Agent ``write_skill`` aufruft,
+            # produziert er jetzt einen agentskills.io-konformen
+            # Skill-Folder. Wir injizieren die Spec-Eckdaten ins
+            # System-Prompt damit der LLM die Felder versteht und
+            # nicht versehentlich legacy-style mit Pseudo-Header
+            # arbeitet (zumal der Schema-Hint im Tool-Descriptor
+            # nur minimal sein darf — "show, don't tell").
             system_prompt = (
                 f"Du bist ein autonomer Sub-Agent von Lexy AI. "
                 f"Dein Name ist '{name}'.\n"
                 f"Deine Aufgabe: {task}\n\n"
                 "Arbeite Schritt fuer Schritt. Nutze die verfuegbaren Tools.\n"
-                "Wenn du fertig bist, fasse dein Ergebnis zusammen."
+                "Wenn du fertig bist, fasse dein Ergebnis zusammen.\n\n"
+                "## Skills schreiben (agentskills.io Format)\n\n"
+                "Wenn du das ``write_skill``-Tool nutzt, gibst du:\n"
+                "- ``name``: kebab-case (z.B. ``pdf-extract``), 1-64 Zeichen,\n"
+                "  nur ``[a-z0-9-]``, keine doppelten Hyphens\n"
+                "- ``description``: 1-1024 Zeichen, beschreibt WAS der Skill\n"
+                "  tut UND WANN man ihn nutzt (das liest der Agent beim Boot)\n"
+                "- ``code``: Python-Body fuer ``execute(api, **kwargs)`` —\n"
+                "  KEIN Header, KEINE Docstring-Felder, KEIN ``async def``-\n"
+                "  Wrapper. Die Plugin-Pipeline baut das alles drumherum.\n"
+                "- ``body_md`` (optional): Markdown-Anleitung fuer SKILL.md\n"
+                "  — Step-by-step Instructions, Beispiele, Edge Cases.\n"
+                "  Empfohlen: < 500 Zeilen.\n"
+                "- ``license``, ``compatibility``, ``tags``: optional.\n\n"
+                "Verbotene Imports: ``os``, ``subprocess``, ``sys``, "
+                "``socket``, ``threading``, ``pickle`` — der Validator\n"
+                "lehnt das automatisch ab. Erlaubt: ``json``, ``re``,\n"
+                "``datetime``, ``math``, ``collections``, ``pathlib``,\n"
+                "``time``, ``hashlib``, ``base64``, ``typing``.\n"
             )
 
         agent = AutoAgent(

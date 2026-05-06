@@ -6,14 +6,20 @@ requires: []
 optional: [weather, autonomous_thinking, scheduler]
 capabilities: [tool, ws_handler, event]
 config_defaults:
+  # Default dashboard layout. Schema matches what the frontend's
+  # ``renderDashboardGrid`` expects: ``{id, col, row}`` where col/row
+  # are CSS-grid span strings ("start / end"). The frontend normaliser
+  # translates legacy ``{widget, x, y, w, h}`` shapes too — kept for
+  # compat, but new configs should use the native form below.
   default_layout:
-    - {widget: "clock", x: 0, y: 0, w: 1, h: 1}
-    - {widget: "weather", x: 1, y: 0, w: 1, h: 1}
-    - {widget: "memory_stats", x: 2, y: 0, w: 1, h: 1}
-    - {widget: "system_status", x: 0, y: 1, w: 2, h: 1}
-    - {widget: "thoughts", x: 2, y: 1, w: 1, h: 2}
-    - {widget: "sessions", x: 3, y: 0, w: 1, h: 1}
-    - {widget: "notes", x: 3, y: 1, w: 1, h: 1}
+    - {id: "clock",         col: "1 / 2", row: "1 / 2"}
+    - {id: "weather",       col: "2 / 3", row: "1 / 2"}
+    - {id: "system_status", col: "3 / 5", row: "1 / 2"}
+    - {id: "memory_stats",  col: "1 / 3", row: "2 / 3"}
+    - {id: "sessions",      col: "3 / 4", row: "2 / 3"}
+    - {id: "thoughts",      col: "4 / 5", row: "2 / 3"}
+    - {id: "notes",         col: "1 / 3", row: "3 / 4"}
+    - {id: "search",        col: "3 / 5", row: "3 / 4"}
   refresh_interval_seconds: 30
   # Per-widget refresh intervals (seconds). Overrides the value each widget
   # declares in code. Use 0 to make a widget push-only (no periodic poll).
