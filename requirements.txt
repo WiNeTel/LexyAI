@@ -25,6 +25,13 @@ numpy>=1.26.0
 pydub>=0.25.1
 soundfile>=0.12.1
 
+# === Uploads / Document parsing ===
+# pypdf is the lightweight (no Cython) PDF text extractor used by the
+# uploads pipeline. python-docx / unstructured are deliberately NOT
+# included — they pull in heavy native deps and we don't need them yet.
+pypdf>=4.0.0
+pillow>=10.0.0  # image dimensions + safe re-encode for thumbs / vision
+
 # === Plugins ===
 watchdog>=4.0.0
 apscheduler>=3.10.0

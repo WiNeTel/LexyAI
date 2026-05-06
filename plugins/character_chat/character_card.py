@@ -68,6 +68,11 @@ class CharacterCard(BaseModel):
     # other_character_id → free-form label ("mother", "sister", "friend")
     relationships: dict[str, str] = Field(default_factory=dict)
     tags: list[str] = Field(default_factory=list)
+    # Live character state — updated by the LLM at the end of each turn via
+    # a ``<state>...</state>`` block. Recognised keys: location, mood,
+    # last_action. Other keys are dropped on parse. Persisted as JSON in the
+    # ``state`` column. Empty dict = "no state known yet".
+    state: dict[str, str] = Field(default_factory=dict)
     # Session ids the character is currently an active speaker in.
     active_sessions: list[str] = Field(default_factory=list)
     # Optional scheduler pattern string. The scheduler plugin interprets this
@@ -159,16 +164,38 @@ class CharacterCard(BaseModel):
             if lines:
                 parts.append("\n## Andere Anwesende\n" + "\n".join(lines))
 
+        state_block = _format_state_block(self.state)
+        if state_block:
+            parts.append(f"\n## Dein Zustand\n{state_block}")
+
         if self.example_dialog.strip():
             parts.append(f"\n## Beispiel-Dialog\n{self.example_dialog.strip()}")
 
         parts.append(
-            "\n## Regeln\n"
-            "- Antworte AUSSCHLIESSLICH in deiner eigenen Stimme.\n"
-            "- Kein Meta-Kommentar, keine Regie-Anweisungen in eckigen Klammern "
-            "(außer kurze *Aktionen* wenn es die Szene trägt).\n"
-            "- Halte dich kurz (1-4 Sätze), außer die Szene verlangt mehr.\n"
-            "- Sprich andere Anwesende gegebenenfalls namentlich an."
+            "\n## Regeln (RP-Disziplin)\n"
+            "- **Bleib in deinem Charakter.** Du sprichst, denkst und "
+            "handelst ausschliesslich als die Person, die oben beschrieben "
+            "ist. Keine Meta-Kommentare, keine Regie-Anweisungen in eckigen "
+            "Klammern.\n"
+            "- **Sprich NIE für den User oder andere Charaktere.** Du "
+            "beschreibst nur, was DEIN Charakter sagt, fühlt und tut. Lege "
+            "niemandem Worte in den Mund.\n"
+            "- **Treibe die Story nicht eigenmächtig voran.** Der User "
+            "führt die Handlung. Du reagierst auf das, was passiert ist — "
+            "du erfindest keine neuen Plot-Punkte, keine plötzlichen "
+            "Ereignisse, keine Zeitsprünge.\n"
+            "- **Gefühle und Handlungen detailreich in *Sternchen*.** "
+            "Inneres Erleben, Körpersprache, kleine Handlungen — "
+            "ausführlich, gerne mehrsätzig wenn die Szene es trägt. "
+            "Nicht nur '*nickt*', sondern z.B. '*lehnt sich langsam "
+            "zurück, kneift die Augen zusammen und atmet hörbar aus*'.\n"
+            "- **Länge**: So viel wie die Szene verlangt — von knappem "
+            "Satz bis Absätzen. Lieber lebendig + detailliert als "
+            "künstlich kurz.\n"
+            "- Du DARFST am Ende deiner Antwort optional einen "
+            "<state>location=...; mood=...; last_action=...</state> "
+            "Block setzen, wenn sich dein Zustand geändert hat. Nur diese "
+            "drei Keys. Wird nicht angezeigt, dient als dein Gedächtnis."
         )
 
         if extra_instructions.strip():
@@ -194,6 +221,7 @@ class CharacterCard(BaseModel):
             "relationships": json.dumps(self.relationships),
             "tags": json.dumps(self.tags),
             "active_sessions": json.dumps(self.active_sessions),
+            "state": json.dumps(self.state),
             "proactive_pulse_pattern": self.proactive_pulse_pattern,
             "proactive_pulse_prompt": self.proactive_pulse_prompt,
             "archived": 1 if self.archived else 0,
@@ -218,6 +246,7 @@ class CharacterCard(BaseModel):
             relationships=_json_loads_dict(row.get("relationships")),
             tags=_json_loads_list(row.get("tags")),
             active_sessions=_json_loads_list(row.get("active_sessions")),
+            state=_json_loads_dict(row.get("state")),
             proactive_pulse_pattern=row.get("proactive_pulse_pattern", "") or "",
             proactive_pulse_prompt=row.get("proactive_pulse_prompt", "") or "",
             archived=bool(row.get("archived", 0)),
@@ -323,7 +352,177 @@ def parse_silly_tavern_file(path: Path) -> CharacterCard:
     return parse_silly_tavern_card(payload)
 
 
+# ─── PNG card import (Silly-Tavern "chara card") ─────────────────────────────
+
+
+def parse_silly_tavern_png(png_bytes: bytes) -> tuple[CharacterCard, bytes]:
+    """Extract a CharacterCard + the embedded avatar PNG from a card.
+
+    Silly-Tavern stores character JSON inside the PNG's tEXt chunk under
+    keyword ``chara``, base64-encoded. The standard supports both v1
+    (flat fields) and v2 (``{spec: "chara_card_v2", data: {...}}``) —
+    :func:`parse_silly_tavern_card` handles both.
+
+    Returns
+    -------
+    (card, png_bytes)
+        ``card`` carries the parsed character; ``png_bytes`` is the raw
+        PNG re-emitted so the caller can persist it as the avatar
+        (Pillow normalises whatever subset of chunks it reads).
+
+    Raises
+    ------
+    CharacterCardError
+        Any malformed input — not a PNG, no ``chara`` chunk, base64 /
+        JSON decode error, missing required fields. The exception
+        message names the failing step so the UI can surface it.
+    """
+    if not png_bytes:
+        raise CharacterCardError("empty PNG payload")
+    try:
+        from PIL import Image
+    except ImportError as exc:  # pragma: no cover — pillow is in requirements.txt
+        raise CharacterCardError(
+            f"Pillow not installed; cannot parse PNG cards ({exc})"
+        ) from exc
+
+    import base64
+    import io
+
+    try:
+        img = Image.open(io.BytesIO(png_bytes))
+        img.load()  # forces parsing of all chunks (including tEXt)
+    except Exception as exc:  # noqa: BLE001 — Pillow raises a zoo of exceptions
+        raise CharacterCardError(f"not a valid PNG: {exc}") from exc
+
+    if (img.format or "").upper() != "PNG":
+        raise CharacterCardError(
+            f"expected PNG, got {img.format!r}"
+        )
+
+    # Pillow exposes tEXt / iTXt chunk values via ``image.info``. Silly-
+    # Tavern (the original) writes ``chara`` (lowercase). Some forks
+    # write ``ccv3`` (chara card v3) — accept either.
+    info = img.info or {}
+    raw = info.get("chara") or info.get("ccv3") or ""
+    if not raw:
+        raise CharacterCardError(
+            "PNG has no Silly-Tavern character data "
+            "(no 'chara' or 'ccv3' tEXt chunk)"
+        )
+    if isinstance(raw, bytes):
+        try:
+            raw = raw.decode("utf-8", errors="replace")
+        except Exception as exc:  # noqa: BLE001
+            raise CharacterCardError(f"chara chunk not utf-8: {exc}") from exc
+
+    try:
+        decoded = base64.b64decode(raw, validate=False)
+    except Exception as exc:  # noqa: BLE001
+        raise CharacterCardError(
+            f"chara chunk is not valid base64: {exc}"
+        ) from exc
+    try:
+        text = decoded.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise CharacterCardError(
+            f"chara chunk decoded but not utf-8: {exc}"
+        ) from exc
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise CharacterCardError(
+            f"chara chunk is not valid JSON: {exc}"
+        ) from exc
+
+    card = parse_silly_tavern_card(payload)
+    return card, png_bytes
+
+
+def parse_silly_tavern_bytes(
+    data: bytes,
+    *,
+    filename: str = "",
+    content_type: str = "",
+) -> tuple[CharacterCard, bytes | None]:
+    """Auto-detect JSON vs PNG and dispatch to the right parser.
+
+    Returns ``(card, png_bytes_or_None)`` — when the input was a PNG,
+    the second element is the raw PNG so callers can persist it as the
+    avatar.
+    """
+    if not data:
+        raise CharacterCardError("empty payload")
+    # PNG magic — the first 8 bytes are ``\x89PNG\r\n\x1a\n``.
+    is_png = data[:8] == b"\x89PNG\r\n\x1a\n"
+    name_lower = (filename or "").lower()
+    mime_lower = (content_type or "").lower()
+    if is_png or name_lower.endswith(".png") or "png" in mime_lower:
+        return parse_silly_tavern_png(data)
+    # Fall through to JSON.
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise CharacterCardError(
+            f"payload is not PNG and not valid UTF-8 JSON: {exc}"
+        ) from exc
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise CharacterCardError(
+            f"payload is not PNG and not valid JSON: {exc}"
+        ) from exc
+    return parse_silly_tavern_card(payload), None
+
+
 # ─── helpers ─────────────────────────────────────────────────────────────────
+
+
+def _format_state_block(state: dict[str, str]) -> str:
+    """Render the live character state for system-prompt injection.
+
+    Renders anchor keys with localised labels first (location, mood,
+    last_action, clothing, posture, condition), then any free-form keys
+    the LLM has chosen to track (snake_case → "Title Case" label).
+
+    Empty/whitespace values are dropped so a half-set state ("location only")
+    renders cleanly. Returns an empty string when nothing is known yet so
+    the caller can decide whether to include the section header.
+    """
+    if not state:
+        return ""
+    anchor_labels = {
+        "location": "Ort",
+        "mood": "Stimmung",
+        "last_action": "Letzte Aktion",
+        "clothing": "Kleidung",
+        "posture": "Haltung",
+        "condition": "Zustand",
+    }
+    bits: list[str] = []
+    rendered: set[str] = set()
+    # 1) Anchor keys in fixed order so the LLM always finds them in the
+    #    same place across turns.
+    for key in (
+        "location", "mood", "last_action", "clothing", "posture", "condition",
+    ):
+        value = (state.get(key) or "").strip()
+        if not value:
+            continue
+        bits.append(f"**{anchor_labels[key]}:** {value}")
+        rendered.add(key)
+    # 2) Free-form extras the LLM has chosen to track. Sorted by key so
+    #    the order is stable across turns even when dict iteration isn't.
+    for key in sorted(state.keys()):
+        if key in rendered:
+            continue
+        value = (state.get(key) or "").strip()
+        if not value:
+            continue
+        # snake_case → "Title Case" so the prompt reads naturally.
+        label = key.replace("_", " ").title()
+        bits.append(f"**{label}:** {value}")
+    return ", ".join(bits)
 
 
 def _json_loads_dict(raw: Any) -> dict[str, str]:

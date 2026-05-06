@@ -166,12 +166,18 @@ class LexyLLM:
 
     @staticmethod
     def _inject_thinking_token(
-        messages: list[dict[str, str]],
-    ) -> list[dict[str, str]]:
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
         """
         Ensure the system prompt starts with ``<|think|>`` so Gemma 4
         switches into reasoning mode. If the first message isn't a system
         message we prepend a new one carrying only the token.
+
+        Multimodal note: a ``content`` field may be a list of content
+        blocks (``[{"type":"text",...}, {"type":"image_url",...}]``)
+        instead of a plain string. We only ever inject the think-token
+        into the *system* message, which by convention is plain text —
+        so the list-content path doesn't need special handling here.
         """
         if not messages:
             return [{"role": "system", "content": _GEMMA_THINK_ENABLE}]
@@ -179,6 +185,13 @@ class LexyLLM:
         first = messages[0]
         if first.get("role") == "system":
             content = first.get("content", "") or ""
+            # Defensive: if some caller put a list here, fall back to
+            # prepending a fresh system message instead of mangling it.
+            if isinstance(content, list):
+                return [
+                    {"role": "system", "content": _GEMMA_THINK_ENABLE},
+                    *messages,
+                ]
             if _GEMMA_THINK_ENABLE in content:
                 return messages  # already enabled
             patched = dict(first)
@@ -193,7 +206,7 @@ class LexyLLM:
     def _build_payload(
         self,
         brain_cfg: BrainConfig,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         stream: bool,
         **overrides: Any,
     ) -> dict[str, Any]:
@@ -225,7 +238,7 @@ class LexyLLM:
 
     async def chat(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         brain: str = "auto",
         **overrides: Any,
     ) -> str:
@@ -242,7 +255,7 @@ class LexyLLM:
 
     async def chat_stream(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         brain: str = "auto",
         **overrides: Any,
     ) -> AsyncIterator[str]:
@@ -257,7 +270,7 @@ class LexyLLM:
 
     async def chat_stream_structured(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         brain: str = "auto",
         **overrides: Any,
     ) -> AsyncIterator[tuple[str, str]]:

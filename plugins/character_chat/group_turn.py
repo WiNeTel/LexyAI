@@ -37,8 +37,14 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
-from .character_card import CharacterCard, _AGE_STAGE_GUIDANCE
+from .character_card import CharacterCard, _AGE_STAGE_GUIDANCE, _format_state_block
 from .context_budget import ContextBudget, Priority, PromptSection
+from .lorebook_engine import (
+    ActivationResult,
+    SECTION_NAME_PER_POSITION,
+    render_position_block,
+)
+from .mention_parser import parse_nl_mentions
 
 
 log = logging.getLogger(__name__)
@@ -81,6 +87,19 @@ class GroupTurnRequest:
     pulse_text: str = ""
     # Optional scene description that gets threaded into each system prompt.
     scene: str = ""
+    # Extra forced speakers appended AFTER any user @-/NL-mentions. The plugin
+    # populates this for pulse-mention propagation: when a pulsing character
+    # addresses someone (e.g. "Drell, hast du das gemacht?"), Drell ends up in
+    # this list so his answer happens in the same round. Empty list = no extras.
+    extra_forced: list[str] = field(default_factory=list)
+    # Per-speaker lore activations, keyed by character_id. The plugin
+    # populates this BEFORE calling ``run_round`` because:
+    #   * the engine needs the DB-resident lore store (plugin-owned)
+    #   * activations differ per speaker (character-scoped books only
+    #     fire for the matching character_id; the haystack uses each
+    #     speaker's persona + state).
+    # An empty dict (or missing key) means "no lore for this speaker".
+    lore_by_speaker: dict[str, "ActivationResult"] = field(default_factory=dict)
 
 
 @dataclass
@@ -131,6 +150,9 @@ class GroupTurnOrchestrator:
         recall_limit: int = 3,
         context_size_fn: Callable[[], int] | None = None,
         safety_margin_tokens: int = 256,
+        speaker_selection_brain: str | None = None,
+        global_style_prompt: str = "",
+        always_call_orchestrator: bool = False,
     ) -> None:
         self._llm_chat = llm_chat
         self._brain = brain
@@ -143,6 +165,23 @@ class GroupTurnOrchestrator:
                 f"got {turn_selection!r}"
             )
         self._turn_selection = turn_selection
+        # Brain to use for the speaker-selection classification call. Defaults
+        # to ``brain`` for backward compatibility, but the plugin pins it to
+        # E4B so the cheap deciding-call doesn't tie up the big A4B brain.
+        self._speaker_brain = speaker_selection_brain or brain
+        # Optional global RP style prompt — appended as a MUST-priority
+        # system section into every character turn so all chars write
+        # in a uniform style on top of their individual persona.
+        self._global_style_prompt = (global_style_prompt or "").strip()
+        # When True, the orchestrator brain (e4b by default) is always
+        # consulted before a round, even when @-mentions or NL-mentions
+        # already covered every speaker. The orchestrator gets the
+        # mention-derived order as a "preferred" hint and can confirm
+        # or refine it — useful for catching cases where the user
+        # named a char that shouldn't actually respond (different room,
+        # asleep, etc.). Default off because it costs one extra LLM
+        # call per round.
+        self._always_call_orchestrator = bool(always_call_orchestrator)
         self._recall_fn = recall_fn
         self._recall_limit = max(0, int(recall_limit))
         # Context-size callback. Called *per turn* so a config reload or a
@@ -173,11 +212,38 @@ class GroupTurnOrchestrator:
                 pulse_text=req.pulse_text,
             )
 
-        forced = _parse_at_mentions(req.user_message, req.characters)
+        # Speaker selection priority:
+        #   1. @-mentions (explicit user intent)
+        #   2. natural-language name mentions (e.g. "Mara, schau mal...")
+        #   3. extra_forced (pulse-mention propagation, set by the plugin)
+        #   4. autonomous LLM order or round-robin fallback
+        # Each layer only contributes when the previous one yielded nothing
+        # OR adds non-overlapping ids — see _pick_speakers for the merge.
+        at_mentions = _parse_at_mentions(req.user_message, req.characters)
+        nl_mentions: list[str] = []
+        if not at_mentions and req.user_message.strip():
+            nl_mentions = parse_nl_mentions(req.user_message, req.characters)
+        forced = at_mentions or nl_mentions
+        # extra_forced is appended after the user-driven order. Filter out
+        # the pulse-from character (already spoke via pulse_text) and any
+        # ids already in `forced` so we don't double-schedule a speaker.
+        extras = [
+            cid
+            for cid in (req.extra_forced or [])
+            if cid != req.pulse_from_id and cid not in forced
+        ]
         speaker_order = await self._pick_speakers(
-            req=req, eligible=eligible, forced=forced
+            req=req, eligible=eligible, forced=forced + extras
         )
         speaker_order = speaker_order[: self._max_speakers]
+        if at_mentions or nl_mentions or extras:
+            log.info(
+                "character_chat.mentions_parsed at=%s nl=%s extras=%s order=%s",
+                at_mentions,
+                nl_mentions,
+                extras,
+                speaker_order,
+            )
 
         by_id = {c.id: c for c in req.characters}
         turns: list[CharacterTurn] = []
@@ -214,10 +280,20 @@ class GroupTurnOrchestrator:
         """Decide who speaks in this round and in what order.
 
         Priority:
-            1. If the user @-mentioned a character, that character goes first.
-            2. If ``turn_selection == "round_robin"``, remaining characters
-               follow in alphabetical order by name.
-            3. Otherwise, ask the LLM for an ordered list.
+            1. If the user @-mentioned or NL-mentioned a character, that
+               character goes first (the order from ``forced`` is preserved).
+            2. If ``turn_selection == "round_robin"`` OR only one char
+               eligible, remaining characters follow alphabetically.
+            3. Otherwise, ask the LLM (``speaker_selection_brain`` —
+               e4b by default) for an ordered list of the *remaining*
+               candidates.
+            4. When ``always_call_orchestrator=True``, the LLM is also
+               consulted to confirm/refine a fully-mention-derived order.
+
+        Every path emits one ``character_chat.speakers_picked`` log line
+        with ``method=mention|round_robin|llm|llm_refined`` so the user
+        can see in the log exactly which path fired (and whether the
+        e4b brain was consulted).
         """
         # Deduplicate but preserve insertion order.
         seen: set[str] = set()
@@ -229,30 +305,97 @@ class GroupTurnOrchestrator:
             seen.add(mention)
             order.append(mention)
 
+        method = "mention" if order else ""
+
         if self._turn_selection == "round_robin" or len(eligible) == 1:
             rest = sorted(
                 (c for c in eligible if c.id not in seen),
                 key=lambda c: c.name.lower(),
             )
             order.extend(c.id for c in rest)
+            method = method or "round_robin"
+            self._log_speakers_picked(
+                method=method, order=order, brain_called=False, req=req,
+            )
             return order
 
         # autonomous: LLM picks order over the remaining candidates.
         remaining = [c for c in eligible if c.id not in seen]
+
+        # always_call_orchestrator path: LLM gets *all* eligibles and the
+        # mention-derived order as a preferred hint. We use this to
+        # catch cases where the user named a char that shouldn't
+        # actually respond (different room, asleep, etc.).
+        if self._always_call_orchestrator and (order or remaining):
+            llm_order = await self._ask_llm_for_order(
+                req=req,
+                candidates=eligible,
+                preferred_order=list(order),
+            )
+            if llm_order:
+                self._log_speakers_picked(
+                    method="llm_refined", order=llm_order,
+                    brain_called=True, req=req,
+                )
+                return llm_order
+            # Fall through if LLM returned nothing usable.
+
         if not remaining:
+            self._log_speakers_picked(
+                method=method or "mention", order=order,
+                brain_called=False, req=req,
+            )
             return order
+
         llm_order = await self._ask_llm_for_order(req=req, candidates=remaining)
         order.extend(llm_order)
         # Safety net: if LLM picked nothing, fall back to round-robin.
         if not llm_order and not order:
             order = [c.id for c in remaining]
+            self._log_speakers_picked(
+                method="llm_failed_round_robin", order=order,
+                brain_called=True, req=req,
+            )
+            return order
+
+        self._log_speakers_picked(
+            method=method or "llm" if llm_order else "mention",
+            order=order, brain_called=True, req=req,
+        )
         return order
+
+    def _log_speakers_picked(
+        self,
+        *,
+        method: str,
+        order: list[str],
+        brain_called: bool,
+        req: GroupTurnRequest,
+    ) -> None:
+        """Single-line summary of how this round's speakers were chosen.
+
+        Mike's audit: "der LLM Server wird aber nie angesprochen" — this
+        log makes it obvious whether e4b was consulted on a given round.
+        Search the log for ``character_chat.speakers_picked`` to see the
+        path that fired (mention / round_robin / llm / llm_refined /
+        llm_failed_round_robin).
+        """
+        log.info(
+            "character_chat.speakers_picked method=%s brain=%s "
+            "brain_called=%s order=%s session=%s",
+            method,
+            self._speaker_brain if brain_called else "(skipped)",
+            brain_called,
+            order,
+            req.session_id,
+        )
 
     async def _ask_llm_for_order(
         self,
         *,
         req: GroupTurnRequest,
         candidates: list[CharacterCard],
+        preferred_order: list[str] | None = None,
     ) -> list[str]:
         roster = "\n".join(
             f"- {c.name} (id={c.id}): {_brief_persona(c)}" for c in candidates
@@ -264,6 +407,19 @@ class GroupTurnOrchestrator:
             trigger = "(Gruppendynamik ohne neuen User-Impuls — wer spricht jetzt?)"
 
         history_blurb = _format_history_tail(req.history, limit=4)
+
+        # When the caller has a mention-derived order, hand it to the LLM
+        # as a hint so it can confirm or override (e.g. when a mentioned
+        # char is in a different room and shouldn't actually answer).
+        hint_block = ""
+        if preferred_order:
+            hint_block = (
+                "\n## Vorgeschlagene Reihenfolge (vom User benannt)\n"
+                + ", ".join(preferred_order)
+                + "\nBestätige diese Reihenfolge ODER gib eine bessere zurück, "
+                "falls einer der Genannten gerade nicht reagieren sollte "
+                "(unangebrachte Anwesenheit, Schlaf, anderer Raum etc.).\n"
+            )
 
         system = (
             "Du bist der Turn-Orchestrator einer RP-Gruppe. Deine Aufgabe: "
@@ -277,7 +433,8 @@ class GroupTurnOrchestrator:
         user = (
             f"## Roster\n{roster}\n\n"
             f"## Letzte Zeilen\n{history_blurb}\n\n"
-            f"## Aktueller Impuls\n{trigger}\n\n"
+            f"## Aktueller Impuls\n{trigger}"
+            f"{hint_block}\n\n"
             "## Deine Antwort (IDs komma-separiert, keine Erklärung):"
         )
 
@@ -291,7 +448,7 @@ class GroupTurnOrchestrator:
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                brain=self._brain,
+                brain=self._speaker_brain,
                 max_tokens=120,
                 temperature=0.3,
                 thinking=False,
@@ -432,19 +589,26 @@ class GroupTurnOrchestrator:
     # System section names used during reassembly. Order matters: it defines
     # the sequence the system prompt is built in.
     _SYSTEM_SECTION_ORDER: tuple[str, ...] = (
+        "lorebook_before_persona",   # NEW (Phase 9.8)
         "identity",
         "persona",
+        "lorebook_after_persona",    # NEW
+        "lorebook_before_scenario",  # NEW (default lore position)
         "scenario",
         "age_guidance",
+        "char_state",
         "others",
         "example_dialog",
+        "global_style",
         "rules",
     )
     # User section order (fed as the user message for the turn).
     _USER_SECTION_ORDER: tuple[str, ...] = (
+        "lorebook_before_history",   # NEW
         "history",
         "memory",
         "pulse",
+        "lorebook_before_user_message",  # NEW
         "user_message",
         "prev_turns",
         "instruction",
@@ -467,6 +631,21 @@ class GroupTurnOrchestrator:
         """
         # ─── SYSTEM sections ──────────────────────────────────────────
         sections: list[PromptSection] = []
+
+        # Lorebook activations land in their declared position. We add
+        # the section here so it sits in the right slot of
+        # _SYSTEM_SECTION_ORDER (or _USER_SECTION_ORDER for the
+        # user-side positions). Empty positions are skipped.
+        lore_result = (req.lore_by_speaker or {}).get(card.id)
+        lore_sections = _lore_sections(lore_result) if lore_result else {}
+        for sec_name in (
+            "lorebook_before_persona",
+            "lorebook_after_persona",
+            "lorebook_before_scenario",
+        ):
+            if sec_name in lore_sections:
+                sections.append(lore_sections[sec_name])
+
         sections.append(
             PromptSection(
                 name="identity",
@@ -516,6 +695,31 @@ class GroupTurnOrchestrator:
                 )
             )
 
+        state_text = _format_state_block(card.state or {})
+        if state_text:
+            sections.append(
+                PromptSection(
+                    name="char_state",
+                    # MUST so state survives prompt-trimming AND the LLM
+                    # can't ignore it on tight contexts. State drift was
+                    # Mike's audit point #2: char "ist nackt" but the
+                    # turn says "zupft an Kleidung" — that contradiction
+                    # is impossible if the state stays visible.
+                    priority=Priority.MUST,
+                    text=(
+                        f"## Dein Zustand (verbindlich!)\n{state_text}\n\n"
+                        "Halte dich strikt an diesen Zustand. Wenn du etwas "
+                        "anderes tun willst (Ort wechseln, Kleidung ändern, "
+                        "Haltung wechseln), schreib am Ende der Antwort einen "
+                        "<state>...</state>-Block der den Zustand explizit "
+                        "aktualisiert. Niemals einen Zustand erzählen der "
+                        "deinem aktuellen Zustand widerspricht."
+                    ),
+                    role="system",
+                    max_tokens=200,
+                )
+            )
+
         others_text = _format_others_block(card, all_cards)
         if others_text:
             sections.append(
@@ -540,25 +744,76 @@ class GroupTurnOrchestrator:
                 )
             )
 
+        # Global style — config-driven, MUST so the same uniform style
+        # applies to every character regardless of their individual
+        # persona's tone. Sits between the per-char blocks (above) and
+        # the per-turn rules (below) — the LLM sees: "I am X with persona
+        # Y; here is the house style; here are the rules; here is what
+        # I'm responding to right now."
+        if self._global_style_prompt:
+            sections.append(
+                PromptSection(
+                    name="global_style",
+                    priority=Priority.MUST,
+                    text=self._global_style_prompt,
+                    role="system",
+                )
+            )
+
         sections.append(
             PromptSection(
                 name="rules",
                 priority=Priority.MUST,
                 text=(
-                    "## Regeln\n"
-                    "- Antworte AUSSCHLIESSLICH in deiner eigenen Stimme.\n"
-                    "- Kein Meta-Kommentar, keine Regie-Anweisungen in "
-                    "eckigen Klammern (außer kurze *Aktionen* wenn es die "
-                    "Szene trägt).\n"
-                    "- Halte dich kurz (1-4 Sätze), außer die Szene verlangt "
-                    "mehr.\n"
-                    "- Sprich andere Anwesende gegebenenfalls namentlich an."
+                    "## Regeln (RP-Disziplin)\n"
+                    "- **Bleib in deinem Charakter.** Du sprichst, denkst und "
+                    "handelst ausschliesslich als die Person, die in der "
+                    "Persona-Sektion beschrieben ist. Keine Meta-Kommentare, "
+                    "keine Regie-Anweisungen in eckigen Klammern.\n"
+                    "- **Sprich NIE für den User oder andere Charaktere.** "
+                    "Du beschreibst nur, was DEIN Charakter sagt, fühlt und "
+                    "tut. Was die anderen tun, entscheiden sie selbst (oder "
+                    "der User). Lege niemandem Worte in den Mund.\n"
+                    "- **Treibe die Story nicht eigenmächtig voran.** Der "
+                    "User führt die Handlung. Du REAGIERST auf das, was "
+                    "passiert ist — du erfindest keine neuen Plot-Punkte, "
+                    "keine plötzlichen Ereignisse, keine Zeitsprünge. Wenn "
+                    "die Szene stockt, fragst du in deiner Stimme nach, "
+                    "statt die Story selbst weiterzuschreiben.\n"
+                    "- **Gefühle und Handlungen detailreich in *Sternchen*.** "
+                    "Inneres Erleben, Körpersprache, kleine Handlungen — "
+                    "beschreibe sie ausführlich, nicht nur '*nickt*' sondern "
+                    "z.B. '*lehnt sich langsam zurück, kneift die Augen "
+                    "zusammen und atmet hörbar aus*'. Mehrere Sätze pro "
+                    "Aktion sind erlaubt und gewünscht, wenn die Szene es "
+                    "trägt.\n"
+                    "- **Länge**: Schreib so viel wie die Szene verlangt — "
+                    "von einem knappen Satz bis zu mehreren Absätzen. Lieber "
+                    "lebendig und detailliert als künstlich kurz. Aber kein "
+                    "Roman, wenn die Szene nichts hergibt.\n"
+                    "- **Andere Anwesende**: Wenn es sich anbietet, sprich "
+                    "sie namentlich an oder reagiere körperlich auf sie.\n"
+                    "- Du DARFST am Ende deiner Antwort optional einen "
+                    "<state>key=value; key=value</state> Block setzen, wenn "
+                    "sich dein Zustand ändert. Anker-Keys: location, mood, "
+                    "last_action, clothing, posture, condition. Du darfst "
+                    "auch eigene Keys ergänzen (snake_case, z.B. "
+                    "holds_object=Schwert, proximity_to_user=nah). Wird "
+                    "nicht angezeigt, dient als dein Gedächtnis für die "
+                    "nächste Runde. Aktualisiere den Zustand IMMER, wenn "
+                    "deine Aktion ihn ändert (anziehen → clothing, "
+                    "umziehen → location, ...) — sonst entstehen Lücken."
                 ),
                 role="system",
             )
         )
 
         # ─── USER sections ────────────────────────────────────────────
+        # Lore that should land in the user-content area (before history
+        # or right before the user message).
+        if "lorebook_before_history" in lore_sections:
+            sections.append(lore_sections["lorebook_before_history"])
+
         history_text = _format_history_tail(req.history, limit=6)
         if history_text:
             # Snapshot req.history so the reduce_fn closure stays pure.
@@ -625,6 +880,10 @@ class GroupTurnOrchestrator:
                 )
             )
 
+        # Lore right before the user message.
+        if "lorebook_before_user_message" in lore_sections:
+            sections.append(lore_sections["lorebook_before_user_message"])
+
         if req.user_message.strip():
             sections.append(
                 PromptSection(
@@ -646,24 +905,40 @@ class GroupTurnOrchestrator:
             sections.append(
                 PromptSection(
                     name="prev_turns",
-                    priority=Priority.HIGH,
+                    # MUST: the prior speaker's reply is the most important
+                    # context for the current turn and would render the
+                    # round incoherent if dropped under tight budgets. We
+                    # accept that long prior-turns push history out first
+                    # — that's the right trade-off for sequential RP.
+                    priority=Priority.MUST,
                     text="## Reaktionen dieser Runde\n" + "\n".join(lines),
                     role="user",
                 )
             )
 
+        # Tailor the "you're up now" instruction so the LLM understands
+        # whom to address. When a previous speaker just spoke (and there's
+        # no fresh user message), this turn is effectively a Char-to-Char
+        # reply — frame it that way instead of leaning on the generic
+        # "react to user" wording.
+        last_speaker_name = ""
+        if previous_turns:
+            for t in reversed(previous_turns):
+                if not t.skipped and t.content and t.character_id != card.id:
+                    last_speaker_name = t.character_name
+                    break
+
+        instruction_text = _build_instruction(
+            card_name=card.name,
+            has_user_message=bool(req.user_message.strip()),
+            has_pulse=bool(req.pulse_text and req.pulse_from_id),
+            last_speaker_name=last_speaker_name,
+        )
         sections.append(
             PromptSection(
                 name="instruction",
                 priority=Priority.MUST,
-                text=(
-                    f"## Du bist jetzt dran: {card.name}\n"
-                    "Antworte in deiner Stimme (1-4 Sätze, außer die Szene "
-                    "verlangt mehr).\n"
-                    "Schreib ausschließlich deine Worte/Aktionen — keine "
-                    "Regie für andere.\n"
-                    "Wenn du nichts beitragen willst, antworte exakt: [PASS]"
-                ),
+                text=instruction_text,
                 role="user",
             )
         )
@@ -680,6 +955,118 @@ class GroupTurnOrchestrator:
 
 # "@Luna hey!" or "@luna" → forces Luna into position 0. Matches @Word.
 _AT_MENTION_RE = re.compile(r"@([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9_\-]{1,40})")
+
+
+def _lore_sections(
+    activation: ActivationResult,
+) -> dict[str, PromptSection]:
+    """Build one ``PromptSection`` per non-empty lore position.
+
+    The role is derived from the position: positions inside the system
+    prompt (before/after persona, before scenario) carry ``role="system"``;
+    user-side positions (before history / before user_message) live
+    in the user message. Priority is HIGH so the lore survives most
+    trimming — but not MUST, so under hard budget pressure the engine
+    still drops lore before it drops rules.
+    """
+    out: dict[str, PromptSection] = {}
+    for position, items in activation.by_position.items():
+        if not items:
+            continue
+        sec_name = SECTION_NAME_PER_POSITION.get(position)
+        if sec_name is None:
+            continue
+        text = render_position_block(items)
+        if not text.strip():
+            continue
+        # Map system vs user role by section name. Cleaner than
+        # exposing a per-position role table — the names are stable.
+        role = "user" if sec_name in (
+            "lorebook_before_history",
+            "lorebook_before_user_message",
+        ) else "system"
+        out[sec_name] = PromptSection(
+            name=sec_name,
+            priority=Priority.HIGH,
+            text=text,
+            role=role,
+            max_tokens=2000,  # absolute cap — engine already budgets
+        )
+    return out
+
+
+def _build_instruction(
+    *,
+    card_name: str,
+    has_user_message: bool,
+    has_pulse: bool,
+    last_speaker_name: str,
+) -> str:
+    """Build the per-turn "you're up now" instruction.
+
+    The instruction adapts to what the speaker is *actually* responding
+    to so the LLM gets a coherent target. The four cases:
+
+    1. **Char-to-Char reply** (no user message, prior speaker exists) →
+       frame the prior turn as a direct address, like a normal chat.
+    2. **Group dynamic with user msg + prior speaker** → instruct to
+       weave both in.
+    3. **User-only** → react to the user.
+    4. **Pulse-only** → react to the impuls.
+    """
+    head = f"## Du bist jetzt dran: {card_name}"
+    style_block = (
+        "Antworte in deiner eigenen Stimme — so lang oder so kurz, "
+        "wie die Szene es verlangt. Lieber lebendig + detailliert als "
+        "gehetzt-knapp."
+    )
+    actions_block = (
+        "**Was du tun sollst**: Beschreibe was DEIN Charakter denkt, "
+        "fühlt, sagt und tut — Aktionen und inneres Erleben in "
+        "*Sternchen*, gerne mehrsätzig."
+    )
+    forbid_block = (
+        "**Was du NICHT tust**: Sprechen für den User oder andere "
+        "Charaktere. Plot vorantreiben, wenn niemand dich darum gebeten "
+        "hat. Zeitsprünge oder neue Ereignisse erfinden."
+    )
+    pass_block = "Wenn du nichts beitragen willst, antworte exakt: [PASS]"
+
+    # Case 1: Char-to-Char reply — last speaker is another character and
+    # there's no fresh user line. Treat the prior reply as if it were
+    # addressed to us directly.
+    if last_speaker_name and not has_user_message and not has_pulse:
+        target_block = (
+            f"**Reagiere auf {last_speaker_name}.** Du antwortest auf das, "
+            f"was {last_speaker_name} gerade gesagt/getan hat (siehe "
+            "*Reaktionen dieser Runde*) — als wäre es eine Nachricht "
+            "an dich. Sprich {last_speaker_name} bei Bedarf direkt an, "
+            "stelle Rückfragen, reagiere emotional. Behandle das "
+            "exakt wie eine User-Nachricht — der einzige Unterschied "
+            "ist der Absender."
+        ).format(last_speaker_name=last_speaker_name)
+        return "\n".join([head, target_block, "", actions_block, forbid_block, "", style_block, pass_block])
+
+    # Case 2: Group dynamic — both a user message AND a prior speaker.
+    if last_speaker_name and has_user_message:
+        target_block = (
+            "**Reagiere auf User + die vorigen Reaktionen.** Du sprichst "
+            f"nach {last_speaker_name} — ergänze, widersprich oder bring "
+            "deine Sicht ein, ohne ihn/sie zu wiederholen."
+        )
+        return "\n".join([head, target_block, "", actions_block, forbid_block, "", style_block, pass_block])
+
+    # Case 4: Pulse-only.
+    if has_pulse and not has_user_message:
+        target_block = (
+            "**Reagiere auf den Impuls.** Etwas ist gerade passiert (siehe "
+            "*Impuls*) — antworte darauf in deiner Rolle."
+        )
+        return "\n".join([head, target_block, "", actions_block, forbid_block, "", style_block, pass_block])
+
+    # Case 3 (default): User message, no prior speaker.
+    target_block = "**Reagiere auf die User-Nachricht.**"
+    return "\n".join([head, target_block, "", actions_block, forbid_block, "", style_block, pass_block])
 
 
 def _parse_at_mentions(

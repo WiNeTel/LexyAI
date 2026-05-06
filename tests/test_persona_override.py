@@ -58,7 +58,10 @@ class _FakePersona:
 
 
 class _FakeRouter:
-    def route(self, text: str, brain: str) -> tuple[str, str]:
+    def route(self, text: str, brain: str, **_kwargs: Any) -> tuple[str, str]:
+        # ``**_kwargs`` swallows new keyword-only options the real router
+        # gains over time (e.g. has_images for vision-routing) so this
+        # fake doesn't have to track every signature change.
         return ("e4b", "test")
 
 

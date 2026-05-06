@@ -1,0 +1,56 @@
+name: deep_research
+version: 1.0.0
+description: "Multi-step deep research: topic → sub-queries → parallel web search → snippet extraction → synthesised markdown report with citations. Live progress over WebSocket."
+entry: plugin.DeepResearchPlugin
+requires: [web_crawler]
+optional: [scheduler]
+capabilities: [tool, ws_handler]
+
+config_defaults:
+  # ── Planning phase ───────────────────────────────────────────────
+  # Brain that decomposes the topic into sub-queries. a4b is the right
+  # default — planning rewards reasoning depth even if the topic is
+  # short. Lexy's tool-calling pipeline forces thinking=False per turn,
+  # so this is just a normal a4b call.
+  planner_brain: "a4b"
+  planner_max_tokens: 600
+  planner_temperature: 0.4
+  # Hard caps on what the planner is allowed to emit.
+  min_subqueries: 3
+  max_subqueries: 7
+  default_subqueries: 5
+
+  # ── Search + extract phase ───────────────────────────────────────
+  # Per sub-query: how many search results to consider, and how many
+  # we actually fetch+extract. Lower fetch limit = faster + cheaper.
+  search_results_per_query: 8
+  fetch_per_query: 4
+  fetch_concurrency_per_query: 2
+  fetch_timeout_seconds: 15
+  # Snippet extraction model — short, cheap classifier-style call.
+  extractor_brain: "e4b"
+  extractor_max_tokens: 400
+  extractor_temperature: 0.2
+  # Truncate fetched page content before extraction so long articles
+  # don't blow the e4b prompt budget. 6000 chars = ~1500 tokens.
+  page_text_max_chars: 6000
+
+  # ── Synthesis phase ──────────────────────────────────────────────
+  # Final report assembly. a4b for long-form coherence + citations.
+  synth_brain: "a4b"
+  synth_max_tokens: 2400
+  synth_temperature: 0.5
+  # If True, the synthesised report is also memory_store'd in the
+  # ``context`` collection so future chat turns can recall it.
+  persist_to_memory: true
+
+  # ── Pipeline-wide ────────────────────────────────────────────────
+  # Parallel fan-out across sub-queries. 3 = run 3 sub-queries at the
+  # same time (each fetches its own pages serially up to fetch_per_query).
+  parallel_subqueries: 3
+  # Hard total wall-clock cap. Past this, partial results are emitted
+  # and the synthesiser runs against whatever came back.
+  total_timeout_seconds: 240
+
+  # Default search language (passed to web_crawler.web_search).
+  default_language: "de"

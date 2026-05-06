@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from fastapi import (
+    Body,
     FastAPI,
     File,
     Form,
@@ -27,6 +28,8 @@ from fastapi.responses import FileResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from lexy_core.uploads import UploadHandler
+from lexy_core.uploads.handler import UploadValidationError
 from lexy_core.utils.logging import get_logger
 
 if TYPE_CHECKING:
@@ -160,11 +163,13 @@ class SessionRegisterRequest(BaseModel):
 class SessionPatchRequest(BaseModel):
     """
     Update metadata on an existing session. Currently supports moving a
-    session between projects and renaming its title.
+    session between projects, renaming its title, and switching its kind
+    (Phase 9.12 — Chat / Roleplay split).
     """
 
     project_id: str | None = None
     title: str | None = None
+    kind: str | None = None  # "chat" | "rp"
 
 
 class ProjectCreateRequest(BaseModel):
@@ -323,17 +328,97 @@ def build_app(lexy: "LexyApp") -> FastAPI:
         return {"status": "disabled"}
 
     @api.post("/api/v1/plugins/{name}/enable")
-    async def enable_plugin(name: str, request: Request) -> dict[str, str]:
+    async def enable_plugin(name: str, request: Request) -> dict[str, Any]:
+        """Enable a plugin.
+
+        Returns a structured response so the frontend can show a useful
+        toast instead of a bare 500. Two outcomes:
+
+        * ``{"status": "enabled", "degraded": False}`` — plugin is fully
+          operational.
+        * ``{"status": "enabled", "degraded": True, "last_error": ...}``
+          — plugin loaded but its provider couldn't be initialised
+          (e.g. CosyVoice server unreachable). The plugin is still
+          registered, only the provider is missing.
+
+        Hard failures (manifest invalid, import explodes before
+        ``on_load`` can swallow it) come back as ``422`` with a
+        ``detail`` payload that the frontend renders verbatim — much
+        more useful than ``HTTP 500``.
+        """
         app = _app(request)
         if app.plugin_loader is None:
             raise HTTPException(503, "Plugin loader not initialised")
-        # Re-run the load + enable path for a plugin that's currently inactive.
         try:
             await app.plugin_loader._load_plugin(name)  # type: ignore[attr-defined]
             await app.plugin_loader._enable_plugin(name)  # type: ignore[attr-defined]
         except Exception as exc:  # noqa: BLE001
-            raise HTTPException(500, f"enable failed: {exc}") from exc
-        return {"status": "enabled"}
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "plugin_enable_failed",
+                    "plugin": name,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            ) from exc
+
+        plugin = app.plugin_loader.get_plugin(name)
+        last_error = ""
+        degraded = False
+        if plugin is not None and hasattr(plugin, "get_status"):
+            try:
+                status = plugin.get_status() or {}
+                last_error = str(status.get("last_error") or "")
+                # A plugin can declare itself "degraded" by exposing a
+                # falsy ``*_active`` field. Otherwise we infer from
+                # the presence of last_error.
+                if last_error:
+                    degraded = True
+            except Exception as exc:  # noqa: BLE001
+                last_error = f"get_status raised: {exc}"
+                degraded = True
+        return {
+            "status": "enabled",
+            "degraded": degraded,
+            "last_error": last_error,
+        }
+
+    @api.get("/api/v1/plugins/{name}/status")
+    async def plugin_status(name: str, request: Request) -> dict[str, Any]:
+        """Return plugin runtime state.
+
+        Plugins can implement ``get_status() -> dict`` to surface
+        custom fields (e.g. ``server_url``, ``module_importable``,
+        ``last_error``). The dashboard's green-dot and the plugin
+        tab's offline-badge both read from here, so they stay in
+        sync — fixes the Phase 9.10 inconsistency Mike flagged on
+        the CosyVoice plugin.
+        """
+        app = _app(request)
+        if app.plugin_loader is None:
+            raise HTTPException(503, "Plugin loader not initialised")
+        manifest = app.plugin_loader.get_manifests().get(name)
+        if manifest is None:
+            raise HTTPException(404, f"unknown plugin: {name}")
+        plugin = app.plugin_loader.get_plugin(name)
+        loaded = plugin is not None
+        enabled = bool(plugin.enabled) if plugin is not None else False
+        custom: dict[str, Any] = {}
+        if plugin is not None and hasattr(plugin, "get_status"):
+            try:
+                raw = plugin.get_status() or {}
+                if isinstance(raw, dict):
+                    custom = raw
+            except Exception as exc:  # noqa: BLE001
+                custom = {"last_error": f"get_status raised: {exc}"}
+        return {
+            "name": name,
+            "loaded": loaded,
+            "enabled": enabled,
+            "version": manifest.version,
+            "description": manifest.description,
+            **custom,
+        }
 
     @api.get("/api/v1/plugins/{name}/config")
     async def get_plugin_config(name: str, request: Request) -> dict[str, Any]:
@@ -439,35 +524,356 @@ def build_app(lexy: "LexyApp") -> FastAPI:
             "content_type": file.content_type,
         }
 
-    @api.get("/api/v1/plugins/{name}/status")
-    async def get_plugin_status(name: str, request: Request) -> dict[str, Any]:
-        """
-        Return a plugin's runtime status snapshot.
+    @api.post("/api/v1/plugins/character_chat/import")
+    async def import_character_card(
+        request: Request,
+        file: UploadFile = File(...),
+        color: str = Form(""),
+        age_stage: str = Form("adult"),
+    ) -> dict[str, Any]:
+        """Import a Silly-Tavern character card.
 
-        A plugin opts in by exposing a ``get_status() -> dict`` method;
-        plugins that don't have one return ``{"available": False}``. This
-        lets the UI render diagnostics (is the background loop alive,
-        when was the last activity, how many events in the last hour,
-        why was the last tick skipped) without each plugin having to
-        bolt on its own custom endpoint.
+        Accepts:
+        * **JSON file** (``application/json`` or ``.json``) — v1 flat
+          or v2 ``{spec,data}`` shape.
+        * **PNG file** (``image/png`` or ``.png``) — Silly-Tavern PNG
+          card with the character JSON in a ``chara`` tEXt chunk. The
+          embedded image becomes the new character's avatar.
+
+        Returns the persisted card. Broadcasts ``character_created``
+        on success.
         """
         app = _app(request)
         if app.plugin_loader is None:
             raise HTTPException(503, "Plugin loader not initialised")
-        plugin = app.plugin_loader.get_plugin(name)
+        plugin = app.plugin_loader.get_plugin("character_chat")
         if plugin is None:
-            raise HTTPException(404, f"unknown plugin: {name}")
-        get_status = getattr(plugin, "get_status", None)
-        if not callable(get_status):
-            return {"name": name, "available": False}
+            raise HTTPException(404, "character_chat plugin not loaded")
+        store = getattr(plugin, "_store", None)
+        if store is None:
+            raise HTTPException(503, "character_chat store not ready")
+
+        data = await file.read()
+        if not data:
+            raise HTTPException(400, "empty upload")
+
         try:
-            snapshot = get_status()
+            saved = await store.import_silly_tavern_bytes(
+                data,
+                filename=file.filename or "",
+                content_type=file.content_type or "",
+                color=color or None,
+                age_stage=age_stage,
+                avatar_dir=CHARACTER_AVATAR_DIR,
+            )
+        except Exception as exc:  # noqa: BLE001 — user-facing error message
+            raise HTTPException(400, f"import failed: {exc}") from exc
+
+        # Broadcast so open tabs refresh their character list. Mirrors
+        # the avatar-upload endpoint pattern.
+        try:
+            await plugin._broadcast_character_event("character_created", saved)
+        except Exception:  # noqa: BLE001
+            pass
+
+        return {
+            "ok": True,
+            "character": {
+                "id": saved.id,
+                "name": saved.name,
+                "avatar": saved.avatar,
+                "age_stage": saved.age_stage,
+            },
+            "size": len(data),
+            "content_type": file.content_type,
+        }
+
+    # ─── Lorebooks (Phase 9.11 — REST mirror of WS handlers) ─────────
+    #
+    # The character_chat plugin already exposes ``_tool_lorebook_*`` and
+    # ``_tool_lore_entry_*`` plus the matching WS handlers (Phase 9.8).
+    # The frontend editor uses REST instead of WS round-trips because
+    # synchronous request/response is cleaner for plain CRUD.
+    #
+    # All routes go through the plugin's tool methods so the broadcast
+    # events (`lorebook_created`, etc.) keep firing — open tabs that
+    # subscribed via WS still see live updates after a REST mutation.
+
+    def _character_chat_plugin(app: Any) -> Any:
+        if app.plugin_loader is None:
+            raise HTTPException(503, "Plugin loader not initialised")
+        plugin = app.plugin_loader.get_plugin("character_chat")
+        if plugin is None:
+            raise HTTPException(404, "character_chat plugin not loaded")
+        if getattr(plugin, "_lore_store", None) is None:
+            raise HTTPException(503, "lorebook store not ready")
+        return plugin
+
+    def _lore_unwrap(result: dict[str, Any], not_found_msg: str) -> dict[str, Any]:
+        """Convert a tool result ``{ok, ...}`` into a REST response.
+
+        ``ok=False`` from the tool layer is mostly user-input error
+        (unknown scope, bad position, missing key on a non-always-on
+        entry) — those become 400. Specifically "not found" results
+        are remapped to 404 so the frontend can branch on it.
+        """
+        if not result.get("ok"):
+            err = str(result.get("error") or "")
+            if "not found" in err.lower():
+                raise HTTPException(404, err or not_found_msg)
+            raise HTTPException(400, err or "request failed")
+        # Strip ``ok`` from the response — caller doesn't need it,
+        # the HTTP status already says "success".
+        out = dict(result)
+        out.pop("ok", None)
+        return out
+
+    @api.get("/api/v1/plugins/character_chat/lorebooks")
+    async def list_lorebooks(
+        request: Request,
+        scope: str | None = None,
+        scope_id: str | None = None,
+        enabled_only: bool = False,
+    ) -> dict[str, Any]:
+        """List lorebooks, optionally filtered by scope / scope_id.
+
+        Query params:
+        * ``scope`` — ``global`` | ``character`` | ``session``. Omit
+          to list every book regardless of scope.
+        * ``scope_id`` — character_id or session_id. Required when
+          ``scope`` is ``character`` or ``session``; ignored otherwise.
+        * ``enabled_only`` — set ``true`` to hide disabled books.
+        """
+        app = _app(request)
+        plugin = _character_chat_plugin(app)
+        result = await plugin._tool_lorebook_list(
+            scope=scope, scope_id=scope_id, enabled_only=enabled_only,
+        )
+        return _lore_unwrap(result, "no lorebooks")
+
+    @api.post("/api/v1/plugins/character_chat/lorebooks")
+    async def create_lorebook(
+        request: Request,
+        body: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        """Create a lorebook.
+
+        Body: ``{name, description?, scope?, scope_id?, token_budget?}``.
+        ``scope=character|session`` requires a non-empty ``scope_id``.
+        """
+        app = _app(request)
+        plugin = _character_chat_plugin(app)
+        result = await plugin._tool_lorebook_create(
+            name=str(body.get("name") or "").strip(),
+            description=str(body.get("description") or ""),
+            scope=str(body.get("scope") or "global"),
+            scope_id=str(body.get("scope_id") or ""),
+            token_budget=int(body.get("token_budget") or 1500),
+        )
+        return _lore_unwrap(result, "create failed")
+
+    @api.patch("/api/v1/plugins/character_chat/lorebooks/{book_id}")
+    async def patch_lorebook(
+        book_id: str,
+        request: Request,
+        body: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        """Patch an existing lorebook. Only known fields are applied.
+
+        Allowed fields: ``name``, ``description``, ``scope``,
+        ``scope_id``, ``enabled``, ``token_budget``.
+        """
+        app = _app(request)
+        plugin = _character_chat_plugin(app)
+        # Strip unknown keys so the tool's allow-list is the source of
+        # truth — we don't have to mirror it here.
+        result = await plugin._tool_lorebook_update(id=book_id, **body)
+        return _lore_unwrap(result, "lorebook not found")
+
+    @api.delete("/api/v1/plugins/character_chat/lorebooks/{book_id}")
+    async def delete_lorebook(
+        book_id: str, request: Request,
+    ) -> dict[str, Any]:
+        """Delete a lorebook + all its entries (cascade)."""
+        app = _app(request)
+        plugin = _character_chat_plugin(app)
+        result = await plugin._tool_lorebook_delete(id=book_id)
+        if not result.get("ok"):
+            raise HTTPException(404, "lorebook not found")
+        return {"id": book_id}
+
+    @api.get(
+        "/api/v1/plugins/character_chat/lorebooks/{book_id}/entries"
+    )
+    async def list_lore_entries(
+        book_id: str,
+        request: Request,
+        enabled_only: bool = False,
+    ) -> dict[str, Any]:
+        """List entries inside a lorebook, sorted by priority then name."""
+        app = _app(request)
+        plugin = _character_chat_plugin(app)
+        result = await plugin._tool_lore_entry_list(
+            lorebook_id=book_id, enabled_only=enabled_only,
+        )
+        return _lore_unwrap(result, "no entries")
+
+    @api.post(
+        "/api/v1/plugins/character_chat/lorebooks/{book_id}/entries"
+    )
+    async def create_lore_entry(
+        book_id: str,
+        request: Request,
+        body: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        """Create a lore entry under the given book.
+
+        Body: ``{name, keys?, content?, position?, priority?,
+        always_on?, scan_depth?}``. Rule: at least one key OR
+        ``always_on=True`` (otherwise the entry would never fire).
+        """
+        app = _app(request)
+        plugin = _character_chat_plugin(app)
+        result = await plugin._tool_lore_entry_create(
+            lorebook_id=book_id,
+            name=str(body.get("name") or "").strip(),
+            keys=list(body.get("keys") or []),
+            content=str(body.get("content") or ""),
+            position=str(body.get("position") or "before_scenario"),
+            priority=int(body.get("priority") or 100),
+            always_on=bool(body.get("always_on", False)),
+            scan_depth=int(body.get("scan_depth") or 4),
+        )
+        return _lore_unwrap(result, "create failed")
+
+    @api.patch("/api/v1/plugins/character_chat/lore_entries/{entry_id}")
+    async def patch_lore_entry(
+        entry_id: str,
+        request: Request,
+        body: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        """Patch a lore entry. Allowed fields: name, keys, content,
+        position, priority, always_on, scan_depth, enabled."""
+        app = _app(request)
+        plugin = _character_chat_plugin(app)
+        result = await plugin._tool_lore_entry_update(id=entry_id, **body)
+        return _lore_unwrap(result, "entry not found")
+
+    @api.delete("/api/v1/plugins/character_chat/lore_entries/{entry_id}")
+    async def delete_lore_entry(
+        entry_id: str, request: Request,
+    ) -> dict[str, Any]:
+        """Delete a single lore entry."""
+        app = _app(request)
+        plugin = _character_chat_plugin(app)
+        result = await plugin._tool_lore_entry_delete(id=entry_id)
+        if not result.get("ok"):
+            raise HTTPException(404, "entry not found")
+        return {"id": entry_id}
+
+    # ─── Chat-attachment uploads ──────────────────────────────────────
+    #
+    # Four endpoints, one per kind. They all return a dict the frontend
+    # passes verbatim into the next chat message's ``attachments`` array,
+    # so the agent can build a multimodal user message (image_url block
+    # for vision) or a doc-excerpt block. Storage is at
+    # ``data/uploads/<session>/<upload_id>.<ext>`` and served via the
+    # ``/uploads`` StaticFiles mount registered later in this function.
+
+    async def _do_upload(
+        request: Request, kind: str, file: UploadFile, session_id: str
+    ) -> dict[str, Any]:
+        app = _app(request)
+        if file is None:
+            raise HTTPException(400, "no file provided")
+        if not session_id:
+            raise HTTPException(400, "session_id required")
+        try:
+            handler = await UploadHandler.from_app(app)
+            data = await file.read()
+            if kind == "image":
+                result = await handler.handle_image(
+                    data=data,
+                    filename=file.filename or "image",
+                    mime=file.content_type or "",
+                    session_id=session_id,
+                )
+            elif kind == "document":
+                result = await handler.handle_document(
+                    data=data,
+                    filename=file.filename or "document",
+                    mime=file.content_type or "",
+                    session_id=session_id,
+                )
+            elif kind == "code":
+                result = await handler.handle_code(
+                    data=data,
+                    filename=file.filename or "code.txt",
+                    mime=file.content_type or "",
+                    session_id=session_id,
+                )
+            elif kind == "audio":
+                result = await handler.handle_audio(
+                    data=data,
+                    filename=file.filename or "audio",
+                    mime=file.content_type or "",
+                    session_id=session_id,
+                )
+            else:
+                raise HTTPException(400, f"unknown upload kind: {kind!r}")
+        except UploadValidationError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except HTTPException:
+            raise
         except Exception as exc:  # noqa: BLE001
-            log.error("plugin_status.failed", plugin=name, error=str(exc))
-            raise HTTPException(500, f"status error: {exc}") from exc
-        if not isinstance(snapshot, dict):
-            raise HTTPException(500, "get_status() must return a dict")
-        return {"name": name, "available": True, **snapshot}
+            log.error("uploads.failed kind=%s error=%s", kind, exc)
+            raise HTTPException(500, f"upload failed: {exc}") from exc
+        return result.payload
+
+    @api.post("/api/v1/uploads/image")
+    async def upload_image(
+        request: Request,
+        session_id: str = Form("default"),
+        file: UploadFile = File(...),
+    ) -> dict[str, Any]:
+        return await _do_upload(request, "image", file, session_id)
+
+    @api.post("/api/v1/uploads/document")
+    async def upload_document(
+        request: Request,
+        session_id: str = Form("default"),
+        file: UploadFile = File(...),
+    ) -> dict[str, Any]:
+        return await _do_upload(request, "document", file, session_id)
+
+    @api.post("/api/v1/uploads/code")
+    async def upload_code(
+        request: Request,
+        session_id: str = Form("default"),
+        file: UploadFile = File(...),
+    ) -> dict[str, Any]:
+        return await _do_upload(request, "code", file, session_id)
+
+    @api.post("/api/v1/uploads/audio")
+    async def upload_audio(
+        request: Request,
+        session_id: str = Form("default"),
+        file: UploadFile = File(...),
+    ) -> dict[str, Any]:
+        return await _do_upload(request, "audio", file, session_id)
+
+    @api.delete("/api/v1/uploads/{upload_id}")
+    async def delete_upload(upload_id: str, request: Request) -> dict[str, Any]:
+        app = _app(request)
+        handler = await UploadHandler.from_app(app)
+        ok = await handler.store.delete(upload_id)
+        if not ok:
+            raise HTTPException(404, "upload not found")
+        return {"ok": True, "upload_id": upload_id}
+
+    # NOTE: ``/api/v1/plugins/{name}/status`` is registered earlier (Phase
+    # 9.10) — the older variant here used to return a different schema.
+    # We keep the single registration to avoid FastAPI route shadowing.
 
     @api.patch("/api/v1/plugins/{name}/config")
     async def patch_plugin_config(
@@ -731,6 +1137,8 @@ def build_app(lexy: "LexyApp") -> FastAPI:
     async def list_sessions(
         request: Request,
         project_id: str | None = None,
+        kind: str | None = None,
+        all: bool = False,
     ) -> dict[str, Any]:
         """
         List all known sessions with a short preview for the GUI sidebar.
@@ -740,6 +1148,17 @@ def build_app(lexy: "LexyApp") -> FastAPI:
         are treated as belonging to the default project (``"default"``),
         so requesting ``project_id=default`` also surfaces legacy
         unassigned sessions.
+
+        Phase 9.12: ``?kind=chat|rp`` orthogonally filters the list by
+        session kind (used by the new Chat / Rollenspiel tab split).
+        Sessions without a stored kind are treated as ``"chat"`` so old
+        sessions stay visible in the chat tab. ``?all=true`` bypasses
+        BOTH project and kind filters.
+
+        ``?all=true`` bypasses the project filter entirely so the user can
+        see every session across every project — useful as an escape hatch
+        when sessions appear "missing" because they were created under a
+        different active project.
 
         For each session we return:
           * ``id``           – session id
@@ -751,6 +1170,7 @@ def build_app(lexy: "LexyApp") -> FastAPI:
           * ``title``        – short title derived from the first user
             message, or null for empty/unnamed sessions
           * ``project_id``   – project the session belongs to, or null
+          * ``kind``         – ``"chat"`` or ``"rp"`` (Phase 9.12)
           * ``created_at``   – unix timestamp when the session was first
             registered (0.0 for legacy sessions migrated from v1)
           * ``updated_at``   – unix timestamp of the last mutation
@@ -768,11 +1188,27 @@ def build_app(lexy: "LexyApp") -> FastAPI:
         wanted_project = project_id.strip() if isinstance(project_id, str) else None
         if wanted_project == "":
             wanted_project = None
+        wanted_kind = kind.strip() if isinstance(kind, str) else None
+        if wanted_kind == "":
+            wanted_kind = None
+        if wanted_kind is not None and wanted_kind not in ("chat", "rp"):
+            raise HTTPException(
+                400, f"unknown kind: {kind!r}; expected 'chat' or 'rp'"
+            )
+        # ``all=true`` short-circuits filtering entirely — same behaviour
+        # as omitting project_id, but explicit so the frontend can ask
+        # for "every session" without faking a missing parameter.
+        if all:
+            wanted_project = None
+            wanted_kind = None
 
         out: list[dict[str, Any]] = []
         for session_id, meta, _count in app.session_store.sessions_with_meta():
             session_project = meta.get("project_id") or "default"
             if wanted_project is not None and session_project != wanted_project:
+                continue
+            session_kind = meta.get("kind") or "chat"
+            if wanted_kind is not None and session_kind != wanted_kind:
                 continue
             history = app.session_store.get(session_id)
             last = history[-1] if history else None
@@ -791,6 +1227,7 @@ def build_app(lexy: "LexyApp") -> FastAPI:
                     "last_user": _trim(last_user["content"]) if last_user else "",
                     "title": meta.get("title"),
                     "project_id": session_project,
+                    "kind": session_kind,
                     "created_at": meta.get("created_at") or 0.0,
                     "updated_at": meta.get("updated_at") or 0.0,
                     "in_progress": in_progress,
@@ -858,6 +1295,12 @@ def build_app(lexy: "LexyApp") -> FastAPI:
         if req.title is not None:
             if app.session_store.set_title(session_id, req.title):
                 changes["title"] = req.title
+        if req.kind is not None:
+            try:
+                if app.session_store.set_kind(session_id, req.kind):
+                    changes["kind"] = req.kind
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
 
         if changes and app.ws_server is not None:
             try:
@@ -904,7 +1347,22 @@ def build_app(lexy: "LexyApp") -> FastAPI:
     async def session_history(session_id: str, request: Request) -> dict[str, Any]:
         app = _app(request)
         history = app.session_store.get(session_id)
-        return {"session_id": session_id, "messages": history}
+        # Return the session's metadata alongside the messages so the
+        # frontend can sync ``activeProjectId`` on resume — otherwise a
+        # session resumed from another project disappears from the list
+        # the next time the user views it.
+        meta = app.session_store.get_meta(session_id) or {}
+        return {
+            "session_id": session_id,
+            "messages": history,
+            "project_id": meta.get("project_id"),
+            "title": meta.get("title"),
+            # Phase 9.12: surfaces the session kind so the frontend can
+            # snap the UI to the right tab when a session is resumed.
+            "kind": meta.get("kind") or "chat",
+            "created_at": meta.get("created_at") or 0.0,
+            "updated_at": meta.get("updated_at") or 0.0,
+        }
 
     @api.delete("/api/v1/sessions/{session_id}")
     async def clear_session(session_id: str, request: Request) -> dict[str, Any]:
@@ -1376,6 +1834,15 @@ def build_app(lexy: "LexyApp") -> FastAPI:
         name="character_avatars",
     )
 
+    # Chat-attachment uploads — same pattern, served under /uploads/<id>.<ext>.
+    uploads_dir = Path("data/uploads")
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    api.mount(
+        "/uploads",
+        StaticFiles(directory=str(uploads_dir)),
+        name="chat_uploads",
+    )
+
     # Serve frontend/static at /static and redirect / → /static/index.html
     static_dir = Path("frontend/static")
     if static_dir.is_dir():
@@ -1385,6 +1852,24 @@ def build_app(lexy: "LexyApp") -> FastAPI:
         @api.get("/", include_in_schema=False)
         async def root_redirect() -> RedirectResponse:
             return RedirectResponse(url="/static/index.html")
+
+        @api.get("/static/index.html", include_in_schema=False)
+        async def serve_index_no_cache() -> FileResponse:
+            """Serve index.html with no-cache headers so a Lexy update
+            always reaches the browser even when the user never
+            hard-reloads. The HTML carries ``?v=<date>`` query strings
+            on its asset references — those are cacheable; only the
+            HTML itself needs to bypass the cache so the new version
+            strings reach the client.
+            """
+            return FileResponse(
+                str(index_file),
+                media_type="text/html",
+                headers={
+                    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                    "Pragma": "no-cache",
+                },
+            )
 
         @api.get("/favicon.ico", include_in_schema=False)
         async def favicon() -> Response:

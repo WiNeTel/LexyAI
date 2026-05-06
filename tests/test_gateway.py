@@ -58,3 +58,49 @@ def test_plugins_list_endpoint(lexy_client: TestClient) -> None:
     names = {p["name"] for p in plugins}
     assert "weather" in names
     assert "voice_cosyvoice" in names
+
+
+# ─── Phase 9.10 — plugin status + structured enable errors ───────────────
+
+
+def test_plugin_status_unknown_returns_404(lexy_client: TestClient) -> None:
+    resp = lexy_client.get("/api/v1/plugins/__no_such_plugin__/status")
+    assert resp.status_code == 404
+
+
+def test_plugin_status_returns_structured_payload(lexy_client: TestClient) -> None:
+    """Phase 9.10: ``/status`` is the single source of truth that
+    the dashboard and the plugin tab both read from.
+
+    We pick ``voice_cosyvoice`` because that's the plugin the bug
+    report was about; it now exposes ``last_error`` /
+    ``module_importable`` / ``server_url`` via ``get_status()``."""
+    resp = lexy_client.get("/api/v1/plugins/voice_cosyvoice/status")
+    assert resp.status_code == 200
+    body = resp.json()
+    # Core keys every plugin gets from the gateway:
+    assert body["name"] == "voice_cosyvoice"
+    assert "loaded" in body
+    assert "enabled" in body
+    assert "version" in body
+    # Custom keys merged from the plugin's get_status():
+    if body.get("loaded"):
+        # Plugin-specific contract — see plugins/voice_cosyvoice/cosyvoice_plugin.py
+        assert "last_error" in body
+        assert "server_url" in body
+
+
+def test_enable_unknown_plugin_returns_structured_422(
+    lexy_client: TestClient,
+) -> None:
+    """The old route raised ``HTTPException(500)`` on any failure
+    which surfaced as ``HTTP 500`` in the toast. Phase 9.10 returns
+    ``422`` with ``detail.code = "plugin_enable_failed"`` so the
+    frontend can show the actual error instead of a status code."""
+    resp = lexy_client.post("/api/v1/plugins/__no_such_plugin__/enable")
+    assert resp.status_code == 422
+    detail = resp.json().get("detail")
+    assert isinstance(detail, dict)
+    assert detail.get("code") == "plugin_enable_failed"
+    assert detail.get("plugin") == "__no_such_plugin__"
+    assert "error" in detail

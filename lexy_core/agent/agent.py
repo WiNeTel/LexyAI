@@ -83,13 +83,26 @@ class LexyAgent:
         session_id: str = "default",
         user_id: str = "default",
         brain: str = "auto",
+        attachments: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Run the full Think→Plan→Execute→Reflect loop. Returns a result dict."""
+        """Run the full Think→Plan→Execute→Reflect loop. Returns a result dict.
+
+        ``attachments`` carries upload manifests from the
+        :mod:`lexy_core.uploads` pipeline. Each item is the dict the
+        upload handler returned, plus a ``data_url`` for images. The
+        agent uses them to:
+
+        * Build a multimodal user message (image_url blocks for vision)
+        * Inject document/code excerpts into the prompt
+        * Append a transcript line for audio
+        * Force the multimodal brain when at least one image is present
+        """
         log.info(
             "agent.process",
             session=session_id,
             user=user_id,
             length=len(text),
+            attachments=len(attachments or []),
         )
 
         ctx: dict[str, Any] = {
@@ -98,6 +111,7 @@ class LexyAgent:
             "user_id": user_id,
             "brain": brain,
             "tools_used": [],
+            "attachments": list(attachments or []),
         }
 
         # Snapshot the session's previous ``updated_at`` BEFORE we append
@@ -197,6 +211,7 @@ class LexyAgent:
         session_id: str = "default",
         user_id: str = "default",
         brain: str = "auto",
+        attachments: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """
         Streaming variant with full tool-execution loop.
@@ -228,6 +243,7 @@ class LexyAgent:
             "user_id": user_id,
             "brain": brain,
             "tools_used": [],
+            "attachments": list(attachments or []),
         }
 
         # Snapshot previous updated_at BEFORE appending the user message,
@@ -558,12 +574,18 @@ class LexyAgent:
             log.error("agent.recall_failed", error=str(exc))
             return []
 
-    async def _plan(self, ctx: dict[str, Any]) -> list[dict[str, str]]:
+    async def _plan(self, ctx: dict[str, Any]) -> list[dict[str, Any]]:
         """Build the message list and decide on a brain."""
-        brain, reason = self._router.route(ctx["text"], ctx.get("brain", "auto"))
+        attachments: list[dict[str, Any]] = ctx.get("attachments") or []
+        has_images = any(
+            (a or {}).get("kind") == "image" for a in attachments
+        )
+        brain, reason = self._router.route(
+            ctx["text"], ctx.get("brain", "auto"), has_images=has_images
+        )
         ctx["brain"] = brain
         await self._app.event_bus.emit(
-            "core.brain_routed", {"brain": brain, "reason": reason}
+            "core.brain_routed", {"brain": brain, "reason": reason},
         )
 
         # Pull the persona prompt from app state (user-editable). Fall
@@ -661,10 +683,32 @@ class LexyAgent:
                     cleaned_history.append(msg)
             history = cleaned_history
 
-        messages: list[dict[str, str]] = [
+        # Build the user message. If the turn carries image attachments
+        # we switch to a multimodal content array; non-image attachments
+        # (docs/code/audio) are folded into the text since the LLM only
+        # needs the parsed excerpt + a hint where it came from.
+        user_text = ctx["text"]
+        attachment_text = _render_non_image_attachments(attachments)
+        if attachment_text:
+            user_text = f"{user_text}\n\n{attachment_text}" if user_text else attachment_text
+
+        user_message: dict[str, Any]
+        image_blocks = _build_image_blocks(attachments)
+        if image_blocks:
+            user_message = {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_text or "(siehe Anhang)"},
+                    *image_blocks,
+                ],
+            }
+        else:
+            user_message = {"role": "user", "content": user_text}
+
+        messages: list[dict[str, Any]] = [
             {"role": "system", "content": "\n\n".join(system_parts)},
             *history,
-            {"role": "user", "content": ctx["text"]},
+            user_message,
         ]
         ctx["messages"] = messages
         ctx["history_length"] = len(history)
@@ -901,3 +945,88 @@ class LexyAgent:
             )
         except Exception as exc:  # noqa: BLE001
             log.error("agent.memorize_failed", error=str(exc))
+
+
+
+# ─── Attachment helpers ───────────────────────────────────────────────
+
+
+def _build_image_blocks(
+    attachments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return ``image_url`` content blocks for multimodal LLM messages.
+
+    Skips entries that don't look like images, or have no usable URL /
+    data URL. The caller passes the result inline into the user-content
+    array; if there are no images, the chat stays plain-text.
+    """
+    blocks: list[dict[str, Any]] = []
+    for item in attachments or []:
+        if not isinstance(item, dict) or item.get("kind") != "image":
+            continue
+        url = item.get("data_url") or item.get("url") or ""
+        if not url:
+            continue
+        blocks.append(
+            {"type": "image_url", "image_url": {"url": url}}
+        )
+    return blocks
+
+
+def _render_non_image_attachments(
+    attachments: list[dict[str, Any]],
+) -> str:
+    """Format doc/code/audio attachments as a text block for the prompt.
+
+    Images are handled separately via ``_build_image_blocks`` and so are
+    skipped here. Each non-image item gets one short labelled block; the
+    LLM sees it as an inline reference like:
+
+        [Datei] readme.md (document, 12 KB) — first 400 chars excerpt …
+    """
+    if not attachments:
+        return ""
+    lines: list[str] = []
+    for item in attachments:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("kind") or ""
+        if kind == "image":
+            continue
+        filename = item.get("filename") or "(file)"
+        size = item.get("size") or 0
+        size_kb = max(1, size // 1024) if size else 0
+        size_label = f"{size_kb} KB" if size else "?"
+        if kind == "document":
+            excerpt = (item.get("excerpt") or "").strip()
+            chunks = item.get("chunks_indexed") or 0
+            head = (
+                f"[Datei] {filename} (document, {size_label}, "
+                f"{chunks} chunks indexed)"
+            )
+            body = excerpt if excerpt else "(no extractable text)"
+            lines.append(f"{head}\n{body}")
+        elif kind == "code":
+            language = item.get("language") or ""
+            lang_str = f" {language}" if language else ""
+            line_count = item.get("lines") or 0
+            excerpt = (item.get("excerpt") or "").strip()
+            head = (
+                f"[Datei] {filename} (code{lang_str}, {line_count} lines)"
+            )
+            body = excerpt if excerpt else "(empty)"
+            lines.append(f"{head}\n{body}")
+        elif kind == "audio":
+            transcript = (item.get("transcript") or "").strip()
+            head = f"[Audio] {filename} ({size_label})"
+            body = (
+                f"Transcript: {transcript}"
+                if transcript
+                else "(no transcript available)"
+            )
+            lines.append(f"{head}\n{body}")
+        else:
+            lines.append(f"[Anhang] {filename} ({kind}, {size_label})")
+    if not lines:
+        return ""
+    return "## Anhänge dieser Nachricht\n" + "\n\n".join(lines)

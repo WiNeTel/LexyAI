@@ -232,7 +232,16 @@ window.LexyHolo = (function () {
 
         function skip() {
             overlay.classList.add("hidden");
-            ScreenOutline.build();
+            // ScreenOutline is declared LATER in this file. When the
+            // browser hits this point on a returning visit (sessionStorage
+            // already set) the const is still in its TDZ and a direct
+            // reference would throw "can't access lexical declaration
+            // 'ScreenOutline' before initialization". Defer the call to
+            // a microtask — by the time it fires, the rest of the module
+            // (including ScreenOutline) has been initialised.
+            queueMicrotask(() => {
+                try { ScreenOutline.build(); } catch (_e) {}
+            });
         }
 
         // Check if boot was already seen this session

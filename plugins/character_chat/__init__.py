@@ -3,7 +3,9 @@
 from .character_card import (
     CharacterCard,
     CharacterCardError,
+    parse_silly_tavern_bytes,
     parse_silly_tavern_card,
+    parse_silly_tavern_png,
 )
 from .character_store import CharacterStore
 from .context_budget import (
@@ -17,7 +19,9 @@ from .context_budget import (
 __all__ = [
     "CharacterCard",
     "CharacterCardError",
+    "parse_silly_tavern_bytes",
     "parse_silly_tavern_card",
+    "parse_silly_tavern_png",
     "CharacterStore",
     "ContextBudget",
     "Priority",

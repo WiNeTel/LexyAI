@@ -1,0 +1,45 @@
+name: coder
+version: 1.0.0
+description: "Self-Coding workspace. Lexy can read/write code in a sandboxed workdir, manage venvs, run skills via subprocess, and (optionally) run a multi-step Plan→Code→Test→Reflect loop with error-learning."
+entry: plugin.CoderPlugin
+requires: []
+optional: [scheduler, skill_writer]
+capabilities: [tool, event, ws_handler]
+
+config_defaults:
+  # Root of Lexy's workspace. Everything outside this path is read-only
+  # (and not even readable until a future "context-source" feature pins
+  # it). Three subdirs are auto-created: skills/ (sandboxed tools that
+  # can be run via subprocess), projects/ (Mike's work — Lexy writes,
+  # Mike runs), extensions/ (Lexy modifying her own plugins, Phase 4).
+  workspace_root: "workspace"
+
+  # Approval-Gate timeouts. The frontend modal must respond within this
+  # window or the tool call is auto-rejected (defensive default — better
+  # to fail noisily than silently hang on a closed tab).
+  approval_timeout_seconds: 180
+
+  # Auto-approve LOW-risk actions (read, list, git_log, git_diff).
+  # MED/HIGH always require an explicit decision.
+  auto_approve_low_risk: true
+
+  # Per-skill subprocess execution. Skills can `workspace_run` themselves;
+  # Projects (kind=project) are NEVER run automatically — Mike's rule.
+  run_default_timeout_seconds: 30
+  run_max_output_bytes: 1048576       # 1 MB stdout+stderr cap
+  run_default_python: "python"        # used when no explicit env/python
+
+  # Coder-Brain (Phase C) — Multi-step Plan→Code→Test→Reflect Loop.
+  # When False: only the lower-level workspace_* tools are exposed and
+  # Lexy plans/reflects via her normal agent loop.
+  coder_brain_enabled: true
+  coder_brain_default_brain: "a4b"    # planning/reflection wants reasoning
+  coder_max_steps: 12
+  coder_max_retries_per_step: 3
+  coder_history_window: 6
+
+  # Error-learning. When True, before each subprocess run the brain
+  # recalls similar past errors from ChromaDB `errors` collection and
+  # injects them into the next plan iteration.
+  error_learning_enabled: true
+  error_learning_recall_limit: 3

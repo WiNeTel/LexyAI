@@ -218,7 +218,8 @@ html, body {
     font-family: var(--mono); font-size: 12px;
 }
 
-#chat-window {
+#chat-window,
+#rp-chat-window {
     flex: 1;
     overflow-y: auto;
     padding: 20px;
@@ -444,16 +445,114 @@ html, body {
     filter: drop-shadow(0 0 18px rgba(255, 122, 26, 0.25));
 }
 
-/* ── Composer ─────────────────────────────────────────────────── */
-#composer {
+/* ── Composer (Phase 9.12: shared with the RP-tab composer) ───── */
+#composer,
+#rp-composer {
     flex-shrink: 0;
     display: grid;
-    grid-template-columns: 1fr auto;
+    grid-template-columns: auto 1fr auto;
     gap: 10px;
     padding: 14px 20px;
     border-top: 1px solid var(--border);
     background: var(--bg-2);
 }
+.composer-toolbar {
+    display: flex;
+    gap: 6px;
+    align-items: stretch;
+}
+.btn.upload-btn {
+    padding: 8px 10px;
+    font-size: 16px;
+    line-height: 1;
+}
+.btn.upload-btn[data-busy="true"] {
+    opacity: 0.5;
+    cursor: progress;
+}
+.composer-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 8px 20px;
+    background: var(--bg-2);
+    border-top: 1px solid var(--border);
+}
+.composer-attachments[hidden] { display: none; }
+.attachment-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 6px 4px 8px;
+    background: var(--bg-3);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 12px;
+    max-width: 240px;
+}
+.attachment-chip .chip-thumb {
+    width: 28px;
+    height: 28px;
+    border-radius: 4px;
+    object-fit: cover;
+    background: var(--bg-4);
+    flex-shrink: 0;
+}
+.attachment-chip .chip-icon {
+    width: 28px;
+    height: 28px;
+    border-radius: 4px;
+    background: var(--bg-4);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    flex-shrink: 0;
+}
+.attachment-chip .chip-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1 1 auto;
+}
+.attachment-chip .chip-meta {
+    color: var(--muted);
+    font-size: 11px;
+    flex-shrink: 0;
+}
+.attachment-chip .chip-remove {
+    background: transparent;
+    border: 0;
+    color: var(--muted);
+    cursor: pointer;
+    padding: 2px 4px;
+    line-height: 1;
+}
+.attachment-chip .chip-remove:hover { color: var(--err); }
+
+/* Inline image / file in chat bubbles */
+.bubble .bubble-image {
+    display: block;
+    max-width: 100%;
+    max-height: 320px;
+    border-radius: 8px;
+    margin: 4px 0;
+}
+.bubble .bubble-file {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    background: var(--bg-3);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 12px;
+    text-decoration: none;
+    color: var(--text);
+    margin: 4px 0;
+}
+.bubble .bubble-file:hover { border-color: var(--accent); }
+
 #input {
     background: var(--bg-3);
     color: var(--text);
@@ -799,6 +898,17 @@ textarea:focus, select:focus {
     color: var(--warn, #e7b946);
     border-color: rgba(231, 185, 70, 0.45);
     margin-left: 6px;
+}
+/* Phase 9.12: Chat / RP session-kind badges */
+.session-item .sid-role-rp {
+    color: #cdb6f7;
+    background: rgba(187, 154, 247, 0.12);
+    border-color: rgba(187, 154, 247, 0.35);
+}
+.session-item .sid-role-chat {
+    color: #9bb6f7;
+    background: rgba(122, 162, 247, 0.10);
+    border-color: rgba(122, 162, 247, 0.25);
 }
 .session-item.session-in-progress {
     border-left: 3px solid var(--warn, #e7b946);
@@ -2149,4 +2259,631 @@ textarea:focus, select:focus {
 #char-session-sim-status.running {
     color: var(--ok, #9ece6a);
     font-weight: bold;
+}
+
+/* ── Coder approval modal + console (Phase 10.B+C) ─────────────── */
+.coder-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 9000;
+    backdrop-filter: blur(2px);
+}
+.coder-overlay[hidden] { display: none; }
+.coder-modal {
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: 0 16px 64px rgba(0, 0, 0, 0.6);
+    width: min(640px, 92vw);
+    max-height: 86vh;
+    display: flex;
+    flex-direction: column;
+}
+.coder-modal-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--border);
+}
+.coder-modal-header h2 {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 600;
+    flex: 1;
+}
+.coder-risk {
+    display: inline-block;
+    padding: 3px 8px;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    background: var(--bg-4);
+    color: var(--text);
+}
+.coder-risk[data-risk="low"]  { background: rgba(74, 222, 128, 0.15); color: #4ade80; border: 1px solid rgba(74, 222, 128, 0.4); }
+.coder-risk[data-risk="med"]  { background: rgba(251, 191, 36, 0.15); color: #fbbf24; border: 1px solid rgba(251, 191, 36, 0.4); }
+.coder-risk[data-risk="high"] { background: rgba(239, 68, 68, 0.15);  color: #f87171; border: 1px solid rgba(239, 68, 68, 0.4); }
+.coder-modal-body {
+    padding: 14px 18px;
+    overflow-y: auto;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+.coder-action-row {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    font-size: 13px;
+}
+.coder-action-label {
+    color: var(--muted);
+    flex-shrink: 0;
+}
+#coder-approval-action {
+    background: var(--bg-3);
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-family: monospace;
+    font-size: 12px;
+}
+.coder-preview {
+    background: var(--bg-3);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-family: monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    max-height: 320px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin: 0;
+}
+.coder-payload summary {
+    cursor: pointer;
+    color: var(--muted);
+    font-size: 12px;
+}
+.coder-payload pre {
+    background: var(--bg-3);
+    padding: 8px 10px;
+    border-radius: 4px;
+    font-size: 11px;
+    margin: 6px 0 0;
+    max-height: 160px;
+    overflow: auto;
+}
+.coder-modal-actions {
+    display: flex;
+    gap: 8px;
+    padding: 12px 18px;
+    border-top: 1px solid var(--border);
+    justify-content: flex-end;
+    flex-wrap: wrap;
+}
+
+/* Coder console — floating panel showing live task progress. */
+.coder-console {
+    position: fixed;
+    right: 16px;
+    bottom: 16px;
+    width: min(420px, 92vw);
+    max-height: 60vh;
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    z-index: 8500;
+    display: flex;
+    flex-direction: column;
+}
+.coder-console[hidden] { display: none; }
+.coder-console-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+}
+.coder-console-title {
+    font-size: 13px;
+    font-weight: 600;
+}
+.coder-console-close {
+    padding: 2px 8px;
+    font-size: 12px;
+    line-height: 1;
+}
+.coder-console-body {
+    padding: 8px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.coder-task-card {
+    background: var(--bg-3);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+.coder-task-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 600;
+}
+.coder-task-state {
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 0.05em;
+    padding: 2px 6px;
+    border-radius: 4px;
+    background: var(--bg-4);
+}
+.coder-task-state[data-state="running"]    { background: rgba(56, 189, 248, 0.18);  color: #38bdf8; }
+.coder-task-state[data-state="planning"]   { background: rgba(168, 85, 247, 0.18);  color: #a855f7; }
+.coder-task-state[data-state="reflecting"] { background: rgba(251, 191, 36, 0.18);  color: #fbbf24; }
+.coder-task-state[data-state="done"]       { background: rgba(74, 222, 128, 0.18);  color: #4ade80; }
+.coder-task-state[data-state="failed"]     { background: rgba(239, 68, 68, 0.18);   color: #f87171; }
+.coder-task-state[data-state="cancelled"]  { background: var(--bg-4); color: var(--muted); }
+.coder-task-desc {
+    color: var(--muted);
+    font-weight: 400;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+}
+.coder-task-steps {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin-top: 4px;
+    font-size: 11px;
+}
+.coder-task-step {
+    display: flex;
+    gap: 6px;
+    color: var(--muted);
+}
+.coder-task-step[data-completed="true"]  { color: var(--text); }
+.coder-task-step[data-completed="true"]::before { content: "✓"; color: #4ade80; }
+.coder-task-step[data-completed="false"]::before { content: "·"; }
+.coder-task-step.current::before { content: "→"; color: var(--accent); }
+.coder-task-error {
+    margin-top: 4px;
+    color: #f87171;
+    font-family: monospace;
+    font-size: 11px;
+    background: rgba(239, 68, 68, 0.08);
+    border-left: 2px solid #f87171;
+    padding: 4px 8px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* ── Deep Research console (Phase 12) ─────────────────────────── */
+.research-console {
+    position: fixed;
+    right: 16px;
+    bottom: 16px;
+    width: min(560px, 92vw);
+    max-height: 70vh;
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    z-index: 8400; /* below coder-console (8500) so coder approvals win */
+    display: flex;
+    flex-direction: column;
+}
+.research-console[hidden] { display: none; }
+.research-console-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+}
+.research-console-title {
+    font-size: 13px;
+    font-weight: 600;
+}
+.research-console-close {
+    padding: 2px 8px;
+    font-size: 12px;
+    line-height: 1;
+}
+.research-console-body {
+    padding: 8px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.research-task-card {
+    background: var(--bg-3);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-size: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.research-task-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 600;
+}
+.research-task-state {
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 0.05em;
+    padding: 2px 6px;
+    border-radius: 4px;
+    background: var(--bg-4);
+}
+.research-task-state[data-state="planning"]      { background: rgba(168, 85, 247, 0.18); color: #a855f7; }
+.research-task-state[data-state="searching"]     { background: rgba(56, 189, 248, 0.18); color: #38bdf8; }
+.research-task-state[data-state="synthesising"]  { background: rgba(251, 191, 36, 0.18); color: #fbbf24; }
+.research-task-state[data-state="done"]          { background: rgba(74, 222, 128, 0.18); color: #4ade80; }
+.research-task-state[data-state="failed"]        { background: rgba(239, 68, 68, 0.18);  color: #f87171; }
+.research-task-state[data-state="cancelled"]     { background: var(--bg-4); color: var(--muted); }
+.research-task-topic {
+    color: var(--text);
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+}
+.research-task-meta {
+    color: var(--muted);
+    font-size: 11px;
+}
+.research-task-subqueries {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    margin-top: 4px;
+    font-size: 11px;
+}
+.research-task-subquery {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    color: var(--muted);
+}
+.research-task-subquery[data-completed="true"] { color: var(--text); }
+.research-task-subquery .sq-marker {
+    width: 14px;
+    text-align: center;
+    flex-shrink: 0;
+}
+.research-task-subquery[data-completed="true"]  .sq-marker { color: #4ade80; }
+.research-task-subquery[data-completed="false"] .sq-marker { color: var(--muted); }
+.research-task-subquery .sq-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+}
+.research-task-subquery .sq-count {
+    color: var(--muted);
+    font-size: 10px;
+    flex-shrink: 0;
+}
+.research-task-report {
+    margin-top: 6px;
+    padding: 8px 10px;
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    max-height: 40vh;
+    overflow-y: auto;
+    font-size: 12px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+.research-task-report h1, .research-task-report h2, .research-task-report h3 {
+    margin: 8px 0 4px;
+    font-size: 13px;
+}
+.research-task-report code {
+    background: var(--bg-4);
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-family: var(--mono);
+    font-size: 11px;
+}
+.research-task-report a {
+    color: var(--accent);
+    text-decoration: none;
+}
+.research-task-report a:hover { text-decoration: underline; }
+.research-task-error {
+    color: #f87171;
+    font-family: monospace;
+    font-size: 11px;
+    background: rgba(239, 68, 68, 0.08);
+    border-left: 2px solid #f87171;
+    padding: 4px 8px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* ── Character bubble inline edit (Phase 9.5) ─────────────────── */
+.char-msg-actions {
+    display: flex;
+    gap: 4px;
+    margin-top: 6px;
+    opacity: 0;
+    transition: opacity 0.12s;
+}
+.msg.character:hover .char-msg-actions {
+    opacity: 1;
+}
+.char-edit-textarea {
+    width: 100%;
+    min-height: 60px;
+    background: var(--bg-3);
+    color: var(--text);
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-family: var(--font);
+    font-size: 13px;
+    line-height: 1.4;
+    resize: vertical;
+}
+.char-edit-textarea:focus { outline: none; border-color: var(--accent); }
+
+/* ── Sessions tab: cross-project rescue banner ──────────────────────── */
+.session-cross-hint {
+    background: rgba(255, 122, 26, 0.08);
+    border: 1px solid rgba(255, 122, 26, 0.35);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-bottom: 12px;
+    font-size: 13px;
+    line-height: 1.45;
+}
+.session-cross-hint b { color: var(--accent); }
+
+/* ─── Lorebooks (Phase 9.11) ────────────────────────────────────────
+ *
+ * Two-pane editor — books on the left (compact card list with scope
+ * badge + entry count), entries on the right (table with key chips
+ * + position pill + always-on icon). Click a book → its entries
+ * load into the right pane. Click an entry → modal opens for edit.
+ * Same look-and-feel as the Characters tab so muscle memory carries.
+ */
+
+.lorebooks-layout {
+    display: grid;
+    grid-template-columns: 320px 1fr;
+    gap: 16px;
+    padding: 0;
+    align-items: start;
+}
+
+.lore-books-pane {
+    max-height: calc(100vh - 220px);
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.lore-book-card {
+    background: var(--panel, #1a1b26);
+    border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+    border-left-width: 4px;
+    border-left-color: var(--accent, #7aa2f7);
+    border-radius: 8px;
+    padding: 10px 12px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+}
+
+.lore-book-card:hover { background: rgba(255, 255, 255, 0.04); }
+.lore-book-card.active {
+    background: rgba(122, 162, 247, 0.08);
+    border-color: var(--accent, #7aa2f7);
+}
+.lore-book-card.disabled {
+    opacity: 0.55;
+    border-left-color: #4a5060;
+}
+.lore-book-card.scope-character { border-left-color: #bb9af7; }
+.lore-book-card.scope-session   { border-left-color: #9ece6a; }
+.lore-book-card.scope-global    { border-left-color: #7aa2f7; }
+
+.lore-book-card .lore-book-name {
+    font-weight: 600;
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    margin-bottom: 4px;
+}
+.lore-book-card .lore-book-meta {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.55);
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+.lore-book-card .lore-book-desc {
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.65);
+    margin-top: 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+}
+
+.lore-scope-badge {
+    display: inline-block;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 1px 6px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.06);
+    color: rgba(255, 255, 255, 0.75);
+}
+.lore-scope-badge.scope-global    { background: rgba(122, 162, 247, 0.18); color: #9bb6f7; }
+.lore-scope-badge.scope-character { background: rgba(187, 154, 247, 0.18); color: #cdb6f7; }
+.lore-scope-badge.scope-session   { background: rgba(158, 206, 106, 0.18); color: #b9e08a; }
+
+/* Right-pane: header + entries table */
+.lore-entries-pane {
+    background: var(--panel, #1a1b26);
+    border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+    border-radius: 10px;
+    padding: 14px 16px;
+    min-height: calc(100vh - 220px);
+}
+
+.lore-entries-pane .lore-empty {
+    padding: 60px 20px;
+    text-align: center;
+    font-size: 14px;
+}
+
+.lore-entries-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 14px;
+    gap: 12px;
+}
+.lore-entries-header .lore-current-book-name {
+    font-size: 16px;
+    font-weight: 600;
+}
+.lore-entries-header .lore-current-book-meta {
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.55);
+    margin-top: 2px;
+}
+
+table.lore-entries-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+.lore-entries-table th,
+.lore-entries-table td {
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border, rgba(255, 255, 255, 0.06));
+    text-align: left;
+    vertical-align: top;
+}
+.lore-entries-table th {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: rgba(255, 255, 255, 0.55);
+    font-weight: 600;
+}
+.lore-entries-table tr.entry-row {
+    cursor: pointer;
+    transition: background 0.12s;
+}
+.lore-entries-table tr.entry-row:hover {
+    background: rgba(255, 255, 255, 0.03);
+}
+.lore-entries-table tr.entry-row.disabled {
+    opacity: 0.5;
+}
+
+.lore-key-chip {
+    display: inline-block;
+    background: rgba(122, 162, 247, 0.1);
+    color: #9bb6f7;
+    border: 1px solid rgba(122, 162, 247, 0.25);
+    padding: 1px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    margin: 0 4px 2px 0;
+}
+.lore-key-chip.always-on {
+    background: rgba(255, 184, 108, 0.12);
+    color: #ffc987;
+    border-color: rgba(255, 184, 108, 0.3);
+}
+.lore-position-pill {
+    display: inline-block;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    padding: 1px 8px;
+    border-radius: 6px;
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.7);
+}
+
+/* Modals — book + entry */
+.modal.lore-book-modal,
+.modal.lore-entry-modal {
+    max-width: 640px;
+    max-height: 88vh;
+    overflow-y: auto;
+}
+.modal.lore-entry-modal { max-width: 720px; }
+
+.modal-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 20px 8px;
+    border-bottom: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+}
+.modal-head h3 { margin: 0; font-size: 16px; }
+
+.modal-foot {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    padding-top: 14px;
+    margin-top: 14px;
+    border-top: 1px solid var(--border, rgba(255, 255, 255, 0.06));
+}
+.modal-foot .btn-danger {
+    margin-right: auto;
+}
+
+.btn.icon {
+    padding: 4px 10px;
+    font-size: 14px;
+}
+
+/* Lorebook tab — responsive */
+@media (max-width: 1080px) {
+    .lorebooks-layout { grid-template-columns: 1fr; }
+    .lore-books-pane { max-height: 280px; }
+    .lore-entries-pane { min-height: auto; }
 }

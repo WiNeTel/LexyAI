@@ -44,6 +44,18 @@ from .group_turn import (
     GroupTurnOrchestrator,
     GroupTurnRequest,
 )
+from .lorebook_engine import LorebookEngine
+from .lorebook_store import (
+    LorebookStore,
+    SCOPE_CHARACTER,
+    SCOPE_GLOBAL,
+    SCOPE_SESSION,
+    VALID_POSITIONS,
+    VALID_SCOPES,
+)
+from .mention_parser import parse_nl_mentions
+from .pulse_generator import PulseGenerator
+from .state_updater import merge_state, parse_state_block
 
 
 log = get_logger(module="character_chat")
@@ -160,12 +172,25 @@ IMPORT_CARD_SCHEMA: dict[str, Any] = {
     "properties": {
         "payload": {
             "type": "object",
-            "description": "Silly-Tavern JSON (v1 oder v2 'data'-nested).",
+            "description": (
+                "Silly-Tavern JSON (v1 oder v2 'data'-nested). Genau "
+                "EINE von ``payload`` oder ``png_b64`` muss gesetzt sein."
+            ),
         },
+        "png_b64": {
+            "type": "string",
+            "description": (
+                "Base64-encoded PNG card mit eingebettetem "
+                "'chara'-tEXt-Chunk (Silly-Tavern Standard). Das Bild "
+                "selbst wird als Avatar des Charakters gespeichert."
+            ),
+        },
+        "filename": {"type": "string"},
+        "content_type": {"type": "string"},
         "color": {"type": "string"},
         "age_stage": {"type": "string", "enum": list(AGE_STAGES)},
     },
-    "required": ["payload"],
+    "required": [],
 }
 
 RUN_ROUND_SCHEMA: dict[str, Any] = {
@@ -204,6 +229,25 @@ class CharacterChatPlugin(BasePlugin):
         self._temperature: float = 0.8
         self._max_speakers: int = 4
         self._turn_selection: str = "autonomous"
+        # Brain used for the cheap speaker-selection classifier. Independent
+        # of ``default_brain`` so the big A4B brain stays free to do actual
+        # in-character turns. Default e4b (Gemma 4 12B on :5006).
+        self._speaker_selection_brain: str = "e4b"
+        # Global RP style prompt — Mike's request "alle charaktere sollen
+        # im gleichen Style schreiben". Injected MUST-priority into every
+        # character turn's system prompt. Empty string disables.
+        self._global_rp_style_prompt: str = ""
+        # Force the orchestrator brain to confirm/refine speaker order
+        # even when @-mentions or NL-mentions already cover everyone.
+        # Off by default — adds one E4B call per round.
+        self._always_call_orchestrator: bool = False
+        # Smart pulse generation — replaces the static _DEFAULT_PULSES with
+        # a tiny LLM call (E4B by default) that reads persona + state +
+        # recent history. When False, the old static behaviour is exact.
+        self._smart_pulses_enabled: bool = True
+        self._pulse_generation_brain: str = "e4b"
+        self._pulse_history_window: int = 6
+        self._pulse_max_tokens: int = 200
         self._proactive_pulses_enabled: bool = True
         self._lexy_auto_reacts: bool = True
         self._memory_strict_isolation: bool = True
@@ -217,6 +261,9 @@ class CharacterChatPlugin(BasePlugin):
         # of the last pulse-round.
         self._pulse_cooldowns: dict[str, float] = {}
         self._pulse_cooldown_seconds: float = 600.0  # 10 min default
+        # Sessions older than this in seconds skip pulse + sim ticks.
+        # 0 = disabled (= pre-9.7 behaviour). Set in _apply_config.
+        self._pulse_session_stale_seconds: float = 21600.0  # 6h default
         # Guard: ensure _rehydrate_pulse_timers runs exactly once.
         self._pulse_rehydrated: bool = False
         # Autonomous simulation: per-session recurring timer id + state.
@@ -229,6 +276,9 @@ class CharacterChatPlugin(BasePlugin):
         # Components (created in on_load)
         self._store: CharacterStore | None = None
         self._orchestrator: GroupTurnOrchestrator | None = None
+        self._pulse_generator: PulseGenerator | None = None
+        self._lore_store: LorebookStore | None = None
+        self._lore_engine: LorebookEngine = LorebookEngine()
         # Serialise round execution per session so two concurrent
         # run_round requests don't interleave their broadcasts.
         self._session_locks: dict[str, asyncio.Lock] = {}
@@ -246,6 +296,11 @@ class CharacterChatPlugin(BasePlugin):
         db = await self.api.get_db()
         self._store = CharacterStore(db)
         await self._store.init_schema()
+        # Lorebook store shares the character_chat DB — same connection,
+        # separate tables. Init unconditionally (the table CREATE IF NOT
+        # EXISTS is idempotent and cheap).
+        self._lore_store = LorebookStore(db)
+        await self._lore_store.init_schema()
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS character_turns (
@@ -327,6 +382,15 @@ class CharacterChatPlugin(BasePlugin):
             recall_limit=3,
             context_size_fn=_ctx_fn,
             safety_margin_tokens=self._context_safety_margin,
+            speaker_selection_brain=self._speaker_selection_brain,
+            global_style_prompt=self._global_rp_style_prompt,
+            always_call_orchestrator=self._always_call_orchestrator,
+        )
+        self._pulse_generator = PulseGenerator(
+            llm_chat=self.api.llm_chat,
+            brain=self._pulse_generation_brain,
+            max_tokens=self._pulse_max_tokens,
+            history_window=self._pulse_history_window,
         )
 
     async def _character_recall(
@@ -370,6 +434,33 @@ class CharacterChatPlugin(BasePlugin):
         if turn_sel not in ("autonomous", "round_robin"):
             turn_sel = "autonomous"
         self._turn_selection = turn_sel
+        self._speaker_selection_brain = str(
+            cfg.get("speaker_selection_brain", "e4b") or "e4b"
+        )
+        self._global_rp_style_prompt = str(
+            cfg.get("global_rp_style_prompt") or ""
+        ).strip()
+        self._always_call_orchestrator = bool(
+            cfg.get("always_call_orchestrator", False)
+        )
+        self._smart_pulses_enabled = bool(
+            cfg.get("smart_pulses_enabled", True)
+        )
+        self._pulse_generation_brain = str(
+            cfg.get("pulse_generation_brain", "e4b") or "e4b"
+        )
+        try:
+            self._pulse_history_window = max(
+                0, int(cfg.get("pulse_history_window", 6) or 6)
+            )
+        except (TypeError, ValueError):
+            self._pulse_history_window = 6
+        try:
+            self._pulse_max_tokens = max(
+                40, int(cfg.get("pulse_max_tokens", 200) or 200)
+            )
+        except (TypeError, ValueError):
+            self._pulse_max_tokens = 200
         self._proactive_pulses_enabled = bool(
             cfg.get("proactive_pulses_enabled", True)
         )
@@ -384,6 +475,14 @@ class CharacterChatPlugin(BasePlugin):
             )
         except (TypeError, ValueError):
             self._pulse_cooldown_seconds = 600.0
+        # Pulse staleness: skip pulse + sim if the session has been idle
+        # for longer than this. 0 disables the check entirely.
+        try:
+            self._pulse_session_stale_seconds = max(
+                0.0, float(cfg.get("pulse_session_stale_seconds", 21600) or 0)
+            )
+        except (TypeError, ValueError):
+            self._pulse_session_stale_seconds = 21600.0
 
         # Autonomous simulation defaults.
         try:
@@ -533,6 +632,140 @@ class CharacterChatPlugin(BasePlugin):
             },
         )
 
+        # ── Lorebook tools (Phase 9.8) ───────────────────────────────
+        self.api.register_tool(
+            name="lorebook_create",
+            handler=self._tool_lorebook_create,
+            description=(
+                "Erstelle ein neues Lorebook. scope=global|character|session, "
+                "scope_id ist die character_id (für character) oder "
+                "session_id (für session) — leer für global."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "scope": {
+                        "type": "string",
+                        "enum": ["global", "character", "session"],
+                    },
+                    "scope_id": {"type": "string"},
+                    "token_budget": {"type": "integer"},
+                },
+                "required": ["name"],
+            },
+        )
+        self.api.register_tool(
+            name="lorebook_list",
+            handler=self._tool_lorebook_list,
+            description="Liste alle Lorebooks (optional gefiltert nach scope/scope_id).",
+            schema={
+                "type": "object",
+                "properties": {
+                    "scope": {"type": "string"},
+                    "scope_id": {"type": "string"},
+                    "enabled_only": {"type": "boolean"},
+                },
+            },
+        )
+        self.api.register_tool(
+            name="lorebook_update",
+            handler=self._tool_lorebook_update,
+            description="Aktualisiere ein Lorebook (name/description/enabled/token_budget).",
+            schema={
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "enabled": {"type": "boolean"},
+                    "token_budget": {"type": "integer"},
+                },
+                "required": ["id"],
+            },
+        )
+        self.api.register_tool(
+            name="lorebook_delete",
+            handler=self._tool_lorebook_delete,
+            description="Lösche ein Lorebook + alle seine Einträge.",
+            schema={
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+            },
+        )
+        self.api.register_tool(
+            name="lore_entry_create",
+            handler=self._tool_lore_entry_create,
+            description=(
+                "Erstelle einen Eintrag in einem Lorebook. keys = Liste "
+                "von Trigger-Wörtern (case-insensitive Substring). "
+                "always_on=true → feuert jede Runde ohne Trigger. "
+                "position bestimmt wo im Prompt der Inhalt landet."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "lorebook_id": {"type": "string"},
+                    "name": {"type": "string"},
+                    "keys": {"type": "array", "items": {"type": "string"}},
+                    "content": {"type": "string"},
+                    "position": {
+                        "type": "string",
+                        "enum": list(VALID_POSITIONS),
+                    },
+                    "priority": {"type": "integer"},
+                    "always_on": {"type": "boolean"},
+                    "scan_depth": {"type": "integer"},
+                },
+                "required": ["lorebook_id", "name"],
+            },
+        )
+        self.api.register_tool(
+            name="lore_entry_list",
+            handler=self._tool_lore_entry_list,
+            description="Liste alle Einträge eines Lorebooks.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "lorebook_id": {"type": "string"},
+                    "enabled_only": {"type": "boolean"},
+                },
+                "required": ["lorebook_id"],
+            },
+        )
+        self.api.register_tool(
+            name="lore_entry_update",
+            handler=self._tool_lore_entry_update,
+            description="Aktualisiere einen Lore-Eintrag.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "name": {"type": "string"},
+                    "keys": {"type": "array", "items": {"type": "string"}},
+                    "content": {"type": "string"},
+                    "position": {"type": "string"},
+                    "priority": {"type": "integer"},
+                    "always_on": {"type": "boolean"},
+                    "scan_depth": {"type": "integer"},
+                    "enabled": {"type": "boolean"},
+                },
+                "required": ["id"],
+            },
+        )
+        self.api.register_tool(
+            name="lore_entry_delete",
+            handler=self._tool_lore_entry_delete,
+            description="Lösche einen Lore-Eintrag.",
+            schema={
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+            },
+        )
+
         # WebSocket handlers
         self.api.register_ws_handler("character_list", self._ws_list_characters)
         self.api.register_ws_handler("character_create", self._ws_create_character)
@@ -546,6 +779,18 @@ class CharacterChatPlugin(BasePlugin):
         self.api.register_ws_handler("character_detach", self._ws_detach_character)
         self.api.register_ws_handler("character_turn_request", self._ws_run_round)
         self.api.register_ws_handler("character_history", self._ws_history)
+        # Per-turn editing — Mike's audit point #3: at parity with how
+        # Lexy's normal-chat bubbles can be edited / deleted /
+        # regenerated. The frontend bubble action bar dispatches these.
+        self.api.register_ws_handler(
+            "character_turn_edit", self._ws_turn_edit
+        )
+        self.api.register_ws_handler(
+            "character_turn_delete", self._ws_turn_delete
+        )
+        self.api.register_ws_handler(
+            "character_turn_regenerate", self._ws_turn_regenerate
+        )
         self.api.register_ws_handler("character_import", self._ws_import_card)
         self.api.register_ws_handler("character_session_get", self._ws_session_get)
         self.api.register_ws_handler("character_session_set", self._ws_session_set)
@@ -553,6 +798,31 @@ class CharacterChatPlugin(BasePlugin):
         self.api.register_ws_handler("simulation_stop", self._ws_simulation_stop)
         self.api.register_ws_handler(
             "simulation_status_get", self._ws_simulation_status_get
+        )
+        # Lorebook WS handlers — frontend admin panel uses these.
+        self.api.register_ws_handler(
+            "lorebook_list", self._ws_lorebook_list,
+        )
+        self.api.register_ws_handler(
+            "lorebook_create", self._ws_lorebook_create,
+        )
+        self.api.register_ws_handler(
+            "lorebook_update", self._ws_lorebook_update,
+        )
+        self.api.register_ws_handler(
+            "lorebook_delete", self._ws_lorebook_delete,
+        )
+        self.api.register_ws_handler(
+            "lore_entry_list", self._ws_lore_entry_list,
+        )
+        self.api.register_ws_handler(
+            "lore_entry_create", self._ws_lore_entry_create,
+        )
+        self.api.register_ws_handler(
+            "lore_entry_update", self._ws_lore_entry_update,
+        )
+        self.api.register_ws_handler(
+            "lore_entry_delete", self._ws_lore_entry_delete,
         )
 
         # Hook: intercept user messages before the normal agent runs them.
@@ -840,6 +1110,13 @@ class CharacterChatPlugin(BasePlugin):
         if kind == "autonomous_sim":
             sim_session = str(action.get("session_id") or "")
             if sim_session:
+                if self._is_session_stale(sim_session):
+                    log.debug(
+                        "character_chat.sim_skipped_stale_session "
+                        "session=%s threshold=%.0fs",
+                        sim_session, self._pulse_session_stale_seconds,
+                    )
+                    return
                 asyncio.create_task(
                     self._run_autonomous_tick(sim_session),
                     name=f"character_chat.sim_tick.{sim_session}",
@@ -871,16 +1148,55 @@ class CharacterChatPlugin(BasePlugin):
                 self._pulse_cooldown_seconds - (now - last_pulse),
             )
             return
+
+        # Staleness guard: skip pulses for sessions Mike hasn't touched
+        # in a while. Without this, a character with a 2h pulse pattern
+        # would keep firing forever even though the user moved on days
+        # ago — wasting LLM calls and producing ghost-replies for
+        # sessions no one is reading. Resumes automatically when the
+        # user comes back (any new user message updates session
+        # ``meta.updated_at``).
+        if self._is_session_stale(session_id):
+            log.info(
+                "character_chat.pulse_skipped_stale_session "
+                "character=%s session=%s threshold=%.0fs",
+                character_id, session_id, self._pulse_session_stale_seconds,
+            )
+            return
+
         self._pulse_cooldowns[session_id] = now
 
-        # Resolve the card so we can enrich the pulse text with an
-        # age-stage-appropriate default when none is supplied.
+        # Resolve the card so we can enrich the pulse text. Fallback chain:
+        #   1. ``pulse_text`` from the scheduler payload (legacy / manual)
+        #   2. ``card.proactive_pulse_prompt`` (per-character override)
+        #   3. LLM-generated text via PulseGenerator (smart_pulses_enabled)
+        #   4. Static age-stage default (last resort, original behaviour)
         if self._store is not None and not pulse_text:
             card = await self._store.get(character_id)
             if card is not None:
-                pulse_text = card.proactive_pulse_prompt or _default_pulse(
-                    card.age_stage
-                )
+                if card.proactive_pulse_prompt:
+                    pulse_text = card.proactive_pulse_prompt
+                elif self._smart_pulses_enabled and self._pulse_generator is not None:
+                    others = await self._store.list_in_session(session_id)
+                    history = self._load_session_history(session_id)
+                    sess_state = await self._get_session_state(session_id)
+                    scene = str(sess_state.get("scene") or "")
+                    try:
+                        pulse_text = await self._pulse_generator.generate(
+                            character=card,
+                            others_in_session=others,
+                            recent_history=history,
+                            scene=scene,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning(
+                            "character_chat.pulse_generator_failed character=%s error=%s",
+                            card.name,
+                            str(exc),
+                        )
+                        pulse_text = ""
+                if not pulse_text:
+                    pulse_text = _default_pulse(card.age_stage)
 
         if not pulse_text:
             pulse_text = "*bemerkt etwas und bewegt sich*"
@@ -1185,6 +1501,8 @@ class CharacterChatPlugin(BasePlugin):
                 # Register proactive pulse timer if the card has a pattern.
                 if saved.proactive_pulse_pattern and self._proactive_pulses_enabled:
                     await self._register_pulse_timer(saved, session_id)
+                # Phase 9.12: same auto-tag as ``_tool_attach_character``.
+                await self._maybe_tag_session_rp(session_id)
             except Exception as exc:  # noqa: BLE001
                 log.warning(
                     "character_chat.spawn_auto_attach_failed",
@@ -1265,11 +1583,47 @@ class CharacterChatPlugin(BasePlugin):
         if updated is None:
             return {"ok": False, "error": "not_found"}
         await self._broadcast_character_event("character_updated", updated)
+        # Phase 9.12 — auto-tag the session as ``kind="rp"``. Lazy
+        # migration: old chat-only sessions are upgraded the first time
+        # someone attaches a character, so existing roleplay sessions
+        # show up in the new RP tab without a one-shot migration script.
+        # ``set_kind`` is idempotent (returns False on no-change) so we
+        # only broadcast when it actually flips.
+        await self._maybe_tag_session_rp(session_id)
         # If the card has a proactive-pulse pattern, register it with the
         # scheduler now (idempotent: duplicate attach simply re-registers).
         if updated.proactive_pulse_pattern:
             await self._register_pulse_timer(updated, session_id)
         return {"ok": True, "character": _card_to_public(updated)}
+
+    async def _maybe_tag_session_rp(self, session_id: str) -> None:
+        """Flip ``meta.kind`` to ``"rp"`` when a character first joins.
+
+        Silent no-op if the session store can't be reached (tests that
+        stub the api), if the session doesn't exist yet, or if the kind
+        was already ``"rp"``. Broadcasts ``session_kind_changed`` only
+        when an actual flip happened so stale tabs can re-route.
+        """
+        if not session_id:
+            return
+        session_store = getattr(self.api._app, "session_store", None)
+        if session_store is None:
+            return
+        try:
+            changed = session_store.set_kind(session_id, "rp")
+        except (ValueError, AttributeError):
+            return
+        if changed:
+            try:
+                await self.api.ws_broadcast(
+                    {
+                        "type": "session_kind_changed",
+                        "session_id": session_id,
+                        "kind": "rp",
+                    }
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
     async def _tool_detach_character(
         self, id: str, session_id: str
@@ -1421,16 +1775,60 @@ class CharacterChatPlugin(BasePlugin):
 
     async def _tool_import_card(
         self,
-        payload: dict[str, Any],
+        payload: dict[str, Any] | None = None,
+        png_b64: str = "",
+        filename: str = "",
+        content_type: str = "",
         color: str = "",
         age_stage: str = "adult",
     ) -> dict[str, Any]:
+        """Import a Silly-Tavern character card.
+
+        Three input forms — exactly one must be supplied:
+
+        * ``payload`` — JSON dict (the v1 flat or v2 ``{spec,data}`` shape).
+        * ``png_b64`` — base64-encoded PNG bytes carrying a ``chara``
+          tEXt chunk (Silly-Tavern PNG card). The image itself is
+          written to the avatar directory and bound to the new character.
+        * (REST upload) — handled by the gateway endpoint, not here.
+        """
         if self._store is None:
             return {"ok": False, "error": "store_not_ready"}
+        # Resolve the avatar directory from the gateway's well-known
+        # constant so PNG cards get their picture rendered next to
+        # uploaded avatars. Lazy import avoids a hard dep cycle in
+        # plugin-only tests.
+        from pathlib import Path
+        avatar_dir = Path("data/plugins/character_chat/avatars")
+
         try:
-            saved = await self._store.import_silly_tavern(
-                payload, color=color or None, age_stage=age_stage
-            )
+            if png_b64:
+                import base64
+                try:
+                    raw = base64.b64decode(png_b64, validate=False)
+                except Exception as exc:  # noqa: BLE001
+                    return {
+                        "ok": False,
+                        "error": f"png_b64 not valid base64: {exc}",
+                    }
+                saved = await self._store.import_silly_tavern_bytes(
+                    raw,
+                    filename=filename or "card.png",
+                    content_type=content_type or "image/png",
+                    color=color or None,
+                    age_stage=age_stage,
+                    avatar_dir=avatar_dir,
+                )
+            elif payload is not None:
+                saved = await self._store.import_silly_tavern(
+                    payload, color=color or None, age_stage=age_stage,
+                )
+            else:
+                return {
+                    "ok": False,
+                    "error": "either 'payload' (JSON dict) or "
+                             "'png_b64' (base64 PNG) is required",
+                }
         except CharacterCardError as exc:
             return {"ok": False, "error": str(exc)}
         await self._broadcast_character_event("character_created", saved)
@@ -1455,6 +1853,38 @@ class CharacterChatPlugin(BasePlugin):
 
             history = self._load_session_history(session_id)
 
+            # Pulse-mention propagation: if the pulse text addresses another
+            # character by name (NL detection — same parser used for user
+            # messages), push them into ``extra_forced`` so they answer in
+            # the SAME round as the pulse. Without this they'd only see the
+            # pulse as background context and stay silent.
+            extra_forced: list[str] = []
+            if pulse_text and pulse_from_id:
+                extra_forced = parse_nl_mentions(pulse_text, characters)
+                # Strip self-mentions defensively.
+                extra_forced = [
+                    cid for cid in extra_forced if cid != pulse_from_id
+                ]
+                if extra_forced:
+                    log.info(
+                        "character_chat.pulse_mention_propagated from=%s to=%s",
+                        pulse_from_id,
+                        extra_forced,
+                    )
+
+            # Pre-resolve lorebook activations per speaker. We do this
+            # here (in the plugin, which owns the LorebookStore) so the
+            # orchestrator stays DB-agnostic. The engine is cheap — a
+            # cache-friendly substring scan plus list assembly — so
+            # running it once per character per round is fine.
+            lore_by_speaker = await self._resolve_lore_per_speaker(
+                characters=characters,
+                session_id=session_id,
+                history=history,
+                user_message=user_message,
+                pulse_text=pulse_text,
+            )
+
             req = GroupTurnRequest(
                 session_id=session_id,
                 history=history,
@@ -1463,6 +1893,8 @@ class CharacterChatPlugin(BasePlugin):
                 pulse_from_id=pulse_from_id,
                 pulse_text=pulse_text,
                 scene=scene,
+                extra_forced=extra_forced,
+                lore_by_speaker=lore_by_speaker,
             )
 
             round_id = uuid.uuid4().hex[:12]
@@ -1754,6 +2186,443 @@ class CharacterChatPlugin(BasePlugin):
             }
         )
 
+    # ─── Per-turn edit / delete / regenerate ────────────────────────────
+    #
+    # Mike's audit point #3: at parity with Lexy's normal-chat bubbles,
+    # character bubbles must support edit / delete / regenerate. All
+    # three round-trip through these WS handlers; the frontend's
+    # `appendCharacterTurn` action bar dispatches them.
+
+    async def _fetch_turn_row(
+        self, turn_id: str
+    ) -> dict[str, Any] | None:
+        """Read a single character_turns row by id."""
+        if not turn_id:
+            return None
+        db = await self.api.get_db()
+        async with db.execute(
+            "SELECT id, session_id, character_id, character_name, round_id, "
+            "order_num, content, skipped, trigger_kind, trigger_text, "
+            "created_at FROM character_turns WHERE id = ?",
+            (turn_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row[0],
+            "session_id": row[1],
+            "character_id": row[2],
+            "character_name": row[3],
+            "round_id": row[4],
+            "order": int(row[5] or 0),
+            "content": row[6],
+            "skipped": bool(row[7]),
+            "trigger_kind": row[8],
+            "trigger_text": row[9],
+            "created_at": float(row[10]),
+        }
+
+    async def _ws_turn_edit(
+        self, client: Any, message: dict[str, Any]
+    ) -> None:
+        """Replace a turn's text. Used by the inline edit form."""
+        turn_id = str(message.get("turn_id") or "")
+        new_content = str(message.get("content") or "")
+        if not turn_id or not new_content.strip():
+            await client.send_json(
+                {"type": "character_turn_edit_ack", "ok": False,
+                 "error": "turn_id and non-empty content required"}
+            )
+            return
+        existing = await self._fetch_turn_row(turn_id)
+        if existing is None:
+            await client.send_json(
+                {"type": "character_turn_edit_ack", "ok": False,
+                 "error": "turn not found"}
+            )
+            return
+        db = await self.api.get_db()
+        await db.execute(
+            "UPDATE character_turns SET content = ?, skipped = 0 "
+            "WHERE id = ?",
+            (new_content, turn_id),
+        )
+        await db.commit()
+        # Broadcast so all open tabs render the new text.
+        await self.api.ws_broadcast(
+            {
+                "type": "character_turn_updated",
+                "session_id": existing["session_id"],
+                "round_id": existing["round_id"],
+                "turn_id": turn_id,
+                "character_id": existing["character_id"],
+                "character_name": existing["character_name"],
+                "content": new_content,
+                "skipped": False,
+            }
+        )
+        await client.send_json(
+            {"type": "character_turn_edit_ack", "ok": True, "turn_id": turn_id}
+        )
+
+    async def _ws_turn_delete(
+        self, client: Any, message: dict[str, Any]
+    ) -> None:
+        """Remove a single character_turn row + broadcast deletion."""
+        turn_id = str(message.get("turn_id") or "")
+        if not turn_id:
+            await client.send_json(
+                {"type": "character_turn_delete_ack", "ok": False,
+                 "error": "turn_id required"}
+            )
+            return
+        existing = await self._fetch_turn_row(turn_id)
+        if existing is None:
+            await client.send_json(
+                {"type": "character_turn_delete_ack", "ok": False,
+                 "error": "turn not found"}
+            )
+            return
+        db = await self.api.get_db()
+        await db.execute(
+            "DELETE FROM character_turns WHERE id = ?", (turn_id,),
+        )
+        await db.commit()
+        await self.api.ws_broadcast(
+            {
+                "type": "character_turn_deleted",
+                "session_id": existing["session_id"],
+                "round_id": existing["round_id"],
+                "turn_id": turn_id,
+            }
+        )
+        await client.send_json(
+            {"type": "character_turn_delete_ack", "ok": True, "turn_id": turn_id}
+        )
+
+    async def _ws_turn_regenerate(
+        self, client: Any, message: dict[str, Any]
+    ) -> None:
+        """Drop a turn and re-run JUST that single character's response.
+
+        Strategy: load the deleted turn's round context (other turns of
+        the same round that came BEFORE it), then call
+        ``_run_single_turn`` on the character with the round's original
+        trigger. Result lands as a new ``character_turn`` broadcast +
+        DB row, and the old turn is gone — UI replaces accordingly.
+        """
+        turn_id = str(message.get("turn_id") or "")
+        if not turn_id or self._store is None or self._orchestrator is None:
+            await client.send_json(
+                {"type": "character_turn_regenerate_ack", "ok": False,
+                 "error": "turn_id required / plugin not ready"}
+            )
+            return
+        existing = await self._fetch_turn_row(turn_id)
+        if existing is None:
+            await client.send_json(
+                {"type": "character_turn_regenerate_ack", "ok": False,
+                 "error": "turn not found"}
+            )
+            return
+
+        session_id = existing["session_id"]
+        round_id = existing["round_id"]
+        char_id = existing["character_id"]
+
+        # Load the same character's card + the other speakers in the round
+        # so the prompt builder can render "Reaktionen dieser Runde".
+        card = await self._store.get(char_id)
+        if card is None:
+            await client.send_json(
+                {"type": "character_turn_regenerate_ack", "ok": False,
+                 "error": "character no longer exists"}
+            )
+            return
+
+        db = await self.api.get_db()
+        async with db.execute(
+            "SELECT id, character_id, character_name, content, skipped, "
+            "order_num FROM character_turns "
+            "WHERE round_id = ? AND id != ? "
+            "ORDER BY order_num ASC",
+            (round_id, turn_id),
+        ) as cur:
+            siblings = list(await cur.fetchall())
+        prior_turns = [
+            CharacterTurn(
+                character_id=row[1], character_name=row[2],
+                content=row[3] or "", skipped=bool(row[4]),
+                order=int(row[5] or 0),
+            )
+            for row in siblings
+            if int(row[5] or 0) < int(existing["order"] or 0)
+        ]
+
+        # Drop the old row + tell the UI it's gone before we generate the
+        # replacement (so tabs show a brief "regenerating…" state).
+        await db.execute(
+            "DELETE FROM character_turns WHERE id = ?", (turn_id,),
+        )
+        await db.commit()
+        await self.api.ws_broadcast(
+            {
+                "type": "character_turn_deleted",
+                "session_id": session_id, "round_id": round_id,
+                "turn_id": turn_id,
+            }
+        )
+
+        # Reconstruct a minimal GroupTurnRequest with the original trigger
+        # so the prompt builder picks the same "Impuls" / "User"-Variante.
+        all_chars = await self._store.list_in_session(session_id)
+        history = self._load_session_history(session_id)
+        trigger_kind = (existing.get("trigger_kind") or "").lower()
+        trigger_text = existing.get("trigger_text") or ""
+        user_msg = ""
+        pulse_from = ""
+        pulse_text = ""
+        if trigger_kind == "user":
+            user_msg = trigger_text
+        elif trigger_kind == "pulse":
+            # trigger_text is "[char_id] *pulse text*" per _describe_trigger
+            if trigger_text.startswith("["):
+                close = trigger_text.find("]")
+                if close > 0:
+                    pulse_from = trigger_text[1:close].strip()
+                    pulse_text = trigger_text[close + 1 :].strip()
+        sess_state = await self._get_session_state(session_id)
+        scene = str(sess_state.get("scene") or "")
+        req = GroupTurnRequest(
+            session_id=session_id,
+            history=history,
+            characters=all_chars,
+            user_message=user_msg,
+            pulse_from_id=pulse_from,
+            pulse_text=pulse_text,
+            scene=scene,
+        )
+        try:
+            new_turn = await self._orchestrator._run_single_turn(
+                card=card,
+                order=int(existing["order"] or 0),
+                previous_turns=prior_turns,
+                req=req,
+                all_cards=all_chars,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "character_chat.regenerate_failed turn_id=%s error=%s",
+                turn_id, exc,
+            )
+            await client.send_json(
+                {"type": "character_turn_regenerate_ack", "ok": False,
+                 "error": f"regeneration failed: {exc}"}
+            )
+            return
+
+        # Persist + broadcast as a normal turn so UI re-renders the bubble.
+        await self._persist_and_broadcast_turns(
+            session_id=session_id,
+            round_id=round_id,
+            trigger_kind=existing.get("trigger_kind") or "user",
+            trigger_text=trigger_text,
+            turns=[new_turn],
+        )
+        await client.send_json(
+            {"type": "character_turn_regenerate_ack", "ok": True,
+             "turn_id": turn_id, "session_id": session_id}
+        )
+
+    # ─── Lorebook tools (Phase 9.8) ─────────────────────────────────────
+
+    def _lore(self) -> LorebookStore:
+        if self._lore_store is None:
+            raise RuntimeError("lorebook store not initialised")
+        return self._lore_store
+
+    async def _tool_lorebook_create(
+        self,
+        name: str,
+        description: str = "",
+        scope: str = "global",
+        scope_id: str = "",
+        token_budget: int = 1500,
+    ) -> dict[str, Any]:
+        try:
+            book = await self._lore().create_lorebook(
+                name=name, description=description, scope=scope,
+                scope_id=scope_id, token_budget=int(token_budget),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        await self.api.ws_broadcast(
+            {"type": "lorebook_created", "book": book.to_public()}
+        )
+        return {"ok": True, "book": book.to_public()}
+
+    async def _tool_lorebook_list(
+        self,
+        scope: str | None = None,
+        scope_id: str | None = None,
+        enabled_only: bool = False,
+    ) -> dict[str, Any]:
+        try:
+            books = await self._lore().list_lorebooks(
+                scope=scope, scope_id=scope_id,
+                enabled_only=bool(enabled_only),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "books": [b.to_public() for b in books]}
+
+    async def _tool_lorebook_update(
+        self, id: str, **patch: Any  # noqa: A002
+    ) -> dict[str, Any]:
+        try:
+            book = await self._lore().update_lorebook(id, **patch)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        if book is None:
+            return {"ok": False, "error": "lorebook not found"}
+        await self.api.ws_broadcast(
+            {"type": "lorebook_updated", "book": book.to_public()}
+        )
+        return {"ok": True, "book": book.to_public()}
+
+    async def _tool_lorebook_delete(self, id: str) -> dict[str, Any]:  # noqa: A002
+        ok = await self._lore().delete_lorebook(id)
+        if ok:
+            await self.api.ws_broadcast(
+                {"type": "lorebook_deleted", "id": id}
+            )
+        return {"ok": ok}
+
+    async def _tool_lore_entry_create(
+        self,
+        lorebook_id: str,
+        name: str,
+        keys: list[str] | None = None,
+        content: str = "",
+        position: str = "before_scenario",
+        priority: int = 100,
+        always_on: bool = False,
+        scan_depth: int = 4,
+    ) -> dict[str, Any]:
+        try:
+            entry = await self._lore().create_entry(
+                lorebook_id=lorebook_id, name=name,
+                keys=list(keys or []), content=content,
+                position=position, priority=int(priority),
+                always_on=bool(always_on),
+                scan_depth=int(scan_depth),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        await self.api.ws_broadcast(
+            {"type": "lore_entry_created", "entry": entry.to_public()}
+        )
+        return {"ok": True, "entry": entry.to_public()}
+
+    async def _tool_lore_entry_list(
+        self,
+        lorebook_id: str,
+        enabled_only: bool = False,
+    ) -> dict[str, Any]:
+        try:
+            entries = await self._lore().list_entries(
+                lorebook_id=lorebook_id,
+                enabled_only=bool(enabled_only),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        return {
+            "ok": True,
+            "entries": [e.to_public() for e in entries],
+        }
+
+    async def _tool_lore_entry_update(
+        self, id: str, **patch: Any  # noqa: A002
+    ) -> dict[str, Any]:
+        try:
+            entry = await self._lore().update_entry(id, **patch)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        if entry is None:
+            return {"ok": False, "error": "lore entry not found"}
+        await self.api.ws_broadcast(
+            {"type": "lore_entry_updated", "entry": entry.to_public()}
+        )
+        return {"ok": True, "entry": entry.to_public()}
+
+    async def _tool_lore_entry_delete(self, id: str) -> dict[str, Any]:  # noqa: A002
+        ok = await self._lore().delete_entry(id)
+        if ok:
+            await self.api.ws_broadcast(
+                {"type": "lore_entry_deleted", "id": id}
+            )
+        return {"ok": ok}
+
+    # ─── Lorebook WS handlers ──────────────────────────────────────────
+
+    async def _ws_lorebook_list(self, client: Any, message: dict[str, Any]) -> None:
+        result = await self._tool_lorebook_list(
+            scope=message.get("scope"),
+            scope_id=message.get("scope_id"),
+            enabled_only=bool(message.get("enabled_only", False)),
+        )
+        await client.send_json({"type": "lorebook_list", **result})
+
+    async def _ws_lorebook_create(self, client: Any, message: dict[str, Any]) -> None:
+        payload = {k: v for k, v in message.items() if k != "type"}
+        result = await self._tool_lorebook_create(**payload)
+        await client.send_json({"type": "lorebook_create_ack", **result})
+
+    async def _ws_lorebook_update(self, client: Any, message: dict[str, Any]) -> None:
+        book_id = str(message.get("id") or "")
+        if not book_id:
+            await client.send_json(
+                {"type": "lorebook_update_ack", "ok": False, "error": "id required"}
+            )
+            return
+        patch = {k: v for k, v in message.items() if k not in ("type", "id")}
+        result = await self._tool_lorebook_update(id=book_id, **patch)
+        await client.send_json({"type": "lorebook_update_ack", **result})
+
+    async def _ws_lorebook_delete(self, client: Any, message: dict[str, Any]) -> None:
+        book_id = str(message.get("id") or "")
+        result = await self._tool_lorebook_delete(id=book_id)
+        await client.send_json({"type": "lorebook_delete_ack", **result})
+
+    async def _ws_lore_entry_list(self, client: Any, message: dict[str, Any]) -> None:
+        result = await self._tool_lore_entry_list(
+            lorebook_id=str(message.get("lorebook_id") or ""),
+            enabled_only=bool(message.get("enabled_only", False)),
+        )
+        await client.send_json({"type": "lore_entry_list", **result})
+
+    async def _ws_lore_entry_create(self, client: Any, message: dict[str, Any]) -> None:
+        payload = {k: v for k, v in message.items() if k != "type"}
+        result = await self._tool_lore_entry_create(**payload)
+        await client.send_json({"type": "lore_entry_create_ack", **result})
+
+    async def _ws_lore_entry_update(self, client: Any, message: dict[str, Any]) -> None:
+        entry_id = str(message.get("id") or "")
+        if not entry_id:
+            await client.send_json(
+                {"type": "lore_entry_update_ack", "ok": False, "error": "id required"}
+            )
+            return
+        patch = {k: v for k, v in message.items() if k not in ("type", "id")}
+        result = await self._tool_lore_entry_update(id=entry_id, **patch)
+        await client.send_json({"type": "lore_entry_update_ack", **result})
+
+    async def _ws_lore_entry_delete(self, client: Any, message: dict[str, Any]) -> None:
+        entry_id = str(message.get("id") or "")
+        result = await self._tool_lore_entry_delete(id=entry_id)
+        await client.send_json({"type": "lore_entry_delete_ack", **result})
+
     # ─── Persistence of turns ────────────────────────────────────────────
 
     async def _persist_and_broadcast_turns(
@@ -1769,6 +2638,35 @@ class CharacterChatPlugin(BasePlugin):
         now = time.time()
         for t in turns:
             turn_id = uuid.uuid4().hex[:12]
+
+            # Strip any <state>...</state> block from the visible content and
+            # apply the parsed state diff to the character. We mutate the turn
+            # object in place so downstream broadcasts and the DB row see the
+            # cleaned content, never the raw block.
+            if not t.skipped and t.content:
+                cleaned, state_updates = parse_state_block(t.content)
+                if cleaned != t.content:
+                    t.content = cleaned
+                if state_updates and self._store is not None:
+                    try:
+                        current = await self._store.get(t.character_id)
+                        if current is not None:
+                            merged = merge_state(current.state, state_updates)
+                            await self._store.update(
+                                t.character_id, state=merged
+                            )
+                            log.info(
+                                "character_chat.state_updated character=%s "
+                                "updates=%s",
+                                t.character_name,
+                                state_updates,
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning(
+                            "character_chat.state_update_failed character=%s error=%s",
+                            t.character_name,
+                            str(exc),
+                        )
             await db.execute(
                 "INSERT INTO character_turns (id, session_id, character_id, "
                 "character_name, round_id, order_num, content, skipped, "
@@ -2049,9 +2947,18 @@ class CharacterChatPlugin(BasePlugin):
             log.warning("character_chat.rehydrate_list_failed error=%s", exc)
             result = {"ok": False}
 
-        items: list[dict[str, Any]] = []
-        if result.get("ok"):
-            items = result.get("data", {}).get("items", []) or []
+        # Pre-9.6 bug: this code read ``data["items"]`` but the scheduler
+        # tool returns ``data["timers"]``. As a result Phase 1 always saw
+        # an empty list and Phase 2 happily registered a fresh timer for
+        # every (char, session) pair on every restart — accumulating 18,
+        # 45, 66 duplicates over time. We now read both keys defensively
+        # so an older / customised scheduler still works.
+        data: dict[str, Any] = (result.get("data") or {}) if result.get("ok") else {}
+        items: list[dict[str, Any]] = list(
+            data.get("timers")
+            or data.get("items")
+            or []
+        )
 
         # Collect ALL character_pulse timers from the scheduler, keyed by
         # (character_id, session_id). If there are DUPLICATES for the same
@@ -2092,24 +2999,56 @@ class CharacterChatPlugin(BasePlugin):
             pair = (character_id, session_id)
             by_pair.setdefault(pair, []).append(timer_id)
 
-        # Restore autonomous_sim timers — one per session, dedupe duplicates.
+        # Resolve known-alive sessions from the SessionStore so we can
+        # cancel timers whose session is gone (Mike's "scheduler bloat"
+        # came from stale session_ids from old experiments).
+        known_sessions: set[str] = set()
+        try:
+            session_store = getattr(self.api._app, "session_store", None)
+            if session_store is not None:
+                known_sessions = set(session_store.sessions())
+        except Exception:  # noqa: BLE001
+            known_sessions = set()
+
+        # Restore autonomous_sim timers — one per session, dedupe duplicates,
+        # AND drop any timer whose session no longer exists.
         sim_restored = 0
+        sim_cancelled = 0
         for sim_session, sim_ids in sim_by_session.items():
+            session_alive = (
+                not known_sessions or sim_session in known_sessions
+            )
+            if not session_alive:
+                # Session is gone — cancel ALL sim timers for it.
+                for dup in sim_ids:
+                    try:
+                        await self.api.call_tool("cancel_timer", {"id": dup})
+                        sim_cancelled += 1
+                    except Exception:  # noqa: BLE001
+                        pass
+                continue
             keeper = sim_ids[-1]
             for dup in sim_ids[:-1]:
                 try:
                     await self.api.call_tool("cancel_timer", {"id": dup})
+                    sim_cancelled += 1
                 except Exception:  # noqa: BLE001
                     pass
             self._simulation_timers[sim_session] = keeper
             sim_restored += 1
-        if sim_restored:
+        if sim_restored or sim_cancelled:
             log.info(
-                "character_chat.sim_timers_rehydrated count=%d", sim_restored
+                "character_chat.sim_timers_rehydrated restored=%d cancelled=%d",
+                sim_restored, sim_cancelled,
             )
 
         restored = 0
         stale: list[str] = []
+        stale_reasons: dict[str, int] = {
+            "dead_character": 0,
+            "dead_session": 0,
+            "duplicate": 0,
+        }
         for pair, timer_ids in by_pair.items():
             character_id, session_id = pair
             # Check if the character is still alive.
@@ -2124,12 +3063,23 @@ class CharacterChatPlugin(BasePlugin):
             if not alive:
                 # Cancel ALL timers for this dead character.
                 stale.extend(timer_ids)
+                stale_reasons["dead_character"] += len(timer_ids)
+                continue
+
+            # Cancel timers whose session no longer exists. We only
+            # apply this when the SessionStore reported at least one
+            # known session — otherwise a brand-new install would
+            # cancel everything by mistake.
+            if known_sessions and session_id not in known_sessions:
+                stale.extend(timer_ids)
+                stale_reasons["dead_session"] += len(timer_ids)
                 continue
 
             # Keep the LAST timer, cancel all duplicates.
             keeper = timer_ids[-1]
             for dup in timer_ids[:-1]:
                 stale.append(dup)
+                stale_reasons["duplicate"] += 1
             self._pulse_timers[pair] = keeper
             restored += 1
 
@@ -2141,11 +3091,13 @@ class CharacterChatPlugin(BasePlugin):
                 pass
 
         log.info(
-            "character_chat.pulse_timers_rehydrated restored=%d stale=%d "
-            "duplicates_cancelled=%d",
+            "character_chat.pulse_timers_rehydrated restored=%d "
+            "cancelled=%d (dead_char=%d dead_session=%d dup=%d)",
             restored,
-            len(stale) - (len(stale) - sum(1 for _ in stale)),
             len(stale),
+            stale_reasons["dead_character"],
+            stale_reasons["dead_session"],
+            stale_reasons["duplicate"],
         )
 
         # ── Phase 2: Create missing timers for attached characters ────
@@ -2164,12 +3116,47 @@ class CharacterChatPlugin(BasePlugin):
             return
 
         created = 0
+        pruned_sessions: list[tuple[str, str]] = []
         for card in all_chars:
             if not card.proactive_pulse_pattern:
                 continue
+            # Auto-prune ``active_sessions`` entries that reference
+            # sessions which no longer exist. Otherwise Phase 2 would
+            # keep registering fresh timers for dead sessions on every
+            # restart — that's exactly the leak Mike saw (18 timers
+            # for Lena across 2 sessions, multiplied by every previous
+            # restart). A clean active_sessions list also prevents
+            # similar leaks from any future feature that iterates over it.
+            if known_sessions:
+                live_sessions_for_card = [
+                    s for s in card.active_sessions if s in known_sessions
+                ]
+                if len(live_sessions_for_card) != len(card.active_sessions):
+                    dropped = [
+                        s for s in card.active_sessions
+                        if s not in known_sessions
+                    ]
+                    try:
+                        await store.update(
+                            card.id, active_sessions=live_sessions_for_card,
+                        )
+                        for s in dropped:
+                            pruned_sessions.append((card.name, s))
+                        card.active_sessions = live_sessions_for_card
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning(
+                            "character_chat.prune_active_sessions_failed "
+                            "character=%s error=%s",
+                            card.name, exc,
+                        )
             for sid in card.active_sessions:
                 if (card.id, sid) in self._pulse_timers:
                     continue  # already rehydrated from Phase 1
+                # Skip dead sessions defensively (covered by the prune
+                # above when ``known_sessions`` is populated, but the
+                # prune is best-effort).
+                if known_sessions and sid not in known_sessions:
+                    continue
                 try:
                     timer_id = await self._register_pulse_timer(card, sid)
                     if timer_id:
@@ -2182,12 +3169,124 @@ class CharacterChatPlugin(BasePlugin):
                         sid,
                         exc,
                     )
-        if created:
+        if created or pruned_sessions:
             log.info(
-                "character_chat.pulse_timers_ensured created=%d", created
+                "character_chat.pulse_timers_ensured created=%d "
+                "pruned_sessions=%d",
+                created, len(pruned_sessions),
             )
+            if pruned_sessions:
+                log.info(
+                    "character_chat.pruned_stale_active_sessions: %s",
+                    pruned_sessions[:20],
+                )
 
     # ─── Helpers ─────────────────────────────────────────────────────────
+
+    async def _resolve_lore_per_speaker(
+        self,
+        *,
+        characters: list[CharacterCard],
+        session_id: str,
+        history: list[dict[str, Any]],
+        user_message: str,
+        pulse_text: str,
+    ) -> dict[str, Any]:
+        """Pre-compute :class:`ActivationResult` per character_id.
+
+        Returns ``{char_id: ActivationResult}`` for every alive character
+        in the round. The engine handles per-character filtering of
+        scope=character books; we hand it the full visible list so a
+        single DB read covers all speakers.
+        """
+        out: dict[str, Any] = {}
+        if self._lore_store is None:
+            return out
+        # Pull all books visible to this session: global + session-scoped
+        # for this session + character-scoped for ANY of the speakers.
+        # We over-fetch slightly (more books than we'll filter to per
+        # speaker) but that's still one DB round-trip total.
+        try:
+            all_books = await self._lore_store.list_lorebooks(enabled_only=True)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("character_chat.lore_list_failed error=%s", exc)
+            return out
+        if not all_books:
+            return out
+
+        speaker_ids = {c.id for c in characters}
+        # Pre-filter to books we might use: global, character (in this round),
+        # session (this session).
+        candidate_books = [
+            b for b in all_books
+            if (
+                b.scope == SCOPE_GLOBAL
+                or (b.scope == SCOPE_CHARACTER and b.scope_id in speaker_ids)
+                or (b.scope == SCOPE_SESSION and b.scope_id == session_id)
+            )
+        ]
+        if not candidate_books:
+            return out
+
+        # Pre-fetch entries for every candidate book.
+        entries_by_book: dict[str, list[Any]] = {}
+        for book in candidate_books:
+            try:
+                entries_by_book[book.id] = await self._lore_store.list_entries(
+                    lorebook_id=book.id, enabled_only=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "character_chat.lore_entries_failed book=%s error=%s",
+                    book.id, exc,
+                )
+                entries_by_book[book.id] = []
+
+        for card in characters:
+            try:
+                result = self._lore_engine.activate(
+                    speaker=card,
+                    session_id=session_id,
+                    history=history,
+                    user_message=user_message,
+                    pulse_text=pulse_text,
+                    lorebooks=candidate_books,
+                    entries=entries_by_book,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "character_chat.lore_activate_failed char=%s error=%s",
+                    card.name, exc,
+                )
+                continue
+            if result.by_position:
+                out[card.id] = result
+        return out
+
+    def _is_session_stale(self, session_id: str) -> bool:
+        """True iff the session hasn't been touched within the staleness
+        window. Reads ``SessionStore.get_meta(session_id).updated_at``.
+
+        A staleness threshold of 0 (config) disables the check entirely
+        and this always returns False. Sessions the SessionStore doesn't
+        know about (no meta) are treated as stale — there's no UI for
+        them, so a pulse round would have no audience anyway.
+        """
+        if self._pulse_session_stale_seconds <= 0:
+            return False
+        try:
+            session_store = getattr(self.api._app, "session_store", None)
+            if session_store is None:
+                return False  # without a store we can't decide → don't block
+            meta = session_store.get_meta(session_id) or {}
+        except Exception:  # noqa: BLE001
+            return False
+        updated_at = float(meta.get("updated_at") or 0.0)
+        if updated_at <= 0:
+            # Brand-new or unknown session — better to skip than to
+            # spam pulses for something the user hasn't engaged with.
+            return True
+        return (time.time() - updated_at) > self._pulse_session_stale_seconds
 
     def _load_session_history(self, session_id: str) -> list[dict[str, Any]]:
         """Pull the last N messages from the core session store as history.
@@ -2229,6 +3328,7 @@ def _card_to_public(card: CharacterCard) -> dict[str, Any]:
         "relationships": dict(card.relationships),
         "tags": list(card.tags),
         "active_sessions": list(card.active_sessions),
+        "state": dict(card.state),
         "proactive_pulse_pattern": card.proactive_pulse_pattern,
         "proactive_pulse_prompt": card.proactive_pulse_prompt,
         "archived": card.archived,
