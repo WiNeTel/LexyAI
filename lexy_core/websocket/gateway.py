@@ -771,6 +771,61 @@ def build_app(lexy: "LexyApp") -> FastAPI:
             raise HTTPException(404, "entry not found")
         return {"id": entry_id}
 
+    @api.get("/api/v1/plugins/character_chat/characters/{char_id}/prompt")
+    async def get_character_prompt_preview(
+        char_id: str, request: Request, session_id: str = "",
+    ) -> dict[str, Any]:
+        """Render the system prompt that would be sent to the LLM for
+        this character — useful for debugging "why does Sandra still
+        think she's wearing a Shirt".
+
+        Mike's report: characters keep referring to clothes that
+        aren't in their state anymore. The cause is usually one of:
+          * persona text still mentions the clothes
+          * example_dialog has stale clothing references (and the
+            LLM uses the example as a few-shot anchor)
+          * state.clothing wasn't actually saved
+          * scenario text describes the wrong outfit
+        This endpoint dumps the rendered prompt so we can see at a
+        glance which source contains the stale text.
+
+        Query param ``session_id`` (optional) — if given, the prompt
+        includes the session's other characters under "## Andere
+        Anwesende".
+        """
+        app = _app(request)
+        plugin = _character_chat_plugin(app)
+        store = getattr(plugin, "_store", None)
+        if store is None:
+            raise HTTPException(503, "character store not ready")
+        card = await store.get(char_id)
+        if card is None:
+            raise HTTPException(404, f"character not found: {char_id}")
+
+        other_characters = []
+        if session_id:
+            try:
+                bound = await store.list_in_session(session_id)
+                other_characters = [c for c in bound if c.id != char_id]
+            except Exception:  # noqa: BLE001
+                other_characters = []
+
+        prompt = card.build_system_prompt(
+            other_characters=other_characters,
+            scene="",
+        )
+        return {
+            "character_id": card.id,
+            "character_name": card.name,
+            "session_id": session_id,
+            "prompt": prompt,
+            "prompt_length": len(prompt),
+            "state": dict(card.state),
+            "persona": card.persona,
+            "scenario": card.scenario,
+            "example_dialog": card.example_dialog,
+        }
+
     @api.get(
         "/api/v1/plugins/character_chat/sessions/{session_id}/turns"
     )

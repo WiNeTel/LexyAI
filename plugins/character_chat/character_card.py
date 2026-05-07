@@ -166,10 +166,35 @@ class CharacterCard(BaseModel):
 
         state_block = _format_state_block(self.state)
         if state_block:
-            parts.append(f"\n## Dein Zustand\n{state_block}")
+            # The state block is the SINGLE SOURCE OF TRUTH for the
+            # character's current physical/emotional reality. We
+            # call it out aggressively because the example_dialog
+            # below may contain stale references (clothes, postures,
+            # locations) from when the card was first written —
+            # without an explicit "this is current, that is style"
+            # signal Mike's chars kept hallucinating Shirts after
+            # he set state.clothing="nackt".
+            parts.append(
+                "\n## Dein Zustand (AKTUELL — das ist die Wahrheit)\n"
+                f"{state_block}\n\n"
+                "**WICHTIG**: Diese Werte beschreiben DEINE JETZIGE "
+                "Realität — Kleidung, Haltung, Stimmung, Ort. Wenn der "
+                "Beispiel-Dialog unten andere Klamotten / Haltung / Ort "
+                "erwähnt, ist DAS NUR STILREFERENZ. Beziehe dich nie "
+                "auf alte Klamotten oder Posen aus dem Beispiel-Dialog. "
+                "Was hier oben steht, gilt — Punkt."
+            )
 
         if self.example_dialog.strip():
-            parts.append(f"\n## Beispiel-Dialog\n{self.example_dialog.strip()}")
+            parts.append(
+                "\n## Beispiel-Dialog (NUR Stilreferenz, NICHT aktuell!)\n"
+                f"{self.example_dialog.strip()}\n\n"
+                "*Der Beispiel-Dialog zeigt nur WIE du sprichst — Tonfall, "
+                "Wortwahl, typische *Sternchen-Gesten*. Er sagt NICHTS "
+                "über deine aktuellen Klamotten, deinen aktuellen Ort "
+                "oder das aktuelle Geschehen. Dafür gilt der Zustand "
+                "oben.*"
+            )
 
         parts.append(
             "\n## Regeln (RP-Disziplin)\n"
@@ -184,6 +209,10 @@ class CharacterCard(BaseModel):
             "führt die Handlung. Du reagierst auf das, was passiert ist — "
             "du erfindest keine neuen Plot-Punkte, keine plötzlichen "
             "Ereignisse, keine Zeitsprünge.\n"
+            "- **Klamotten + Körper:** Erwähne NUR was unter '## Dein "
+            "Zustand' steht. Wenn dort 'Kleidung: nackt' steht, dann "
+            "trägst du NICHTS — auch wenn der Beispiel-Dialog ein Shirt "
+            "oder einen Slip erwähnt. KEINE Halluzinationen.\n"
             "- **Gefühle und Handlungen detailreich in *Sternchen*.** "
             "Inneres Erleben, Körpersprache, kleine Handlungen — "
             "ausführlich, gerne mehrsätzig wenn die Szene es trägt. "
@@ -193,9 +222,12 @@ class CharacterCard(BaseModel):
             "Satz bis Absätzen. Lieber lebendig + detailliert als "
             "künstlich kurz.\n"
             "- Du DARFST am Ende deiner Antwort optional einen "
-            "<state>location=...; mood=...; last_action=...</state> "
-            "Block setzen, wenn sich dein Zustand geändert hat. Nur diese "
-            "drei Keys. Wird nicht angezeigt, dient als dein Gedächtnis."
+            "<state>key=value; key=value</state> Block setzen, wenn "
+            "sich dein Zustand geändert hat. Erlaubte Keys: "
+            "**location, mood, last_action, clothing, posture, "
+            "condition**. Plus optional eigene snake_case Keys "
+            "(injury, holding, etc). Wird nicht angezeigt, dient als "
+            "dein Gedächtnis."
         )
 
         if extra_instructions.strip():
