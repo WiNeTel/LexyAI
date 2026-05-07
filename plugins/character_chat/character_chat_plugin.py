@@ -55,10 +55,65 @@ from .lorebook_store import (
 )
 from .mention_parser import parse_nl_mentions
 from .pulse_generator import PulseGenerator
+from .rp_session_registry import RPSessionRegistry
+from .rp_session_store import (
+    MemoryBackend,
+    RPSessionContainer,
+    TurnRow,
+    parse_stats_input,
+)
 from .state_updater import merge_state, parse_state_block
 
 
 log = get_logger(module="character_chat")
+
+
+# ─── Memory backend adapter (Phase 13) ───────────────────────────────
+
+
+class _PluginAPIMemoryBackend:
+    """Adapt :class:`PluginAPI` to the :class:`MemoryBackend` protocol.
+
+    The RP session container only knows about ``MemoryBackend`` (so
+    tests can fake it). The plugin wires this adapter so containers
+    can store/recall through the standard PluginAPI without seeing
+    the Manager directly.
+    """
+
+    def __init__(self, api: Any) -> None:
+        self._api = api
+
+    async def ensure_collection(self, name: str) -> None:
+        await self._api.memory_ensure_collection(name)
+
+    async def delete_collection(self, name: str) -> None:
+        await self._api.memory_delete_collection(name)
+
+    async def store(
+        self,
+        text: str,
+        collection: str = "facts",
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        return await self._api.memory_store(
+            text=text, collection=collection, metadata=metadata,
+        )
+
+    async def recall(
+        self,
+        query: str,
+        collection: str | None = None,
+        limit: int = 5,
+        project_id: str | None = None,
+        metadata_equals: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        return await self._api.memory_recall(
+            query=query,
+            collection=collection,
+            limit=limit,
+            project_id=project_id,
+            metadata_equals=metadata_equals,
+        )
 
 
 # ─── Tool schemas ─────────────────────────────────────────────────────────────
@@ -279,6 +334,12 @@ class CharacterChatPlugin(BasePlugin):
         self._pulse_generator: PulseGenerator | None = None
         self._lore_store: LorebookStore | None = None
         self._lore_engine: LorebookEngine = LorebookEngine()
+        # Phase 13: per-RP-session container registry. Created lazily
+        # in ``on_load`` once the data dir is known. RP sessions own
+        # their own folder + Chroma collection; recall/state writes
+        # for those sessions go through the registry instead of the
+        # global character_chat tables.
+        self._rp_registry: RPSessionRegistry | None = None
         # Serialise round execution per session so two concurrent
         # run_round requests don't interleave their broadcasts.
         self._session_locks: dict[str, asyncio.Lock] = {}
@@ -341,6 +402,23 @@ class CharacterChatPlugin(BasePlugin):
         )
         await db.commit()
 
+        # Phase 13: per-RP-session container registry. Sessions live
+        # in ``data/rp_sessions/<session_id>/`` (NOT under plugin-data,
+        # because conceptually they're session-scoped artefacts that
+        # the gateway also reads). Memory backend is the PluginAPI
+        # adapter so containers route through standard memory ops.
+        from pathlib import Path
+        rp_root = Path("data/rp_sessions")
+        rp_root.mkdir(parents=True, exist_ok=True)
+        self._rp_registry = RPSessionRegistry(
+            rp_root, _PluginAPIMemoryBackend(self.api),
+        )
+        # Phase 13 wipe-once: on first load after the upgrade, clear
+        # all legacy RP data (character_turns / character_sessions /
+        # source=character_chat memories) so Mike sees a guaranteed
+        # empty state. Marker file prevents re-wipe on every restart.
+        await self._maybe_wipe_legacy_rp_data(db)
+
         # Orchestrator (with per-character memory-recall wired in)
         self._rebuild_orchestrator()
 
@@ -394,15 +472,32 @@ class CharacterChatPlugin(BasePlugin):
         )
 
     async def _character_recall(
-        self, *, character_id: str, query: str, limit: int = 3
+        self,
+        *,
+        character_id: str,
+        query: str,
+        limit: int = 3,
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Per-character memory fetch with strict isolation.
 
-        Uses the extended ``memory_recall`` API (Phase 3b) to filter by
-        ``character_id`` metadata so Luna only ever sees her own memory,
-        never Lexy's. Returns raw recall items.
+        Phase 13: when ``session_id`` belongs to an RP session, recall
+        is scoped to that session's dedicated Chroma collection — so
+        Sandra in Session B sees nothing from Session A even if she's
+        the same character. For non-RP sessions (or missing session_id)
+        the legacy global ``context`` collection is used.
         """
         try:
+            if session_id and self._rp_registry is not None:
+                if self._rp_registry.is_rp_session(session_id):
+                    container = await self._rp_registry.get(session_id)
+                    if container is not None:
+                        return await container.memory_recall(
+                            query=query,
+                            character_id=character_id,
+                            limit=limit,
+                        )
+            # Legacy fallback: pre-Phase-13 global character recall.
             return await self.api.memory_recall(
                 query=query,
                 collection="context",
@@ -413,9 +508,170 @@ class CharacterChatPlugin(BasePlugin):
             log.warning(
                 "character_chat.recall_unavailable",
                 character_id=character_id,
+                session_id=session_id,
                 error=str(exc),
             )
             return []
+
+    async def _maybe_wipe_legacy_rp_data(
+        self, db: Any,
+    ) -> None:
+        """Phase 13 wipe-once: drop legacy RP data on first load.
+
+        Mike's Phase 13 ask: *"alle Memorys und sessions sollten
+        gelöscht sein"*. We honour that by clearing every legacy
+        artefact that pre-dates the RP container architecture, but
+        only ONCE — guarded by ``data/.phase13_wiped``. After the
+        marker exists, the wipe is a no-op so restarts don't keep
+        nuking new sessions.
+        """
+        from pathlib import Path
+        marker = Path("data/.phase13_wiped")
+        if marker.exists():
+            return
+        log.warning("character_chat.phase13_wipe_starting")
+        # 1) character_turns + character_sessions: blow them away.
+        deleted_turns = 0
+        deleted_sess = 0
+        try:
+            cur = await db.execute("DELETE FROM character_turns")
+            deleted_turns = cur.rowcount or 0
+            cur = await db.execute("DELETE FROM character_sessions")
+            deleted_sess = cur.rowcount or 0
+            # Reset characters.state to '{}' so the legacy state column
+            # doesn't keep injecting stale clothing/posture into prompts.
+            await db.execute("UPDATE characters SET state = '{}'")
+            # Detach all characters from sessions — active_sessions
+            # was a global-shared list and is no longer authoritative.
+            await db.execute("UPDATE characters SET active_sessions = '[]'")
+            await db.commit()
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "character_chat.phase13_db_wipe_failed", error=str(exc),
+            )
+
+        # 2) Drop every memory item tagged source=character_chat from
+        #    the global "context" collection (and FTS mirror). We
+        #    reach into Chroma directly here — no public delete-by-
+        #    metadata helper exists yet, and adding one for a one-
+        #    shot wipe would be over-engineering.
+        deleted_mem = 0
+        try:
+            mem = self._app_memory()
+            if mem is not None and getattr(mem, "_collections", None):
+                col = mem._collections.get("context")
+                if col is not None:
+                    got = col.get(where={"source": "character_chat"})
+                    ids = list(got.get("ids") or [])
+                    if ids:
+                        col.delete(ids=ids)
+                        deleted_mem = len(ids)
+                    # FTS mirror
+                    fts = getattr(mem, "_fts", None)
+                    if fts is not None and ids:
+                        for chunk_start in range(0, len(ids), 500):
+                            chunk = ids[chunk_start:chunk_start + 500]
+                            placeholders = ",".join("?" * len(chunk))
+                            await fts.execute(
+                                f"DELETE FROM items_fts WHERE id IN ({placeholders})",
+                                chunk,
+                            )
+                        await fts.commit()
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "character_chat.phase13_mem_wipe_failed", error=str(exc),
+            )
+
+        # 3) Strip kind=rp sessions from the core session store.
+        deleted_core_sessions = 0
+        try:
+            ss = self._app_session_store()
+            if ss is not None and hasattr(ss, "delete_by_kind"):
+                deleted_core_sessions = await ss.delete_by_kind("rp")
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "character_chat.phase13_session_wipe_failed",
+                error=str(exc),
+            )
+
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        import time as _time
+        marker.write_text(
+            json.dumps({
+                "wiped_at": _time.time(),
+                "character_turns": deleted_turns,
+                "character_sessions": deleted_sess,
+                "memory_items": deleted_mem,
+                "core_sessions": deleted_core_sessions,
+            }, indent=2),
+            encoding="utf-8",
+        )
+        log.warning(
+            "character_chat.phase13_wipe_complete",
+            character_turns=deleted_turns,
+            character_sessions=deleted_sess,
+            memory_items=deleted_mem,
+            core_sessions=deleted_core_sessions,
+        )
+
+    def _app_memory(self) -> Any:
+        """Best-effort lookup of MemoryManager via the PluginAPI."""
+        # PluginAPI doesn't expose memory directly; we access it via
+        # the application held by the API. Wrapped in try/except since
+        # the surface is private and may move in future refactors.
+        try:
+            return getattr(self.api, "_app").memory  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _app_session_store(self) -> Any:
+        try:
+            return getattr(self.api, "_app").session_store  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _is_rp_session(self, session_id: str) -> bool:
+        """True if the given session is RP — checks both the registry
+        (existing folder) AND the core session store's kind marker."""
+        if not session_id:
+            return False
+        if self._rp_registry is not None and self._rp_registry.is_rp_session(
+            session_id
+        ):
+            return True
+        # Fallback: ask the session store. A session that was just
+        # created with kind="rp" but doesn't have a folder yet still
+        # qualifies — the next attach will materialise the folder.
+        ss = self._app_session_store()
+        if ss is None:
+            return False
+        try:
+            meta = ss.get_meta(session_id) if hasattr(ss, "get_meta") else None
+        except Exception:  # noqa: BLE001
+            return False
+        if not isinstance(meta, dict):
+            return False
+        return str(meta.get("kind", "")) == "rp"
+
+    async def _get_rp_container(
+        self,
+        session_id: str,
+        *,
+        title: str = "",
+        scene: str = "",
+        tracked_stats: dict[str, str] | None = None,
+    ) -> RPSessionContainer | None:
+        """Return the container for an RP session, creating if missing."""
+        if not session_id or self._rp_registry is None:
+            return None
+        if not await self._is_rp_session(session_id):
+            return None
+        return await self._rp_registry.get_or_create(
+            session_id,
+            title=title,
+            scene=scene,
+            tracked_stats=tracked_stats,
+        )
 
     async def on_config_changed(self, cfg: dict[str, Any]) -> None:
         self._apply_config(cfg)
@@ -873,6 +1129,16 @@ class CharacterChatPlugin(BasePlugin):
         # cleanup already removes them on shutdown, but we defensively
         # unregister so a disable/re-enable cycle doesn't double-book.
         await self._cancel_all_pulse_timers()
+        # Phase 13: close every open RP session container so SQLite
+        # handles drop cleanly on shutdown.
+        if self._rp_registry is not None:
+            try:
+                await self._rp_registry.shutdown()
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "character_chat.rp_registry_shutdown_failed",
+                    error=str(exc),
+                )
         log.info("character_chat.disabled")
 
     # ─── Hook: before_user_input intercept ───────────────────────────────
@@ -1590,6 +1856,21 @@ class CharacterChatPlugin(BasePlugin):
         # ``set_kind`` is idempotent (returns False on no-change) so we
         # only broadcast when it actually flips.
         await self._maybe_tag_session_rp(session_id)
+        # Phase 13: ensure an RP container exists for this session and
+        # snapshot the character's session-state from the session's
+        # tracked_stats defaults. We never clobber existing live state
+        # on re-attach (snapshot is a no-op if state is already set).
+        try:
+            container = await self._get_rp_container(session_id)
+            if container is not None:
+                await container.snapshot_template_for_char(id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "character_chat.rp_snapshot_failed",
+                character_id=id,
+                session_id=session_id,
+                error=str(exc),
+            )
         # If the card has a proactive-pulse pattern, register it with the
         # scheduler now (idempotent: duplicate attach simply re-registers).
         if updated.proactive_pulse_pattern:
@@ -1885,6 +2166,24 @@ class CharacterChatPlugin(BasePlugin):
                 pulse_text=pulse_text,
             )
 
+            # Phase 13: pull each speaker's live state from the RP
+            # container so the orchestrator's prompt builder sees the
+            # CURRENT session-state, not the stale character.state.
+            live_state_by_char: dict[str, dict[str, str]] = {}
+            try:
+                container = await self._get_rp_container(session_id)
+                if container is not None:
+                    for c in characters:
+                        st = await container.get_char_state(c.id)
+                        if st:
+                            live_state_by_char[c.id] = st
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "character_chat.rp_state_load_failed",
+                    session_id=session_id,
+                    error=str(exc),
+                )
+
             req = GroupTurnRequest(
                 session_id=session_id,
                 history=history,
@@ -1895,6 +2194,7 @@ class CharacterChatPlugin(BasePlugin):
                 scene=scene,
                 extra_forced=extra_forced,
                 lore_by_speaker=lore_by_speaker,
+                live_state_by_char=live_state_by_char,
             )
 
             round_id = uuid.uuid4().hex[:12]
@@ -2196,9 +2496,17 @@ class CharacterChatPlugin(BasePlugin):
     async def _fetch_turn_row(
         self, turn_id: str
     ) -> dict[str, Any] | None:
-        """Read a single character_turns row by id."""
+        """Read a single character_turns row by id.
+
+        Phase 13: a turn for an RP session lives in that session's
+        container, not in the global ``character_turns`` table. We
+        try the legacy table first (for non-RP sessions), then fall
+        back to scanning RP containers. Each container only opens
+        its SQLite handle on demand so this stays cheap.
+        """
         if not turn_id:
             return None
+        # Legacy path
         db = await self.api.get_db()
         async with db.execute(
             "SELECT id, session_id, character_id, character_name, round_id, "
@@ -2207,21 +2515,49 @@ class CharacterChatPlugin(BasePlugin):
             (turn_id,),
         ) as cur:
             row = await cur.fetchone()
-        if row is None:
+        if row is not None:
+            return {
+                "id": row[0],
+                "session_id": row[1],
+                "character_id": row[2],
+                "character_name": row[3],
+                "round_id": row[4],
+                "order": int(row[5] or 0),
+                "content": row[6],
+                "skipped": bool(row[7]),
+                "trigger_kind": row[8],
+                "trigger_text": row[9],
+                "created_at": float(row[10]),
+                "_in_rp_container": False,
+            }
+        # RP fallback: scan every known RP container.
+        if self._rp_registry is None:
             return None
-        return {
-            "id": row[0],
-            "session_id": row[1],
-            "character_id": row[2],
-            "character_name": row[3],
-            "round_id": row[4],
-            "order": int(row[5] or 0),
-            "content": row[6],
-            "skipped": bool(row[7]),
-            "trigger_kind": row[8],
-            "trigger_text": row[9],
-            "created_at": float(row[10]),
-        }
+        try:
+            session_ids = await self._rp_registry.list_session_ids()
+        except Exception:  # noqa: BLE001
+            return None
+        for sid in session_ids:
+            container = await self._rp_registry.get(sid)
+            if container is None:
+                continue
+            t = await container.get_turn(turn_id)
+            if t is not None:
+                return {
+                    "id": t.id,
+                    "session_id": sid,
+                    "character_id": t.character_id,
+                    "character_name": t.character_name,
+                    "round_id": t.round_id,
+                    "order": t.order_num,
+                    "content": t.content,
+                    "skipped": t.skipped,
+                    "trigger_kind": t.trigger_kind,
+                    "trigger_text": t.trigger_text,
+                    "created_at": t.created_at,
+                    "_in_rp_container": True,
+                }
+        return None
 
     async def _ws_turn_edit(
         self, client: Any, message: dict[str, Any]
@@ -2242,13 +2578,18 @@ class CharacterChatPlugin(BasePlugin):
                  "error": "turn not found"}
             )
             return
-        db = await self.api.get_db()
-        await db.execute(
-            "UPDATE character_turns SET content = ?, skipped = 0 "
-            "WHERE id = ?",
-            (new_content, turn_id),
-        )
-        await db.commit()
+        if existing.get("_in_rp_container"):
+            container = await self._get_rp_container(existing["session_id"])
+            if container is not None:
+                await container.update_turn_content(turn_id, new_content)
+        else:
+            db = await self.api.get_db()
+            await db.execute(
+                "UPDATE character_turns SET content = ?, skipped = 0 "
+                "WHERE id = ?",
+                (new_content, turn_id),
+            )
+            await db.commit()
         # Broadcast so all open tabs render the new text.
         await self.api.ws_broadcast(
             {
@@ -2284,11 +2625,16 @@ class CharacterChatPlugin(BasePlugin):
                  "error": "turn not found"}
             )
             return
-        db = await self.api.get_db()
-        await db.execute(
-            "DELETE FROM character_turns WHERE id = ?", (turn_id,),
-        )
-        await db.commit()
+        if existing.get("_in_rp_container"):
+            container = await self._get_rp_container(existing["session_id"])
+            if container is not None:
+                await container.delete_turn(turn_id)
+        else:
+            db = await self.api.get_db()
+            await db.execute(
+                "DELETE FROM character_turns WHERE id = ?", (turn_id,),
+            )
+            await db.commit()
         await self.api.ws_broadcast(
             {
                 "type": "character_turn_deleted",
@@ -2341,31 +2687,56 @@ class CharacterChatPlugin(BasePlugin):
             )
             return
 
-        db = await self.api.get_db()
-        async with db.execute(
-            "SELECT id, character_id, character_name, content, skipped, "
-            "order_num FROM character_turns "
-            "WHERE round_id = ? AND id != ? "
-            "ORDER BY order_num ASC",
-            (round_id, turn_id),
-        ) as cur:
-            siblings = list(await cur.fetchall())
-        prior_turns = [
-            CharacterTurn(
-                character_id=row[1], character_name=row[2],
-                content=row[3] or "", skipped=bool(row[4]),
-                order=int(row[5] or 0),
+        # Phase 13: load siblings + delete old turn from the right
+        # store. RP sessions live in their container; non-RP keep
+        # using the legacy global ``character_turns`` table.
+        in_container = bool(existing.get("_in_rp_container"))
+        if in_container:
+            container = await self._get_rp_container(session_id)
+            if container is None:
+                await client.send_json(
+                    {"type": "character_turn_regenerate_ack", "ok": False,
+                     "error": "rp container not available"}
+                )
+                return
+            sibling_rows = await container.list_turns_for_round(round_id)
+            prior_turns = [
+                CharacterTurn(
+                    character_id=tr.character_id,
+                    character_name=tr.character_name,
+                    content=tr.content,
+                    skipped=tr.skipped,
+                    order=tr.order_num,
+                )
+                for tr in sibling_rows
+                if tr.id != turn_id and tr.order_num < int(existing["order"] or 0)
+            ]
+            await container.delete_turn(turn_id)
+        else:
+            db = await self.api.get_db()
+            async with db.execute(
+                "SELECT id, character_id, character_name, content, skipped, "
+                "order_num FROM character_turns "
+                "WHERE round_id = ? AND id != ? "
+                "ORDER BY order_num ASC",
+                (round_id, turn_id),
+            ) as cur:
+                siblings = list(await cur.fetchall())
+            prior_turns = [
+                CharacterTurn(
+                    character_id=row[1], character_name=row[2],
+                    content=row[3] or "", skipped=bool(row[4]),
+                    order=int(row[5] or 0),
+                )
+                for row in siblings
+                if int(row[5] or 0) < int(existing["order"] or 0)
+            ]
+            # Drop the old row + tell the UI it's gone before we generate
+            # the replacement (so tabs show a brief "regenerating…" state).
+            await db.execute(
+                "DELETE FROM character_turns WHERE id = ?", (turn_id,),
             )
-            for row in siblings
-            if int(row[5] or 0) < int(existing["order"] or 0)
-        ]
-
-        # Drop the old row + tell the UI it's gone before we generate the
-        # replacement (so tabs show a brief "regenerating…" state).
-        await db.execute(
-            "DELETE FROM character_turns WHERE id = ?", (turn_id,),
-        )
-        await db.commit()
+            await db.commit()
         await self.api.ws_broadcast(
             {
                 "type": "character_turn_deleted",
@@ -2394,6 +2765,20 @@ class CharacterChatPlugin(BasePlugin):
                     pulse_text = trigger_text[close + 1 :].strip()
         sess_state = await self._get_session_state(session_id)
         scene = str(sess_state.get("scene") or "")
+        # Phase 13: same live_state injection as run_round.
+        live_state_by_char: dict[str, dict[str, str]] = {}
+        try:
+            container = await self._get_rp_container(session_id)
+            if container is not None:
+                for c in all_chars:
+                    st = await container.get_char_state(c.id)
+                    if st:
+                        live_state_by_char[c.id] = st
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "character_chat.rp_state_load_failed_regen",
+                session_id=session_id, error=str(exc),
+            )
         req = GroupTurnRequest(
             session_id=session_id,
             history=history,
@@ -2402,6 +2787,7 @@ class CharacterChatPlugin(BasePlugin):
             pulse_from_id=pulse_from,
             pulse_text=pulse_text,
             scene=scene,
+            live_state_by_char=live_state_by_char,
         )
         try:
             new_turn = await self._orchestrator._run_single_turn(
@@ -2634,58 +3020,113 @@ class CharacterChatPlugin(BasePlugin):
         trigger_text: str,
         turns: list[CharacterTurn],
     ) -> None:
+        # Phase 13: when this is an RP session, we route ALL writes
+        # (turns + state + memory) through the per-session container.
+        # Non-RP sessions use the legacy global tables and global
+        # ``context`` collection — unchanged.
+        container: RPSessionContainer | None = None
+        try:
+            container = await self._get_rp_container(session_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "character_chat.rp_container_lookup_failed",
+                session_id=session_id,
+                error=str(exc),
+            )
+
         db = await self.api.get_db()
         now = time.time()
         for t in turns:
             turn_id = uuid.uuid4().hex[:12]
 
-            # Strip any <state>...</state> block from the visible content and
-            # apply the parsed state diff to the character. We mutate the turn
-            # object in place so downstream broadcasts and the DB row see the
-            # cleaned content, never the raw block.
+            # Strip any <state>...</state> block from the visible content
+            # and apply the parsed state diff to the right scope.
             if not t.skipped and t.content:
                 cleaned, state_updates = parse_state_block(t.content)
                 if cleaned != t.content:
                     t.content = cleaned
-                if state_updates and self._store is not None:
+                if state_updates:
                     try:
-                        current = await self._store.get(t.character_id)
-                        if current is not None:
-                            merged = merge_state(current.state, state_updates)
-                            await self._store.update(
-                                t.character_id, state=merged
+                        if container is not None:
+                            # RP path: state lives in the session, not
+                            # on the character. tracked_stats filtering
+                            # happens inside update_char_state.
+                            await container.update_char_state(
+                                t.character_id, state_updates,
                             )
                             log.info(
-                                "character_chat.state_updated character=%s "
-                                "updates=%s",
+                                "character_chat.state_updated_rp "
+                                "character=%s updates=%s",
                                 t.character_name,
                                 state_updates,
                             )
+                        elif self._store is not None:
+                            # Legacy: writes to the character row.
+                            current = await self._store.get(t.character_id)
+                            if current is not None:
+                                merged = merge_state(
+                                    current.state, state_updates,
+                                )
+                                await self._store.update(
+                                    t.character_id, state=merged,
+                                )
+                                log.info(
+                                    "character_chat.state_updated_legacy "
+                                    "character=%s updates=%s",
+                                    t.character_name,
+                                    state_updates,
+                                )
                     except Exception as exc:  # noqa: BLE001
                         log.warning(
-                            "character_chat.state_update_failed character=%s error=%s",
+                            "character_chat.state_update_failed "
+                            "character=%s error=%s",
                             t.character_name,
                             str(exc),
                         )
-            await db.execute(
-                "INSERT INTO character_turns (id, session_id, character_id, "
-                "character_name, round_id, order_num, content, skipped, "
-                "trigger_kind, trigger_text, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    turn_id,
-                    session_id,
-                    t.character_id,
-                    t.character_name,
-                    round_id,
-                    t.order,
-                    t.content,
-                    1 if t.skipped else 0,
-                    trigger_kind,
-                    trigger_text,
-                    now,
-                ),
-            )
+
+            # Persist the turn. RP → container.turns.db.
+            #                Non-RP → legacy global character_turns.
+            if container is not None:
+                try:
+                    await container.append_turn(TurnRow(
+                        id=turn_id,
+                        character_id=t.character_id,
+                        character_name=t.character_name,
+                        round_id=round_id,
+                        order_num=t.order,
+                        content=t.content,
+                        skipped=t.skipped,
+                        trigger_kind=trigger_kind,
+                        trigger_text=trigger_text,
+                        created_at=now,
+                    ))
+                except Exception as exc:  # noqa: BLE001
+                    log.error(
+                        "character_chat.rp_turn_persist_failed",
+                        session_id=session_id,
+                        character=t.character_name,
+                        error=str(exc),
+                    )
+            else:
+                await db.execute(
+                    "INSERT INTO character_turns (id, session_id, character_id, "
+                    "character_name, round_id, order_num, content, skipped, "
+                    "trigger_kind, trigger_text, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        turn_id,
+                        session_id,
+                        t.character_id,
+                        t.character_name,
+                        round_id,
+                        t.order,
+                        t.content,
+                        1 if t.skipped else 0,
+                        trigger_kind,
+                        trigger_text,
+                        now,
+                    ),
+                )
 
             # Broadcast per turn so the UI can render them streaming-style.
             await self.api.ws_broadcast(
@@ -2714,30 +3155,41 @@ class CharacterChatPlugin(BasePlugin):
                     name=f"character_chat.tts.{turn_id}",
                 )
 
-            # Strict-isolation memory write: each character stores their OWN
-            # view of the exchange, tagged with character_id. Phase-3 recall
-            # will filter on character_id so Luna only sees Luna's memory.
+            # Memory write — RP routes to the per-session collection,
+            # non-RP uses the global ``context`` collection.
             if self._memory_strict_isolation and not t.skipped and t.content:
                 try:
-                    await self.api.memory_store(
-                        text=t.content,
-                        collection="context",
-                        metadata={
-                            "source": "character_chat",
-                            "character_id": t.character_id,
-                            "character_name": t.character_name,
-                            "session_id": session_id,
-                            "round_id": round_id,
-                            "trigger_kind": trigger_kind,
-                        },
-                    )
+                    if container is not None:
+                        await container.memory_write(
+                            text=t.content,
+                            character_id=t.character_id,
+                            metadata={
+                                "character_name": t.character_name,
+                                "round_id": round_id,
+                                "trigger_kind": trigger_kind,
+                            },
+                        )
+                    else:
+                        await self.api.memory_store(
+                            text=t.content,
+                            collection="context",
+                            metadata={
+                                "source": "character_chat",
+                                "character_id": t.character_id,
+                                "character_name": t.character_name,
+                                "session_id": session_id,
+                                "round_id": round_id,
+                                "trigger_kind": trigger_kind,
+                            },
+                        )
                 except Exception as exc:  # noqa: BLE001
                     log.warning(
                         "character_chat.memory_store_failed",
                         character=t.character_name,
                         error=str(exc),
                     )
-        await db.commit()
+        if container is None:
+            await db.commit()
 
     async def _speak_character_turn(
         self,

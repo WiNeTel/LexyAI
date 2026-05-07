@@ -1818,11 +1818,96 @@
     if (newSessionBtn) {
         newSessionBtn.addEventListener("click", newSession);
     }
-    // Phase 9.12: RP-Tab hat seinen eigenen "Neue Session"-Button.
-    // Beide rufen ``newSession()`` — die Funktion liest ``state.activeTab``
-    // und legt eine Chat- bzw. RP-Session an.
+    // Phase 13: RP-Tab opens the create-modal first so the user can
+    // pick a name + stats. Chat-Tab still creates inline.
     if (rpNewSessionBtn) {
-        rpNewSessionBtn.addEventListener("click", newSession);
+        rpNewSessionBtn.addEventListener("click", openRPCreateModal);
+    }
+
+    // ─── RP-Session create modal (Phase 13) ──────────────────────
+    const rpCreateModal = $("rp-create-modal");
+    const rpCreateClose = $("rp-create-close");
+    const rpCreateCancel = $("rp-create-cancel");
+    const rpCreateSubmit = $("rp-create-submit");
+    const rpCreateTitle = $("rp-create-title");
+    const rpCreateScene = $("rp-create-scene");
+    const rpCreateStats = $("rp-create-stats");
+
+    function openRPCreateModal() {
+        if (state.sending) {
+            toast("Busy", "Warte bis die aktuelle Antwort fertig ist");
+            return;
+        }
+        if (!rpCreateModal) {
+            // Fallback to inline path if modal markup is missing.
+            return newSession();
+        }
+        if (rpCreateTitle) rpCreateTitle.value = "";
+        if (rpCreateScene) rpCreateScene.value = "";
+        if (rpCreateStats) {
+            // Sensible default — Mike's most-common case.
+            rpCreateStats.value = "clothing; posture; mood";
+        }
+        rpCreateModal.hidden = false;
+        if (rpCreateTitle) rpCreateTitle.focus();
+    }
+    function closeRPCreateModal() {
+        if (rpCreateModal) rpCreateModal.hidden = true;
+    }
+    if (rpCreateClose) rpCreateClose.addEventListener("click", closeRPCreateModal);
+    if (rpCreateCancel) rpCreateCancel.addEventListener("click", closeRPCreateModal);
+    if (rpCreateModal) {
+        rpCreateModal.addEventListener("click", (e) => {
+            if (e.target === rpCreateModal) closeRPCreateModal();
+        });
+    }
+    if (rpCreateSubmit) {
+        rpCreateSubmit.addEventListener("click", async () => {
+            const title = rpCreateTitle ? rpCreateTitle.value.trim() : "";
+            const scene = rpCreateScene ? rpCreateScene.value.trim() : "";
+            const stats = rpCreateStats ? rpCreateStats.value.trim() : "";
+            const sid = generateSessionId();
+            const payload = {
+                session_id: sid,
+                title: title,
+                scene: scene,
+                tracked_stats: stats || "",
+            };
+            if (state.activeProjectId) {
+                payload.project_id = state.activeProjectId;
+            }
+            try {
+                const resp = await fetch("/api/v1/rp_sessions/register", {
+                    method: "POST",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify(payload),
+                });
+                if (!resp.ok) {
+                    const text = await resp.text().catch(() => "");
+                    throw new Error(`HTTP ${resp.status} ${text}`);
+                }
+                await resp.json();
+            } catch (err) {
+                toast("RP-Session anlegen fehlgeschlagen", String(err && err.message ? err.message : err));
+                return;
+            }
+            // Switch the RP-tab to the freshly-created session.
+            state.audio.stop();
+            state.sessionId = sid;
+            state.rpSessionId = sid;
+            state.currentAssistantBubble = null;
+            state.currentReasoningBubble = null;
+            state.currentAssistantText = "";
+            if (rpChatWindow) rpChatWindow.innerHTML = "";
+            try { localStorage.setItem("lexy_last_rp_session", sid); } catch (_e) {}
+            updateSessionPill();
+            _syncSessionUI("rp");
+            const label = title ? `"${title}"` : `#${sid.slice(0, 6)}`;
+            systemNote(`Neue RP-Session ${label} angelegt — eigener Memory-Container, getrackte Stats: ${stats || "(keine)"}.`);
+            closeRPCreateModal();
+            // Refresh the session sidebar so the new entry appears.
+            try { await loadSessions(); } catch (_e) {}
+        });
     }
 
     function _copySessionToClipboard() {
@@ -2747,6 +2832,12 @@
                     ? `<div class="sid sid-title">${escapeHtml(s.title)}</div>
                        <div class="sid-sub mono">${escapeHtml(s.id)}${isActive ? ' · active' : ''}</div>`
                     : `<div class="sid">${escapeHtml(s.id)}${isActive ? ' <span class="sid-active">· active</span>' : ''}</div>`;
+                // Phase 13: rename button beside the title for RP
+                // sessions — Mike asked for naming so he can tell
+                // sessions apart in the list.
+                const renameBtn = s.kind === "rp"
+                    ? `<button class="msg-action session-rename-btn" title="Session umbenennen">✏</button>`
+                    : "";
                 div.innerHTML = `
                     ${headline}
                     <div class="smeta">${kindBadge} ${s.messages} messages ${roleBadge}${inProgressBadge}</div>
@@ -2754,6 +2845,7 @@
                     ${userHint}
                     <div class="session-actions">
                         <button class="msg-action primary session-resume-btn">↻ Resume</button>
+                        ${renameBtn}
                         <button class="msg-action danger session-delete-btn">🗑 Delete</button>
                     </div>
                 `;
@@ -2784,6 +2876,34 @@
                         toast("Error", err.message);
                     }
                 });
+                const renameNode = div.querySelector(".session-rename-btn");
+                if (renameNode) {
+                    renameNode.addEventListener("click", async (ev) => {
+                        ev.stopPropagation();
+                        const current = s.title || "";
+                        const next = prompt(
+                            "Neuer Name für diese RP-Session:",
+                            current,
+                        );
+                        if (next === null) return;  // user pressed Cancel
+                        const trimmed = next.trim();
+                        try {
+                            const resp = await fetch(
+                                `/api/v1/sessions/${encodeURIComponent(s.id)}`,
+                                {
+                                    method: "PATCH",
+                                    headers: { "content-type": "application/json" },
+                                    body: JSON.stringify({ title: trimmed }),
+                                },
+                            );
+                            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                            await loadSessions();
+                            toast("Session umbenannt", trimmed || "(ohne Titel)");
+                        } catch (err) {
+                            toast("Umbenennen fehlgeschlagen", String(err && err.message ? err.message : err));
+                        }
+                    });
+                }
                 sessionsList.appendChild(div);
             }
         } catch (err) {
@@ -5036,16 +5156,16 @@
     const charFormTags = $("char-form-tags");
     const charFormPulsePattern = $("char-form-pulse-pattern");
     const charFormPulsePrompt = $("char-form-pulse-prompt");
-    // ── Live-State editor (Phase 12 hotfix) ────────────────────────
-    // Anchor keys per state_updater.ANCHOR_STATE_KEYS — empty input
-    // means "drop the key from state" (so a Mike-emptied "clothing"
-    // doesn't leak the LLM's old "Shirt" entry into future prompts).
-    const charFormStateClothing = $("char-form-state-clothing");
-    const charFormStatePosture = $("char-form-state-posture");
-    const charFormStateCondition = $("char-form-state-condition");
-    const charFormStateMood = $("char-form-state-mood");
-    const charFormStateLocation = $("char-form-state-location");
-    const charFormStateReset = $("char-form-state-reset");
+    // Phase 13 — character-level state fields are gone; state lives in
+    // the RP session container. The DOM nodes are absent in markup but
+    // we keep harmless null lookups to avoid breaking older saved
+    // sessions whose code paths we haven't fully cleaned up yet.
+    const charFormStateClothing = null;
+    const charFormStatePosture = null;
+    const charFormStateCondition = null;
+    const charFormStateMood = null;
+    const charFormStateLocation = null;
+    const charFormStateReset = null;
     // Prompt-Vorschau (Hotfix Phase 12) — debug helper that shows
     // the rendered system prompt + flags any clothing words still
     // hiding in persona/scenario/greeting/example_dialog. Mike's

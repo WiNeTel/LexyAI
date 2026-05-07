@@ -11,13 +11,13 @@
       JSON.parse a PNG and failed with "unexpected character at line 1
       column 1". Bump the date string when shipping a frontend change.
     -->
-    <link rel="stylesheet" href="/static/style.css?v=20260506j" />
-    <link rel="stylesheet" href="/static/holo.css?v=20260506j" />
+    <link rel="stylesheet" href="/static/style.css?v=20260507a" />
+    <link rel="stylesheet" href="/static/holo.css?v=20260507a" />
     <!-- Three.js for 3D Avatar Stage. Bundled locally so Lexy works
          offline / on air-gapped LANs (cdnjs blocked or unreachable).
          Falls back gracefully — holo.js uses ``typeof THREE === 'undefined'``
          to skip the avatar stage when the script didn't load. -->
-    <script src="/static/vendor/three.min.js?v=20260506j" defer></script>
+    <script src="/static/vendor/three.min.js?v=20260507a" defer></script>
 </head>
 <body>
 
@@ -489,42 +489,11 @@
                             <input type="text" id="char-form-tags" placeholder="rp, family, baby (komma-separiert)" />
                         </div>
 
-                        <!-- ─── Live-State (Phase 12 hotfix) ───
-                             The State block lands at the top of the
-                             character's system prompt and persists
-                             across turns. Without UI to edit it, Mike
-                             couldn't override Sandra's "Shirt" entry
-                             back to "nackt" — only the LLM could via
-                             `<state>` blocks in its responses.
-                             Now: fill the anchor fields directly,
-                             empty = drop the key from state. -->
-                        <details class="char-form-state-block">
-                            <summary>Live-Zustand <span class="muted">(was der Charakter gerade trägt / fühlt / tut)</span></summary>
-                            <div class="setting-row">
-                                <label>Kleidung</label>
-                                <input type="text" id="char-form-state-clothing" placeholder="z.B. nackt, T-Shirt, Pyjama (leer = nicht im Prompt)" />
-                            </div>
-                            <div class="setting-row">
-                                <label>Haltung</label>
-                                <input type="text" id="char-form-state-posture" placeholder="z.B. sitzend, stehend, liegend" />
-                            </div>
-                            <div class="setting-row">
-                                <label>Zustand</label>
-                                <input type="text" id="char-form-state-condition" placeholder="z.B. müde, energiegeladen, krank" />
-                            </div>
-                            <div class="setting-row">
-                                <label>Stimmung</label>
-                                <input type="text" id="char-form-state-mood" placeholder="z.B. fröhlich, genervt, neugierig" />
-                            </div>
-                            <div class="setting-row">
-                                <label>Ort</label>
-                                <input type="text" id="char-form-state-location" placeholder="z.B. Küche, Garten, Schlafzimmer" />
-                            </div>
-                            <div class="setting-row">
-                                <label>&nbsp;</label>
-                                <button type="button" class="btn btn-danger" id="char-form-state-reset" title="Alle State-Felder leeren — der Charakter startet wieder ohne erinnerten Zustand.">🧹 Zustand zurücksetzen</button>
-                            </div>
-                        </details>
+                        <!-- Phase 13: per-character state-fields are gone.
+                             State now lives in the RP-Session — Mike
+                             configures the tracked stats per session
+                             (e.g. "clothing=nackt; mood; hunger") in
+                             the session modal. -->
 
                         <div class="setting-row">
                             <label>&nbsp;</label>
@@ -1265,6 +1234,47 @@
         <div id="scm-list"></div>
     </div>
 
+    <!-- ─── RP-Session Create Modal (Phase 13) ───────────────────────
+         Opens when the user clicks "Neue RP-Session". Lets them give
+         the session a name and configure which stats to track per
+         character (e.g. "clothing=nackt; posture; mood; hunger").
+         Stats are session-scoped — characters no longer carry their
+         own state defaults. -->
+    <div id="rp-create-modal" class="modal-wrap" hidden>
+        <div class="modal rp-create-modal">
+            <header class="modal-head">
+                <h3>🆕 Neue Rollenspiel-Session</h3>
+                <button class="btn icon" id="rp-create-close" title="Abbrechen">✕</button>
+            </header>
+            <div class="modal-body">
+                <div class="setting-row">
+                    <label for="rp-create-title">Name <span class="muted">(optional)</span></label>
+                    <input type="text" id="rp-create-title"
+                           placeholder="z.B. Insel-Szenario, Schule, Familie…" />
+                </div>
+                <div class="setting-row">
+                    <label for="rp-create-scene">Szene <span class="muted">(optional)</span></label>
+                    <textarea id="rp-create-scene" rows="2"
+                              placeholder="Wo seid ihr, wie ist die Stimmung?"></textarea>
+                </div>
+                <div class="setting-row">
+                    <label for="rp-create-stats">State-Tracking</label>
+                    <input type="text" id="rp-create-stats"
+                           placeholder="Clothing=nackt; Posture=stehend; Mood; Hunger" />
+                </div>
+                <div class="muted rp-create-hint">
+                    Semicolon-getrennte <code>key=wert</code>-Liste. <code>=wert</code> ist optional —
+                    es setzt einen Default. Diese Stats werden für ALLE Charaktere in dieser
+                    Session getrackt. Beispiele: <code>clothing=nackt; mood; hunger</code>.
+                </div>
+            </div>
+            <footer class="modal-footer">
+                <button class="btn" id="rp-create-cancel">Abbrechen</button>
+                <button class="btn primary" id="rp-create-submit">Anlegen</button>
+            </footer>
+        </div>
+    </div>
+
     <!-- ─── Character session modal (chat-toolbar popout) ────────── -->
     <div id="character-session-modal" class="modal-wrap" hidden>
         <div class="modal character-session-modal">
@@ -1386,7 +1396,7 @@
     <!-- HoloMat layer loads BEFORE app.js so window.LexyHolo is available.
          ``?v=…`` matches the head-tag version so the bundle stays
          consistent across cache layers. -->
-    <script src="/static/holo.js?v=20260506j"></script>
-    <script src="/static/app.js?v=20260506j"></script>
+    <script src="/static/holo.js?v=20260507a"></script>
+    <script src="/static/app.js?v=20260507a"></script>
 </body>
 </html>

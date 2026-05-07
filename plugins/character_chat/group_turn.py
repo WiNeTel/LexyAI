@@ -100,6 +100,11 @@ class GroupTurnRequest:
     #     speaker's persona + state).
     # An empty dict (or missing key) means "no lore for this speaker".
     lore_by_speaker: dict[str, "ActivationResult"] = field(default_factory=dict)
+    # Phase 13 — per-character live state from the RP session container,
+    # keyed by character_id. Overrides ``card.state`` when building the
+    # prompt's state-block. Empty dict / missing key falls back to the
+    # legacy ``card.state`` so non-RP code paths keep working.
+    live_state_by_char: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -501,11 +506,30 @@ class GroupTurnOrchestrator:
                 or card.name
             )
             try:
+                # Phase 13: pass the session_id so the recall function
+                # can route to the per-RP-session collection. Plugins
+                # implementing the legacy 3-arg signature still work
+                # because we pass session_id as a keyword.
                 own_memories = await self._recall_fn(
                     character_id=card.id,
                     query=query,
                     limit=self._recall_limit,
+                    session_id=req.session_id,
                 )
+            except TypeError:
+                # Fallback for older recall_fn signatures without session_id.
+                try:
+                    own_memories = await self._recall_fn(
+                        character_id=card.id,
+                        query=query,
+                        limit=self._recall_limit,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "character_chat.recall_failed_legacy: %s (char=%s)",
+                        exc,
+                        card.name,
+                    )
             except Exception as exc:  # noqa: BLE001
                 log.warning(
                     "character_chat.recall_failed: %s (char=%s)",
@@ -695,7 +719,14 @@ class GroupTurnOrchestrator:
                 )
             )
 
-        state_text = _format_state_block(card.state or {})
+        # Phase 13: live session state takes precedence over the
+        # legacy character-scoped ``state`` column. The plugin pre-
+        # populates ``live_state_by_char`` from the RP container; any
+        # other code path (chat-tab character mode, tests) still falls
+        # back to ``card.state`` so this is backward compatible.
+        live_state = (req.live_state_by_char or {}).get(card.id)
+        effective_state = live_state if live_state else (card.state or {})
+        state_text = _format_state_block(effective_state)
         if state_text:
             sections.append(
                 PromptSection(

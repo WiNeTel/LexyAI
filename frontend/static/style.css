@@ -2188,6 +2188,39 @@ textarea:focus, select:focus {
 .char-session-row .name { flex: 1; font-weight: 500; }
 .char-session-row .age { font-size: 11px; opacity: 0.6; }
 
+/* RP-session create modal (Phase 13) ──────────────────────────────
+   Lets Mike give a session a name + configure tracked stats on the
+   way IN, so containers materialise with the right defaults. */
+.rp-create-modal { max-width: 540px; }
+.rp-create-modal .setting-row {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 12px;
+}
+.rp-create-modal .setting-row label { font-weight: 500; font-size: 13px; }
+.rp-create-modal .setting-row input,
+.rp-create-modal .setting-row textarea {
+    width: 100%;
+    padding: 6px 8px;
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    color: inherit;
+    font: inherit;
+}
+.rp-create-modal .rp-create-hint {
+    font-size: 12px;
+    line-height: 1.5;
+    margin-top: 8px;
+}
+.rp-create-modal .rp-create-hint code {
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.06);
+    font-size: 11px;
+}
+
 /* Prompt-preview modal (Hotfix Phase 12) ───────────────────────────
    Lets Mike see exactly what's sent to the LLM for a character —
    the summary block flags clothing-watchword hits per source field

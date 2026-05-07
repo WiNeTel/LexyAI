@@ -126,6 +126,8 @@ class CharacterCard(BaseModel):
         scene: str = "",
         other_characters: list["CharacterCard"] | None = None,
         extra_instructions: str = "",
+        live_state: dict[str, str] | None = None,
+        tracked_stats: dict[str, str] | None = None,
     ) -> str:
         """Render this card as an LLM system prompt.
 
@@ -133,6 +135,15 @@ class CharacterCard(BaseModel):
         includes persona, scenario, age-stage guidance, relationship hints
         for any ``other_characters`` currently in the scene, and finally the
         example dialog as a few-shot anchor.
+
+        Phase 13:
+        * ``live_state`` — when set, OVERRIDES ``self.state`` for the
+          state block. The plugin passes the live RP-session state here
+          so the prompt reflects the truth of the current session, not
+          the legacy per-character state column.
+        * ``tracked_stats`` — when set, the rules block tells the LLM
+          which keys are valid in its ``<state>`` output, instead of the
+          generic anchor-key list.
         """
         parts: list[str] = []
         parts.append(f"Du bist {self.name}.")
@@ -164,7 +175,12 @@ class CharacterCard(BaseModel):
             if lines:
                 parts.append("\n## Andere Anwesende\n" + "\n".join(lines))
 
-        state_block = _format_state_block(self.state)
+        # Phase 13: live_state (from the RP session container) wins
+        # over the legacy character.state column. Passing a non-None
+        # empty dict means "no state right now" — different from None
+        # which means "use the card's default".
+        effective_state = live_state if live_state is not None else self.state
+        state_block = _format_state_block(effective_state)
         if state_block:
             # The state block is the SINGLE SOURCE OF TRUTH for the
             # character's current physical/emotional reality. We
@@ -196,6 +212,18 @@ class CharacterCard(BaseModel):
                 "oben.*"
             )
 
+        # Build the allowed-keys hint for the <state> rule. Phase 13:
+        # the session's tracked_stats wins; otherwise the legacy
+        # anchor list serves as a sane default for non-RP usage.
+        if tracked_stats:
+            stats_keys = list(tracked_stats.keys())
+        else:
+            stats_keys = [
+                "location", "mood", "last_action",
+                "clothing", "posture", "condition",
+            ]
+        stats_str = ", ".join(f"**{k}**" for k in stats_keys) if stats_keys else "(keine konfiguriert)"
+
         parts.append(
             "\n## Regeln (RP-Disziplin)\n"
             "- **Bleib in deinem Charakter.** Du sprichst, denkst und "
@@ -223,11 +251,8 @@ class CharacterCard(BaseModel):
             "künstlich kurz.\n"
             "- Du DARFST am Ende deiner Antwort optional einen "
             "<state>key=value; key=value</state> Block setzen, wenn "
-            "sich dein Zustand geändert hat. Erlaubte Keys: "
-            "**location, mood, last_action, clothing, posture, "
-            "condition**. Plus optional eigene snake_case Keys "
-            "(injury, holding, etc). Wird nicht angezeigt, dient als "
-            "dein Gedächtnis."
+            "sich dein Zustand geändert hat. Erlaubte Keys für DIESE "
+            f"Session: {stats_str}. Andere Keys werden ignoriert."
         )
 
         if extra_instructions.strip():
