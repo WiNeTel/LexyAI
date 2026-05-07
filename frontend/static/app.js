@@ -5046,6 +5046,17 @@
     const charFormStateMood = $("char-form-state-mood");
     const charFormStateLocation = $("char-form-state-location");
     const charFormStateReset = $("char-form-state-reset");
+    // Prompt-Vorschau (Hotfix Phase 12) — debug helper that shows
+    // the rendered system prompt + flags any clothing words still
+    // hiding in persona/scenario/greeting/example_dialog. Mike's
+    // RP characters kept referencing clothes their state didn't
+    // match; this gives him a one-click way to find the source.
+    const charFormPreviewBtn = $("char-form-preview-prompt");
+    const charPromptPreviewModal = $("char-prompt-preview-modal");
+    const charPromptPreviewClose = $("char-prompt-preview-close");
+    const charPromptPreviewTitle = $("char-prompt-preview-title");
+    const charPromptPreviewSummary = $("char-prompt-preview-summary");
+    const charPromptPreviewPre = $("char-prompt-preview-pre");
     const charFormAvatarImg = $("char-form-avatar-img");
     const charFormAvatarBtn = $("char-form-avatar-btn");
     const charFormAvatarFile = $("char-form-avatar-file");
@@ -5211,6 +5222,9 @@
         charFormArchive.hidden = c.archived;
         charFormUnarchive.hidden = !c.archived;
         charFormDelete.hidden = false;
+        // Prompt-preview is meaningful only for an existing (saved)
+        // character. resetCharacterForm() hides it again.
+        if (charFormPreviewBtn) charFormPreviewBtn.hidden = false;
         renderCharactersList();
     }
 
@@ -5241,6 +5255,7 @@
         charFormArchive.hidden = true;
         charFormUnarchive.hidden = true;
         charFormDelete.hidden = true;
+        if (charFormPreviewBtn) charFormPreviewBtn.hidden = true;
         renderCharactersList();
     }
 
@@ -5340,6 +5355,142 @@
         wsSend({ type: "character_delete", id });
         resetCharacterForm();
     });
+
+    // ─── Prompt-Vorschau (Phase 12 Hotfix) ──────────────────────────
+    // Mike's RP characters kept emitting clothing references that
+    // contradicted ``state.clothing``. The state-block authority fix
+    // alone wasn't enough — the actual clothing words still hide
+    // somewhere in persona/scenario/greeting/example_dialog. This
+    // modal fetches the rendered system prompt from the debug REST
+    // endpoint and highlights every clothing-watchword hit so Mike
+    // can find the offending field in seconds.
+    const _CLOTHING_WATCHWORDS = [
+        "shirt", "t-shirt", "tshirt", "hemd", "bluse", "top",
+        "slip", "höschen", "hoeschen", "unterwäsche", "unterwaesche", "string", "tanga",
+        "hose", "rock", "kleid", "pyjama", "schlafanzug",
+        "pulli", "pullover", "jacke", "mantel", "schuhe", "socken", "strümpfe", "struempfe",
+        "bh", "büstenhalter", "buestenhalter", "panties", "leggings", "jeans",
+    ];
+    const _CLOTHING_RE = new RegExp(
+        "\\b(" + _CLOTHING_WATCHWORDS.map((w) => w.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&")).join("|") + ")\\b",
+        "gi",
+    );
+
+    function _scanClothingHits(text) {
+        if (!text) return [];
+        const hits = new Set();
+        let m;
+        _CLOTHING_RE.lastIndex = 0;
+        while ((m = _CLOTHING_RE.exec(text)) !== null) {
+            hits.add(m[1].toLowerCase());
+        }
+        return [...hits];
+    }
+
+    function _highlightClothing(escapedText) {
+        // Operate on already-HTML-escaped text so we can wrap matches
+        // in <mark>…</mark> safely.
+        return escapedText.replace(_CLOTHING_RE, (m) => `<mark>${m}</mark>`);
+    }
+
+    function renderPromptPreview(body) {
+        if (!charPromptPreviewModal) return;
+        const name = body.character_name || "Charakter";
+        if (charPromptPreviewTitle) {
+            charPromptPreviewTitle.textContent = `Prompt-Vorschau · ${name}`;
+        }
+
+        // Per-source quick-scan.
+        const sources = [
+            ["persona", body.persona || ""],
+            ["scenario", body.scenario || ""],
+            ["greeting", body.greeting || ""],
+            ["example_dialog", body.example_dialog || ""],
+        ];
+        const rows = [];
+        const stateClothing = (body.state && body.state.clothing) ? String(body.state.clothing) : "";
+        if (stateClothing) {
+            rows.push(`<div class="row ok">🧷 <strong>state.clothing</strong> = "${escapeHtml(stateClothing)}" (Wahrheit für die LLM)</div>`);
+        } else {
+            rows.push(`<div class="row">🧷 state.clothing nicht gesetzt</div>`);
+        }
+        for (const [label, val] of sources) {
+            if (!val) {
+                rows.push(`<div class="row ok">✓ <strong>${label}</strong> leer</div>`);
+                continue;
+            }
+            const hits = _scanClothingHits(val);
+            if (hits.length === 0) {
+                rows.push(`<div class="row ok">✓ <strong>${label}</strong> keine Klamotten-Wörter</div>`);
+            } else {
+                rows.push(
+                    `<div class="row warn">⚠ <strong>${label}</strong> enthält: ${
+                        hits.map((h) => `<code>${escapeHtml(h)}</code>`).join(", ")
+                    }</div>`,
+                );
+            }
+        }
+        // Length info.
+        const len = body.prompt_length || (body.prompt ? body.prompt.length : 0);
+        rows.push(`<div class="row">📏 Prompt-Länge: ${len} Zeichen</div>`);
+        if (charPromptPreviewSummary) {
+            charPromptPreviewSummary.innerHTML = rows.join("");
+        }
+
+        // Full prompt with clothing words highlighted.
+        if (charPromptPreviewPre) {
+            const escaped = escapeHtml(body.prompt || "");
+            charPromptPreviewPre.innerHTML = _highlightClothing(escaped);
+        }
+
+        charPromptPreviewModal.hidden = false;
+    }
+
+    async function openPromptPreview() {
+        const id = charFormId.value.trim();
+        if (!id) {
+            if (typeof toast === "function") {
+                toast("Vorschau", "Bitte erst Charakter speichern.");
+            }
+            return;
+        }
+        const sessionId = (state && (state.rpSessionId || state.sessionId)) || "";
+        let url = `/api/v1/plugins/character_chat/characters/${encodeURIComponent(id)}/prompt`;
+        if (sessionId) {
+            url += `?session_id=${encodeURIComponent(sessionId)}`;
+        }
+        try {
+            const resp = await fetch(url);
+            if (!resp.ok) {
+                if (typeof toast === "function") {
+                    toast("Vorschau fehlgeschlagen", `HTTP ${resp.status}`);
+                }
+                return;
+            }
+            const body = await resp.json();
+            renderPromptPreview(body);
+        } catch (err) {
+            if (typeof toast === "function") {
+                toast("Vorschau fehlgeschlagen", String(err && err.message ? err.message : err));
+            }
+        }
+    }
+
+    if (charFormPreviewBtn) charFormPreviewBtn.addEventListener("click", openPromptPreview);
+    if (charPromptPreviewClose) {
+        charPromptPreviewClose.addEventListener("click", () => {
+            if (charPromptPreviewModal) charPromptPreviewModal.hidden = true;
+        });
+    }
+    if (charPromptPreviewModal) {
+        charPromptPreviewModal.addEventListener("click", (e) => {
+            // Click outside .modal closes the wrapper — same pattern
+            // as the other modals in this file.
+            if (e.target === charPromptPreviewModal) {
+                charPromptPreviewModal.hidden = true;
+            }
+        });
+    }
 
     // Avatar upload
     if (charFormAvatarBtn) {

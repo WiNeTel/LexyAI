@@ -11,13 +11,13 @@
       JSON.parse a PNG and failed with "unexpected character at line 1
       column 1". Bump the date string when shipping a frontend change.
     -->
-    <link rel="stylesheet" href="/static/style.css?v=20260506i" />
-    <link rel="stylesheet" href="/static/holo.css?v=20260506i" />
+    <link rel="stylesheet" href="/static/style.css?v=20260506j" />
+    <link rel="stylesheet" href="/static/holo.css?v=20260506j" />
     <!-- Three.js for 3D Avatar Stage. Bundled locally so Lexy works
          offline / on air-gapped LANs (cdnjs blocked or unreachable).
          Falls back gracefully — holo.js uses ``typeof THREE === 'undefined'``
          to skip the avatar stage when the script didn't load. -->
-    <script src="/static/vendor/three.min.js?v=20260506i" defer></script>
+    <script src="/static/vendor/three.min.js?v=20260506j" defer></script>
 </head>
 <body>
 
@@ -531,6 +531,10 @@
                             <div class="characters-form-buttons">
                                 <button type="submit" class="btn primary" id="char-form-save">Speichern</button>
                                 <button type="button" class="btn" id="char-form-reset">Neuer Charakter</button>
+                                <button type="button" class="btn" id="char-form-preview-prompt" hidden
+                                        title="Zeigt den System-Prompt der an die LLM gehen würde — perfekt zum debuggen wenn ein Charakter Sachen erwähnt die er nicht tragen sollte.">
+                                    👁 Prompt-Vorschau
+                                </button>
                                 <button type="button" class="btn" id="char-form-attach" hidden>An aktive Session</button>
                                 <button type="button" class="btn" id="char-form-detach" hidden>Aus Session entfernen</button>
                                 <button type="button" class="btn" id="char-form-archive" hidden>Archivieren</button>
@@ -542,6 +546,27 @@
                     </form>
                 </div>
             </section>
+
+            <!-- ─── Prompt-Preview Modal (Hotfix Phase 12) ─────────────
+                 Lets the user see exactly what's sent to the LLM for
+                 a character — quick way to find which input field
+                 (persona / scenario / greeting / example_dialog)
+                 contains stale clothing / posture text. -->
+            <div id="char-prompt-preview-modal" class="modal-wrap" hidden>
+                <div class="modal char-prompt-preview-modal">
+                    <header class="modal-head">
+                        <h3 id="char-prompt-preview-title">Prompt-Vorschau</h3>
+                        <button class="btn icon" id="char-prompt-preview-close" title="Schließen">✕</button>
+                    </header>
+                    <div class="modal-body">
+                        <div id="char-prompt-preview-summary" class="prompt-preview-summary"></div>
+                        <details open>
+                            <summary>Vollständiger Prompt</summary>
+                            <pre id="char-prompt-preview-pre" class="prompt-preview-pre"></pre>
+                        </details>
+                    </div>
+                </div>
+            </div>
 
             <!-- ─── Roleplay tab (Phase 9.12) ──────────────────────────
                  Eigener Chat-Bereich für Charakter-Sessions. Dasselbe
@@ -1361,7 +1386,7 @@
     <!-- HoloMat layer loads BEFORE app.js so window.LexyHolo is available.
          ``?v=…`` matches the head-tag version so the bundle stays
          consistent across cache layers. -->
-    <script src="/static/holo.js?v=20260506i"></script>
-    <script src="/static/app.js?v=20260506i"></script>
+    <script src="/static/holo.js?v=20260506j"></script>
+    <script src="/static/app.js?v=20260506j"></script>
 </body>
 </html>
