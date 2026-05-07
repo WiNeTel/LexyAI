@@ -5036,6 +5036,16 @@
     const charFormTags = $("char-form-tags");
     const charFormPulsePattern = $("char-form-pulse-pattern");
     const charFormPulsePrompt = $("char-form-pulse-prompt");
+    // ── Live-State editor (Phase 12 hotfix) ────────────────────────
+    // Anchor keys per state_updater.ANCHOR_STATE_KEYS — empty input
+    // means "drop the key from state" (so a Mike-emptied "clothing"
+    // doesn't leak the LLM's old "Shirt" entry into future prompts).
+    const charFormStateClothing = $("char-form-state-clothing");
+    const charFormStatePosture = $("char-form-state-posture");
+    const charFormStateCondition = $("char-form-state-condition");
+    const charFormStateMood = $("char-form-state-mood");
+    const charFormStateLocation = $("char-form-state-location");
+    const charFormStateReset = $("char-form-state-reset");
     const charFormAvatarImg = $("char-form-avatar-img");
     const charFormAvatarBtn = $("char-form-avatar-btn");
     const charFormAvatarFile = $("char-form-avatar-file");
@@ -5179,6 +5189,14 @@
         charFormTags.value = (c.tags || []).join(", ");
         charFormPulsePattern.value = c.proactive_pulse_pattern || "";
         charFormPulsePrompt.value = c.proactive_pulse_prompt || "";
+        // Live-state anchor keys. The card's ``state`` is a dict;
+        // unset keys → empty input.
+        const cstate = (c && typeof c.state === "object" && c.state) || {};
+        if (charFormStateClothing) charFormStateClothing.value = cstate.clothing || "";
+        if (charFormStatePosture) charFormStatePosture.value = cstate.posture || "";
+        if (charFormStateCondition) charFormStateCondition.value = cstate.condition || "";
+        if (charFormStateMood) charFormStateMood.value = cstate.mood || "";
+        if (charFormStateLocation) charFormStateLocation.value = cstate.location || "";
         if (c.avatar) {
             charFormAvatarImg.src = c.avatar;
             charFormAvatarImg.style.display = "";
@@ -5211,6 +5229,11 @@
         charFormTags.value = "";
         charFormPulsePattern.value = "";
         charFormPulsePrompt.value = "";
+        if (charFormStateClothing) charFormStateClothing.value = "";
+        if (charFormStatePosture) charFormStatePosture.value = "";
+        if (charFormStateCondition) charFormStateCondition.value = "";
+        if (charFormStateMood) charFormStateMood.value = "";
+        if (charFormStateLocation) charFormStateLocation.value = "";
         charFormAvatarImg.removeAttribute("src");
         charFormAvatarImg.style.display = "none";
         charFormAttach.hidden = true;
@@ -5224,6 +5247,24 @@
     async function submitCharacterForm(e) {
         e.preventDefault();
         const id = charFormId.value.trim();
+
+        // Build live-state from the anchor inputs. Empty values are
+        // intentionally dropped — that's how Mike removes a stuck
+        // "clothing: Shirt" entry without having to write JSON.
+        const state = {};
+        const _stateInputs = [
+            ["clothing", charFormStateClothing],
+            ["posture", charFormStatePosture],
+            ["condition", charFormStateCondition],
+            ["mood", charFormStateMood],
+            ["location", charFormStateLocation],
+        ];
+        for (const [key, el] of _stateInputs) {
+            if (el && el.value && el.value.trim()) {
+                state[key] = el.value.trim();
+            }
+        }
+
         const payload = {
             name: charFormName.value.trim(),
             persona: charFormPersona.value,
@@ -5236,6 +5277,9 @@
             tags: charFormTags.value.split(",").map((t) => t.trim()).filter(Boolean),
             proactive_pulse_pattern: charFormPulsePattern.value.trim(),
             proactive_pulse_prompt: charFormPulsePrompt.value.trim(),
+            // Pass the cleaned state dict — backend Stores it on the
+            // characters row as JSON (state field).
+            state,
         };
         if (!payload.name) { charsHint("Name fehlt", "error"); return; }
         if (id) {
@@ -5246,6 +5290,18 @@
             charsHint("Erstellt ✓", "ok");
         }
     }
+
+    // 🧹 Reset state — wipe all anchor fields so the next save
+    // produces an empty state dict. The user still has to click
+    // "Speichern" — this just clears the inputs.
+    if (charFormStateReset) charFormStateReset.addEventListener("click", () => {
+        if (charFormStateClothing) charFormStateClothing.value = "";
+        if (charFormStatePosture) charFormStatePosture.value = "";
+        if (charFormStateCondition) charFormStateCondition.value = "";
+        if (charFormStateMood) charFormStateMood.value = "";
+        if (charFormStateLocation) charFormStateLocation.value = "";
+        charsHint("State-Felder geleert — Speichern klicken um zu übernehmen.", "ok");
+    });
 
     if (charsForm) charsForm.addEventListener("submit", submitCharacterForm);
     if (charsNewBtn) charsNewBtn.addEventListener("click", resetCharacterForm);

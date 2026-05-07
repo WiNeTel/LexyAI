@@ -11,13 +11,13 @@
       JSON.parse a PNG and failed with "unexpected character at line 1
       column 1". Bump the date string when shipping a frontend change.
     -->
-    <link rel="stylesheet" href="/static/style.css?v=20260506g" />
-    <link rel="stylesheet" href="/static/holo.css?v=20260506g" />
+    <link rel="stylesheet" href="/static/style.css?v=20260506h" />
+    <link rel="stylesheet" href="/static/holo.css?v=20260506h" />
     <!-- Three.js for 3D Avatar Stage. Bundled locally so Lexy works
          offline / on air-gapped LANs (cdnjs blocked or unreachable).
          Falls back gracefully — holo.js uses ``typeof THREE === 'undefined'``
          to skip the avatar stage when the script didn't load. -->
-    <script src="/static/vendor/three.min.js?v=20260506g" defer></script>
+    <script src="/static/vendor/three.min.js?v=20260506h" defer></script>
 </head>
 <body>
 
@@ -488,6 +488,43 @@
                             <label>Tags</label>
                             <input type="text" id="char-form-tags" placeholder="rp, family, baby (komma-separiert)" />
                         </div>
+
+                        <!-- ─── Live-State (Phase 12 hotfix) ───
+                             The State block lands at the top of the
+                             character's system prompt and persists
+                             across turns. Without UI to edit it, Mike
+                             couldn't override Sandra's "Shirt" entry
+                             back to "nackt" — only the LLM could via
+                             `<state>` blocks in its responses.
+                             Now: fill the anchor fields directly,
+                             empty = drop the key from state. -->
+                        <details class="char-form-state-block">
+                            <summary>Live-Zustand <span class="muted">(was der Charakter gerade trägt / fühlt / tut)</span></summary>
+                            <div class="setting-row">
+                                <label>Kleidung</label>
+                                <input type="text" id="char-form-state-clothing" placeholder="z.B. nackt, T-Shirt, Pyjama (leer = nicht im Prompt)" />
+                            </div>
+                            <div class="setting-row">
+                                <label>Haltung</label>
+                                <input type="text" id="char-form-state-posture" placeholder="z.B. sitzend, stehend, liegend" />
+                            </div>
+                            <div class="setting-row">
+                                <label>Zustand</label>
+                                <input type="text" id="char-form-state-condition" placeholder="z.B. müde, energiegeladen, krank" />
+                            </div>
+                            <div class="setting-row">
+                                <label>Stimmung</label>
+                                <input type="text" id="char-form-state-mood" placeholder="z.B. fröhlich, genervt, neugierig" />
+                            </div>
+                            <div class="setting-row">
+                                <label>Ort</label>
+                                <input type="text" id="char-form-state-location" placeholder="z.B. Küche, Garten, Schlafzimmer" />
+                            </div>
+                            <div class="setting-row">
+                                <label>&nbsp;</label>
+                                <button type="button" class="btn btn-danger" id="char-form-state-reset" title="Alle State-Felder leeren — der Charakter startet wieder ohne erinnerten Zustand.">🧹 Zustand zurücksetzen</button>
+                            </div>
+                        </details>
 
                         <div class="setting-row">
                             <label>&nbsp;</label>
@@ -1103,12 +1140,15 @@
                         </div>
                     </label>
                     <label class="wipe-option">
-                        <input type="checkbox" id="wipe-opt-sessions" checked />
+                        <input type="checkbox" id="wipe-opt-sessions" />
                         <div>
                             <strong>Conversation History</strong>
                             <div class="muted">
-                                Alle Session-Histories (die letzten 20 Messages pro
-                                Session) werden geleert. Live-Chats werden nicht abgebrochen.
+                                ⚠ <strong>Auch alle Sessions</strong> (Chat + RP) werden
+                                gelöscht — inklusive Charakter-Turns + Session-Lorebooks.
+                                Standardmäßig <strong>aus</strong>: ein Memory-Wipe soll
+                                nur die Vector-DB leeren, nicht deine Conversation-History.
+                                Nur ankreuzen wenn du wirklich ALLES löschen willst.
                             </div>
                         </div>
                     </label>
@@ -1321,7 +1361,7 @@
     <!-- HoloMat layer loads BEFORE app.js so window.LexyHolo is available.
          ``?v=…`` matches the head-tag version so the bundle stays
          consistent across cache layers. -->
-    <script src="/static/holo.js?v=20260506g"></script>
-    <script src="/static/app.js?v=20260506g"></script>
+    <script src="/static/holo.js?v=20260506h"></script>
+    <script src="/static/app.js?v=20260506h"></script>
 </body>
 </html>
