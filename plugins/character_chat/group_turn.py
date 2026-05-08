@@ -531,25 +531,14 @@ class GroupTurnOrchestrator:
         # autonomous: LLM picks order over the remaining candidates.
         remaining = [c for c in eligible if c.id not in seen]
 
-        # Phase 13.3 — HYBRID first pass: try the deterministic
-        # natural-order activator before burning an e4b call. If it
-        # produces a non-empty order, we use it; otherwise we fall
-        # through to the LLM-based picker. This matches Mike's
-        # explicit choice "Hybrid: deterministic first, e4b fallback"
-        # and keeps the e4b model on port 5006 (speaker_selection_brain).
-        if remaining and not self._always_call_orchestrator:
-            natural_order = self._activate_natural_order(
-                req=req, eligible=remaining,
-            )
-            if natural_order:
-                order.extend(natural_order)
-                self._log_speakers_picked(
-                    method=(method or "natural_order"),
-                    order=order, brain_called=False, req=req,
-                )
-                return order
-            # else: empty roll — fall through to e4b.
-
+        # Phase 13.3b — UPDATED HIERARCHY (Mike's choice):
+        #   1. Name-mention (handled above, in ``forced``)
+        #   2. LLM story-match — picks the *contextually right* speaker
+        #      with full persona + relationships + last-turn context
+        #      (e.g. "Sandra is the nurse → answers when Lena is hurt")
+        #   3. Talkativeness roll as last-resort for idle phases when
+        #      the LLM also can't decide cleanly.
+        #
         # always_call_orchestrator path: LLM gets *all* eligibles and the
         # mention-derived order as a preferred hint. We use this to
         # catch cases where the user named a char that shouldn't
@@ -575,19 +564,44 @@ class GroupTurnOrchestrator:
             )
             return order
 
+        # Phase 13.3b: PRIMARY autonomous path — story-match LLM call.
+        # The selector now sees personas + relationships + last turn
+        # so it can answer "who would naturally react RIGHT NOW".
         llm_order = await self._ask_llm_for_order(req=req, candidates=remaining)
-        order.extend(llm_order)
-        # Safety net: if LLM picked nothing, fall back to round-robin.
-        if not llm_order and not order:
+        if llm_order:
+            order.extend(llm_order)
+            self._log_speakers_picked(
+                method=(method or "llm_story_match"),
+                order=order, brain_called=True, req=req,
+            )
+            return order
+
+        # LAST RESORT: LLM had no clear pick — roll talkativeness so
+        # idle group chat (everyone equally likely) still produces a
+        # speaker instead of silence.
+        natural_order = self._activate_natural_order(
+            req=req, eligible=remaining,
+        )
+        if natural_order:
+            order.extend(natural_order)
+            self._log_speakers_picked(
+                method=(method or "talkativeness_fallback"),
+                order=order, brain_called=True, req=req,
+            )
+            return order
+
+        # Absolute last resort — neither LLM nor talkativeness picked
+        # anyone. Fall back to round-robin so the round isn't silent.
+        if not order:
             order = [c.id for c in remaining]
             self._log_speakers_picked(
-                method="llm_failed_round_robin", order=order,
-                brain_called=True, req=req,
+                method="round_robin_safety",
+                order=order, brain_called=True, req=req,
             )
             return order
 
         self._log_speakers_picked(
-            method=method or "llm" if llm_order else "mention",
+            method=method or "mention",
             order=order, brain_called=True, req=req,
         )
         return order
@@ -625,9 +639,34 @@ class GroupTurnOrchestrator:
         candidates: list[CharacterCard],
         preferred_order: list[str] | None = None,
     ) -> list[str]:
-        roster = "\n".join(
-            f"- {c.name} (id={c.id}): {_brief_persona(c)}" for c in candidates
-        )
+        # Phase 13.3b: build a richer roster so the selector can reason
+        # about expertise + relationships ("Sandra ist Krankenschwester
+        # → reagiert auf Verletzungen", "Mira kann tauchen → reagiert
+        # wenn jemand was im Wasser sieht"). Mike's brief: characters
+        # should ASK each other based on who can do what.
+        roster_blocks: list[str] = []
+        char_by_id = {c.id: c for c in candidates}
+        for c in candidates:
+            persona_brief = _brief_persona(c)
+            chat_score = (
+                f"talkativeness={float(c.talkativeness):.1f}"
+            )
+            # Resolve relationships against THIS roster only — labels
+            # for non-eligible chars don't help the picker decide.
+            rel_lines: list[str] = []
+            for other_id, label in (c.relationships or {}).items():
+                other = char_by_id.get(other_id)
+                if other is not None and label:
+                    rel_lines.append(f"  · {other.name}: {label}")
+            block = (
+                f"- **{c.name}** (id={c.id}, {chat_score})\n"
+                f"  Profil: {persona_brief}"
+            )
+            if rel_lines:
+                block += "\n  Beziehungen:\n" + "\n".join(rel_lines)
+            roster_blocks.append(block)
+        roster = "\n\n".join(roster_blocks)
+
         trigger = req.user_message.strip() or (
             f"*{req.pulse_text}*" if req.pulse_text else ""
         )
@@ -651,19 +690,32 @@ class GroupTurnOrchestrator:
 
         system = (
             "Du bist der Turn-Orchestrator einer RP-Gruppe. Deine Aufgabe: "
-            "entscheiden, welche Charaktere auf den aktuellen Impuls reagieren "
-            "und in welcher Reihenfolge. Keine Erfindungen — nur IDs aus der "
-            "Liste. Antworte AUSSCHLIESSLICH mit IDs, komma-separiert, in der "
-            "Reihenfolge in der sie sprechen sollen. Wenn jemand schweigen "
-            "würde, lass sie/ihn einfach weg. Maximal "
-            f"{self._max_speakers} Charaktere."
+            "entscheiden, **welcher Charakter** kontextuell am besten geeignet "
+            "ist auf den Impuls zu reagieren — und ob noch ein zweiter "
+            "naheliegend ist.\n\n"
+            "Heuristik:\n"
+            "1. **Expertise-Match** wiegt am höchsten. Wenn jemand "
+            "verletzt ist → Krankenschwester reagiert. Wenn was im Wasser "
+            "treibt → die Surfer/Taucherin. Wenn Lager gebaut werden muss "
+            "→ Architektin. Lies die Profile.\n"
+            "2. **Beziehungs-Bezug**: wer wurde direkt angesprochen oder "
+            "im letzten Turn erwähnt?\n"
+            "3. **Relevanz**: kann dieser Charakter etwas konkret zur "
+            "Situation BEITRAGEN — oder würde er nur 'mhm' sagen?\n"
+            "4. **Talkativeness** ist ein Bias, kein Muss — niedrige Werte "
+            "(z.B. 0.3) sprechen weniger oft, aber wenn ihre Expertise "
+            "gefragt ist, spricht sie trotzdem.\n\n"
+            "Antworte AUSSCHLIESSLICH mit IDs, komma-separiert, in der "
+            "Reihenfolge in der sie sprechen sollen. Maximal "
+            f"{self._max_speakers} Charaktere. Wenn niemand klar passt, "
+            "gib eine leere Liste zurück (ein Wort: NONE)."
         )
         user = (
-            f"## Roster\n{roster}\n\n"
-            f"## Letzte Zeilen\n{history_blurb}\n\n"
+            f"## Charaktere\n{roster}\n\n"
+            f"## Letzte Zeilen aus dem Chat\n{history_blurb}\n\n"
             f"## Aktueller Impuls\n{trigger}"
             f"{hint_block}\n\n"
-            "## Deine Antwort (IDs komma-separiert, keine Erklärung):"
+            "## Deine Antwort (IDs komma-separiert, oder NONE):"
         )
 
         try:
@@ -684,6 +736,15 @@ class GroupTurnOrchestrator:
         except Exception as exc:  # noqa: BLE001
             log.warning("character_chat.order_llm_failed: %s", exc)
             return [c.id for c in candidates]
+
+        # Phase 13.3b: explicit "no clear match" signal. If the LLM
+        # answers ``NONE`` (we ask for it in the system prompt), we
+        # return [] so the caller can fall through to the
+        # talkativeness-roll last-resort. Stripped of the usual
+        # punctuation cosmetic.
+        cleaned_raw = (raw or "").strip().strip("[]()<>\"' \t`.,;:!\n")
+        if cleaned_raw.upper() == "NONE":
+            return []
 
         valid_ids = {c.id: c.id for c in candidates}
         # Also map name→id so the LLM can reply with names if it can't keep
