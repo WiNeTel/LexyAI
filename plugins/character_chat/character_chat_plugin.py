@@ -520,16 +520,32 @@ class CharacterChatPlugin(BasePlugin):
 
         Mike's Phase 13 ask: *"alle Memorys und sessions sollten
         gelöscht sein"*. We honour that by clearing every legacy
-        artefact that pre-dates the RP container architecture, but
-        only ONCE — guarded by ``data/.phase13_wiped``. After the
-        marker exists, the wipe is a no-op so restarts don't keep
-        nuking new sessions.
+        artefact that pre-dates the RP container architecture.
+
+        Marker file ``data/.phase13_wiped`` records the version that
+        last ran; if the file shows an OLDER version (or doesn't
+        exist), the wipe runs again. Phase 13.1 added scheduler-
+        timer cleanup, so first-time installations and existing
+        Phase-13 installs both end up cleaned up.
         """
         from pathlib import Path
+        WIPE_VERSION = "13.1"
         marker = Path("data/.phase13_wiped")
         if marker.exists():
-            return
-        log.warning("character_chat.phase13_wipe_starting")
+            try:
+                payload = json.loads(marker.read_text(encoding="utf-8"))
+                last_version = str(payload.get("version") or "13.0")
+            except Exception:  # noqa: BLE001
+                last_version = "13.0"
+            if last_version >= WIPE_VERSION:
+                return
+            log.warning(
+                "character_chat.phase13_wipe_upgrading",
+                from_version=last_version,
+                to_version=WIPE_VERSION,
+            )
+        else:
+            log.warning("character_chat.phase13_wipe_starting")
         # 1) character_turns + character_sessions: blow them away.
         deleted_turns = 0
         deleted_sess = 0
@@ -594,15 +610,31 @@ class CharacterChatPlugin(BasePlugin):
                 error=str(exc),
             )
 
+        # 4) (NEW in 13.1) Kill every character_pulse:* and
+        #    autonomous_sim:* timer in the scheduler. Mike reported
+        #    that ghost timers from pre-Phase-13 sessions kept firing
+        #    against now-dead session_ids — they survived the DB
+        #    wipe because they live in the scheduler plugin's own
+        #    table. Phase 13's clean-slate promise demands they go.
+        cancelled_timers = 0
+        try:
+            cancelled_timers = await self._cancel_all_character_timers()
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "character_chat.phase13_timer_wipe_failed", error=str(exc),
+            )
+
         marker.parent.mkdir(parents=True, exist_ok=True)
         import time as _time
         marker.write_text(
             json.dumps({
+                "version": WIPE_VERSION,
                 "wiped_at": _time.time(),
                 "character_turns": deleted_turns,
                 "character_sessions": deleted_sess,
                 "memory_items": deleted_mem,
                 "core_sessions": deleted_core_sessions,
+                "timers_cancelled": cancelled_timers,
             }, indent=2),
             encoding="utf-8",
         )
@@ -612,7 +644,46 @@ class CharacterChatPlugin(BasePlugin):
             character_sessions=deleted_sess,
             memory_items=deleted_mem,
             core_sessions=deleted_core_sessions,
+            timers_cancelled=cancelled_timers,
         )
+
+    async def _cancel_all_character_timers(self) -> int:
+        """Cancel every ``character_pulse:*`` and ``autonomous_sim:*``
+        recurring timer in the scheduler.
+
+        Used by the Phase-13 wipe to clear ghosts from pre-Phase-13
+        sessions. Returns the number of timers cancelled.
+        """
+        try:
+            listing = await self.api.call_tool("list_timers", {})
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "character_chat.timer_list_failed", error=str(exc),
+            )
+            return 0
+        cancelled = 0
+        for t in (listing or {}).get("timers", []):
+            label = str(t.get("label") or "")
+            if not (
+                label.startswith("character_pulse:")
+                or label.startswith("autonomous_sim:")
+            ):
+                continue
+            timer_id = t.get("id")
+            if not timer_id:
+                continue
+            try:
+                await self.api.call_tool(
+                    "cancel_timer", {"id": timer_id},
+                )
+                cancelled += 1
+            except Exception:  # noqa: BLE001
+                pass
+        # Reset our in-process bookkeeping — the timers we tracked are
+        # all gone; future attaches will create fresh ones.
+        self._pulse_timers.clear()
+        self._simulation_timers.clear()
+        return cancelled
 
     def _app_memory(self) -> Any:
         """Best-effort lookup of MemoryManager via the PluginAPI."""
@@ -1291,8 +1362,15 @@ class CharacterChatPlugin(BasePlugin):
         # respond to baby-crying, toddler-tugging etc. without the user
         # having to type anything — the core agent speaks *as Lexy* in
         # the session, naturally reacting to what the characters did.
+        # Phase 13: respect the session's character_mode. Mode 1 ("only
+        # characters, Lexy stays silent") is Mike's autonomous-test
+        # setting — Lexy butting in there breaks the immersion. Only
+        # Mode 0 (chat-tab default) and Mode 2 (hybrid) get auto-react.
+        sess_state_for_react = await self._get_session_state(session_id)
+        sess_mode = int(sess_state_for_react.get("character_mode") or 0)
         if (
             self._lexy_auto_reacts
+            and sess_mode != 1
             and pulse_from_id
             and result
             and result.get("ok")
@@ -3060,22 +3138,21 @@ class CharacterChatPlugin(BasePlugin):
                                 t.character_name,
                                 state_updates,
                             )
-                        elif self._store is not None:
-                            # Legacy: writes to the character row.
-                            current = await self._store.get(t.character_id)
-                            if current is not None:
-                                merged = merge_state(
-                                    current.state, state_updates,
-                                )
-                                await self._store.update(
-                                    t.character_id, state=merged,
-                                )
-                                log.info(
-                                    "character_chat.state_updated_legacy "
-                                    "character=%s updates=%s",
-                                    t.character_name,
-                                    state_updates,
-                                )
+                        else:
+                            # Phase 13: non-RP sessions DROP state
+                            # updates from LLM ``<state>`` blocks. The
+                            # old behaviour wrote them to the global
+                            # ``characters.state`` column, which
+                            # contaminated the character's defaults
+                            # for OTHER RP sessions (Mike's whole bug
+                            # report). State now belongs strictly to
+                            # the session that produced it.
+                            log.debug(
+                                "character_chat.state_update_dropped "
+                                "(non-rp session) character=%s updates=%s",
+                                t.character_name,
+                                state_updates,
+                            )
                     except Exception as exc:  # noqa: BLE001
                         log.warning(
                             "character_chat.state_update_failed "
