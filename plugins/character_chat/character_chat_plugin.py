@@ -280,9 +280,17 @@ class CharacterChatPlugin(BasePlugin):
         super().__init__(api, manifest)
         # Config (populated in on_load)
         self._default_brain: str = "e4b"
-        self._max_tokens: int = 320
+        # Phase 13.2: 320 was too tight for German narrative RP — Mike
+        # saw mid-sentence cut-offs and ``<state>`` blocks leaking into
+        # the visible chat because the cut-off snipped the closing tag.
+        # 4096 lets even verbose narrators finish their full action.
+        self._max_tokens: int = 4096
         self._temperature: float = 0.8
-        self._max_speakers: int = 4
+        # Phase 13.2: 4 speakers per round produced an "ich auch / ich
+        # auch / ich auch"-loop where every char repeated the same
+        # sand-staring beat. 2 keeps the dynamic alive over time —
+        # different chars react to different pulses.
+        self._max_speakers: int = 2
         self._turn_selection: str = "autonomous"
         # Brain used for the cheap speaker-selection classifier. Independent
         # of ``default_brain`` so the big A4B brain stays free to do actual
@@ -302,7 +310,7 @@ class CharacterChatPlugin(BasePlugin):
         self._smart_pulses_enabled: bool = True
         self._pulse_generation_brain: str = "e4b"
         self._pulse_history_window: int = 6
-        self._pulse_max_tokens: int = 200
+        self._pulse_max_tokens: int = 600  # was 200 — Phase 13.2
         self._proactive_pulses_enabled: bool = True
         self._lexy_auto_reacts: bool = True
         self._memory_strict_isolation: bool = True
@@ -340,6 +348,13 @@ class CharacterChatPlugin(BasePlugin):
         # for those sessions go through the registry instead of the
         # global character_chat tables.
         self._rp_registry: RPSessionRegistry | None = None
+        # Phase 13.2: skip-cooldown table. When a character returns an
+        # empty / pass turn, we mark them with a small cooldown so the
+        # next round's speaker selection avoids them — otherwise the
+        # LLM-orchestrator keeps picking the same silent character and
+        # produces "*Yara schweigt*" five rounds in a row.
+        # Keyed: ``{session_id: {character_id: rounds_remaining}}``.
+        self._skip_cooldowns: dict[str, dict[str, int]] = {}
         # Serialise round execution per session so two concurrent
         # run_round requests don't interleave their broadcasts.
         self._session_locks: dict[str, asyncio.Lock] = {}
@@ -700,6 +715,50 @@ class CharacterChatPlugin(BasePlugin):
             return getattr(self.api, "_app").session_store  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001
             return None
+
+    def _tick_skip_cooldowns(self, session_id: str) -> set[str]:
+        """Snapshot the chars on cooldown for THIS round, then tick.
+
+        Phase 13.2: when a character is silent in round N, they're put
+        on a 1-round cooldown. This call runs at the START of round
+        N+1: every char in the cooldown table at that moment is
+        excluded for this round, *then* their counter is decremented;
+        whoever drops to ≤ 0 becomes eligible again from round N+2 on.
+        That gives the contract Mike asked for: "skipped once → out
+        for one round, then back in".
+        """
+        cooldowns = self._skip_cooldowns.get(session_id)
+        if not cooldowns:
+            return set()
+        # Snapshot first — every char currently on cooldown is
+        # excluded for this round, regardless of remaining count.
+        excluded: set[str] = set(cooldowns.keys())
+        # Then decrement and prune.
+        for char_id in list(cooldowns.keys()):
+            cooldowns[char_id] -= 1
+            if cooldowns[char_id] <= 0:
+                cooldowns.pop(char_id, None)
+        if not cooldowns:
+            self._skip_cooldowns.pop(session_id, None)
+        return excluded
+
+    def _record_skip_cooldowns(
+        self, session_id: str, turns: list[Any],
+    ) -> None:
+        """After a round, mark every skipped character with a 1-round
+        cooldown. Phase 13.2 — prevents the LLM-orchestrator from
+        looping the same silent char.
+        """
+        if not turns:
+            return
+        for turn in turns:
+            if not getattr(turn, "skipped", False):
+                continue
+            char_id = getattr(turn, "character_id", None)
+            if not char_id:
+                continue
+            cooldowns = self._skip_cooldowns.setdefault(session_id, {})
+            cooldowns[char_id] = 1
 
     async def _is_rp_session(self, session_id: str) -> bool:
         """True if the given session is RP — checks both the registry
@@ -2262,6 +2321,10 @@ class CharacterChatPlugin(BasePlugin):
                     error=str(exc),
                 )
 
+            # Phase 13.2: build the skip-cooldown exclusion set + tick
+            # any existing cooldowns down by 1.
+            excluded = self._tick_skip_cooldowns(session_id)
+
             req = GroupTurnRequest(
                 session_id=session_id,
                 history=history,
@@ -2273,6 +2336,7 @@ class CharacterChatPlugin(BasePlugin):
                 extra_forced=extra_forced,
                 lore_by_speaker=lore_by_speaker,
                 live_state_by_char=live_state_by_char,
+                excluded_speaker_ids=excluded,
             )
 
             round_id = uuid.uuid4().hex[:12]
@@ -2291,6 +2355,11 @@ class CharacterChatPlugin(BasePlugin):
             )
 
             result = await self._orchestrator.run_round(req)
+
+            # Phase 13.2: anyone who skipped this round earns a 1-round
+            # cooldown so the LLM-orchestrator doesn't keep picking
+            # them silent again next round.
+            self._record_skip_cooldowns(session_id, result.turns)
 
             await self._persist_and_broadcast_turns(
                 session_id=session_id,

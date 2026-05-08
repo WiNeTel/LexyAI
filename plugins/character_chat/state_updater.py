@@ -56,6 +56,17 @@ _STATE_BLOCK_RE: Final[re.Pattern[str]] = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# Phase 13.2: dangling-tag fallback. When the LLM hits its max_tokens
+# cap mid-state-block, the closing ``</state>`` never lands and the
+# regex above won't match. The user then sees raw "<state>location=
+# beach; mood=anxious; last_action=looking at" in the chat. This second
+# regex catches the trailing open-tag fragment so it gets stripped too.
+# We also try to parse what little we can from it (best-effort).
+_DANGLING_STATE_RE: Final[re.Pattern[str]] = re.compile(
+    r"<state>([^<]*)$",
+    re.IGNORECASE,
+)
+
 
 def parse_state_block(content: str) -> tuple[str, dict[str, str]]:
     """Extract state updates from a turn's content and return cleaned text.
@@ -103,6 +114,32 @@ def parse_state_block(content: str) -> tuple[str, dict[str, str]]:
             updates[key] = value
 
     cleaned = _STATE_BLOCK_RE.sub("", content).strip()
+
+    # Phase 13.2: dangling open-tag handler. If the LLM cut off mid-
+    # state-block (max_tokens hit), there's an unmatched ``<state>``
+    # at the end. Best-effort parse what we can find before the cut,
+    # then strip the fragment.
+    dangling_match = _DANGLING_STATE_RE.search(cleaned)
+    if dangling_match is not None:
+        body = dangling_match.group(1)
+        for pair in re.split(r"[;\n]+", body):
+            pair = pair.strip()
+            if not pair or "=" not in pair:
+                continue
+            key, _, value = pair.partition("=")
+            key = key.strip().lower()
+            value = value.strip().strip("'\"")
+            if not key or len(key) > _KEY_MAX_LEN:
+                continue
+            if not _KEY_RE.match(key):
+                continue
+            if len(value) > _VALUE_MAX_LEN:
+                value = value[:_VALUE_MAX_LEN].rstrip() + "…"
+            # Don't overwrite cleanly-parsed updates from the closed
+            # block above — they're more trustworthy.
+            updates.setdefault(key, value)
+        cleaned = _DANGLING_STATE_RE.sub("", cleaned).rstrip()
+
     return cleaned, updates
 
 

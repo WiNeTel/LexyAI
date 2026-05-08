@@ -105,6 +105,13 @@ class GroupTurnRequest:
     # prompt's state-block. Empty dict / missing key falls back to the
     # legacy ``card.state`` so non-RP code paths keep working.
     live_state_by_char: dict[str, dict[str, str]] = field(default_factory=dict)
+    # Phase 13.2 — speakers to exclude from selection this round (skip-
+    # cooldown). The plugin populates this with chars that returned
+    # empty/pass turns recently. Speaker selection filters these out;
+    # if filtering would empty the candidate list, the orchestrator
+    # falls back to the unfiltered set so the round isn't completely
+    # silent.
+    excluded_speaker_ids: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -117,6 +124,102 @@ class GroupTurnResult:
     user_message: str = ""
     pulse_from_id: str = ""
     pulse_text: str = ""
+
+
+# ─── Repetition guard (Phase 13.2) ───────────────────────────────────
+
+
+# German stopwords — cheap n-gram comparison ignores these so we
+# don't flag two turns as similar just because both contain "der die
+# das mit von ich". Kept intentionally short — we want enough signal
+# left in the comparison set that real similarity (clothing/sand/
+# salt) lights up Jaccard.
+_REPETITION_STOPWORDS: frozenset[str] = frozenset({
+    "der", "die", "das", "den", "dem", "des",
+    "ein", "eine", "einer", "eines", "einem", "einen",
+    "ich", "du", "er", "sie", "es", "wir", "ihr",
+    "mich", "dich", "ihn", "uns", "euch",
+    "mein", "dein", "sein", "ihr", "unser", "euer",
+    "und", "oder", "aber", "doch", "denn",
+    "in", "im", "auf", "an", "am", "zu", "zum", "zur",
+    "von", "mit", "bei", "nach", "über", "unter", "vor",
+    "ist", "sind", "war", "waren", "wird", "werden", "hat",
+    "haben", "hatte", "kann", "könnte", "muss", "soll",
+    "nicht", "kein", "keine", "schon", "noch", "auch",
+    "wenn", "als", "wie", "was", "wer", "warum", "weil",
+    "sich", "selbst", "nur", "fast",
+})
+
+
+_NGRAM_TOKEN_RE = re.compile(r"[a-zäöüß]{3,}", re.IGNORECASE)
+
+
+def _ngrams(text: str, n: int = 3) -> set[tuple[str, ...]]:
+    """Tokenise + lowercase + drop stopwords + emit n-gram tuples.
+
+    Default ``n=3`` (trigram) — German narrative RP tends to insert
+    enough variation between adjacent content words that 4-grams miss
+    real repetition. Trigrams strike the right balance between false
+    positives (single-word matches) and false negatives (entirely
+    re-worded sand-staring).
+    """
+    tokens = [
+        t.lower() for t in _NGRAM_TOKEN_RE.findall(text or "")
+        if t.lower() not in _REPETITION_STOPWORDS
+    ]
+    if len(tokens) < n:
+        # For very short turns, fall back to bigrams so we still have
+        # SOME signal. A 3-word sentence vs another 3-word sentence
+        # would otherwise always be "no match".
+        n = max(2, min(n, len(tokens)))
+    if len(tokens) < n or n < 2:
+        return set()
+    return {tuple(tokens[i:i + n]) for i in range(len(tokens) - n + 1)}
+
+
+def _jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return inter / union if union else 0.0
+
+
+def detect_repetition(
+    new_text: str,
+    previous_texts: list[str],
+    threshold: float = 0.4,
+) -> tuple[bool, float, list[str]]:
+    """Return (is_repetitive, max_jaccard, sample_repeated_phrases).
+
+    Phase 13.2 helper. The orchestrator calls this AFTER the LLM
+    returns to check whether the new turn re-mixes phrases its
+    same-round predecessors already used. ``threshold=0.4`` was
+    picked from Mike's Castaway log — two turns with "Sand starren /
+    Schläfen reiben / Salz brennt" share roughly 40-50% of their
+    (stopword-stripped) 4-grams.
+
+    Returns the sample phrases so the re-prompt can name them.
+    """
+    if not new_text or not previous_texts:
+        return False, 0.0, []
+    new_grams = _ngrams(new_text)
+    if not new_grams:
+        return False, 0.0, []
+    max_jac = 0.0
+    overlapping_grams: set[tuple[str, ...]] = set()
+    for prev in previous_texts:
+        prev_grams = _ngrams(prev)
+        if not prev_grams:
+            continue
+        jac = _jaccard(new_grams, prev_grams)
+        if jac > max_jac:
+            max_jac = jac
+            overlapping_grams = new_grams & prev_grams
+    if max_jac < threshold:
+        return False, max_jac, []
+    samples = [" ".join(g) for g in list(overlapping_grams)[:5]]
+    return True, max_jac, samples
 
 
 # ─── Typing helpers ──────────────────────────────────────────────────────────
@@ -216,6 +319,27 @@ class GroupTurnOrchestrator:
                 pulse_from_id=req.pulse_from_id,
                 pulse_text=req.pulse_text,
             )
+
+        # Phase 13.2: skip-cooldown filter. Chars that returned an
+        # empty turn last round are excluded for this round so the
+        # LLM-orchestrator doesn't pick them silent again. If filtering
+        # would empty the candidate list, ignore the cooldown — better
+        # one repeat skip than a totally silent round.
+        if req.excluded_speaker_ids:
+            filtered = [
+                c for c in eligible
+                if c.id not in req.excluded_speaker_ids
+            ]
+            if filtered:
+                if len(filtered) < len(eligible):
+                    log.info(
+                        "character_chat.skip_cooldown_filtered "
+                        "session=%s excluded=%s remaining=%d",
+                        req.session_id,
+                        sorted(req.excluded_speaker_ids),
+                        len(filtered),
+                    )
+                eligible = filtered
 
         # Speaker selection priority:
         #   1. @-mentions (explicit user intent)
@@ -599,6 +723,62 @@ class GroupTurnOrchestrator:
         if not content or self._is_pass(content):
             skipped = True
             content = ""
+
+        # Phase 13.2: repetition guard. If this turn re-mixes phrases
+        # the same-round predecessors already wrote, ask the LLM once
+        # more with an anti-repetition hint. Only re-prompt ONCE — a
+        # second loop would double the token cost and rarely help.
+        if (
+            content
+            and not skipped
+            and previous_turns
+        ):
+            prev_texts = [
+                pt.content for pt in previous_turns
+                if pt.content and not pt.skipped
+            ]
+            is_rep, jac, samples = detect_repetition(
+                content, prev_texts, threshold=0.4,
+            )
+            if is_rep:
+                log.info(
+                    "character_chat.repetition_detected character=%s "
+                    "jaccard=%.2f samples=%s",
+                    card.name, jac, samples[:3],
+                )
+                anti_rep_hint = (
+                    "\n\n## WICHTIG (Anti-Wiederholung)\n"
+                    "Deine Mit-Charaktere haben bereits ähnliche "
+                    "Phrasen verwendet. Vermeide diese Wendungen in "
+                    "deinem Beitrag — schreib KEINE Variation davon. "
+                    "Beschreibe stattdessen ETWAS ANDERES (z.B. einen "
+                    "Geruch, ein Geräusch in der Ferne, eine konkrete "
+                    "Aktion, eine spezifische Beobachtung). "
+                    f"Vermeiden: {', '.join(samples[:5])}."
+                )
+                retry_messages = [
+                    {"role": "system",
+                     "content": system_prompt + anti_rep_hint},
+                    {"role": "user", "content": user_content},
+                ]
+                try:
+                    retry_raw = await self._llm_chat(
+                        messages=retry_messages,
+                        brain=self._brain,
+                        max_tokens=self._max_tokens,
+                        temperature=min(
+                            1.0, self._temperature + 0.1,
+                        ),  # nudge up for variety
+                        thinking=False,
+                    )
+                    retry_content = (retry_raw or "").strip()
+                    if retry_content and not self._is_pass(retry_content):
+                        content = retry_content
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "character_chat.repetition_retry_failed "
+                        "character=%s error=%s", card.name, exc,
+                    )
 
         return CharacterTurn(
             character_id=card.id,
