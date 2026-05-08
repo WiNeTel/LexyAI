@@ -82,9 +82,38 @@ class CharacterCard(BaseModel):
     # — e.g. "*weint laut und sucht nach Mama*". Empty = orchestrator picks a
     # default based on age_stage.
     proactive_pulse_prompt: str = ""
+    # Phase 13.3 — talkativeness weight (0.0-1.0) used by the natural-order
+    # speaker selector. Modelled after SillyTavern's ``talkativeness`` field
+    # (group-chats.js): each round, every eligible character rolls
+    # ``random()`` and is activated if ``talkativeness >= roll``. 0.0 = stays
+    # silent unless name-mentioned, 1.0 = always speaks. 0.5 is the default
+    # — feels balanced for a 3-4-character group.
+    talkativeness: float = 0.5
     archived: bool = False
     created_at: float = Field(default_factory=time.time)
     updated_at: float = Field(default_factory=time.time)
+
+    @field_validator("talkativeness", mode="before")
+    @classmethod
+    def _clamp_talkativeness(cls, v: Any) -> float:
+        """Clamp talkativeness to [0.0, 1.0] so a malformed import or a
+        runaway update can't break the natural-order roll. Runs in
+        ``before`` mode so non-numeric inputs (e.g. legacy DB rows
+        that wrote a string by accident) fall back to 0.5 instead of
+        raising a Pydantic error."""
+        if v is None:
+            return 0.5
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return 0.5
+        if f != f:  # NaN check
+            return 0.5
+        if f < 0.0:
+            return 0.0
+        if f > 1.0:
+            return 1.0
+        return f
 
     @field_validator("age_stage")
     @classmethod
@@ -281,6 +310,7 @@ class CharacterCard(BaseModel):
             "state": json.dumps(self.state),
             "proactive_pulse_pattern": self.proactive_pulse_pattern,
             "proactive_pulse_prompt": self.proactive_pulse_prompt,
+            "talkativeness": float(self.talkativeness),
             "archived": 1 if self.archived else 0,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -306,6 +336,11 @@ class CharacterCard(BaseModel):
             state=_json_loads_dict(row.get("state")),
             proactive_pulse_pattern=row.get("proactive_pulse_pattern", "") or "",
             proactive_pulse_prompt=row.get("proactive_pulse_prompt", "") or "",
+            talkativeness=(
+                float(row["talkativeness"])
+                if row.get("talkativeness") is not None
+                else 0.5
+            ),
             archived=bool(row.get("archived", 0)),
             created_at=float(row.get("created_at") or time.time()),
             updated_at=float(row.get("updated_at") or time.time()),

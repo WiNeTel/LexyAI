@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -152,6 +153,18 @@ _REPETITION_STOPWORDS: frozenset[str] = frozenset({
 
 
 _NGRAM_TOKEN_RE = re.compile(r"[a-zäöüß]{3,}", re.IGNORECASE)
+
+
+def _last_history_user_text(history: list[dict[str, Any]] | None) -> str:
+    """Phase 13.3 helper: pull the most recent USER message from a
+    session history list. Used by the natural-order activator when no
+    explicit ``user_message`` is set this round (pulse turns)."""
+    if not history:
+        return ""
+    for msg in reversed(history):
+        if (msg.get("role") or "").lower() == "user":
+            return str(msg.get("content") or "")
+    return ""
 
 
 def _ngrams(text: str, n: int = 3) -> set[tuple[str, ...]]:
@@ -399,6 +412,73 @@ class GroupTurnOrchestrator:
 
     # ─── Speaker selection ───────────────────────────────────────────────
 
+    def _activate_natural_order(
+        self,
+        *,
+        req: GroupTurnRequest,
+        eligible: list[CharacterCard],
+    ) -> list[str]:
+        """Phase 13.3 — SillyTavern-style deterministic speaker pick.
+
+        Mirrors ``activateNaturalOrder`` in
+        ``SillyTavern/public/scripts/group-chats.js``. Three signals,
+        in priority order:
+
+        1. **Name-mention** in the most recent input — that character
+           is activated immediately and gets pole position.
+        2. **Talkativeness roll** — for every other character a single
+           ``random()`` is compared against ``card.talkativeness``;
+           below threshold = silent this round. With Mike's 4-char
+           Castaway group at default 0.5, the expected speaker count
+           per round is ~2 — exactly what ``max_speakers_per_round``
+           caps anyway.
+        3. **Recency / chattiness fallback** — if no character was
+           activated by either rule, pick the eligibly-chattiest one
+           so the round isn't completely silent.
+
+        No LLM call, no async I/O. Returns an ordered list of
+        ``character_id``. Empty list = "couldn't decide cleanly,
+        the caller should fall back to the LLM-based picker".
+        """
+        if not eligible:
+            return []
+        haystack = (
+            req.user_message
+            or req.pulse_text
+            or _last_history_user_text(req.history)
+            or ""
+        ).lower()
+
+        activated: list[str] = []
+        seen: set[str] = set()
+
+        # Pass 1: name mentions go first, in name-order.
+        for card in eligible:
+            name = (card.name or "").strip().lower()
+            if not name:
+                continue
+            # Word-boundary-ish match — avoids "Lena" inside "Galena".
+            pattern = r"\b" + re.escape(name) + r"\b"
+            if re.search(pattern, haystack):
+                if card.id not in seen:
+                    activated.append(card.id)
+                    seen.add(card.id)
+
+        # Pass 2: talkativeness roll for everyone not already activated.
+        for card in eligible:
+            if card.id in seen:
+                continue
+            roll = random.random()
+            if float(card.talkativeness) >= roll:
+                activated.append(card.id)
+                seen.add(card.id)
+
+        # If the rolls left us empty, return [] so the caller can fall
+        # back to the LLM picker. We DON'T blindly pick the chattiest
+        # — that would mask a "nobody really fits" signal that the LLM
+        # might handle better.
+        return activated
+
     async def _pick_speakers(
         self,
         *,
@@ -450,6 +530,25 @@ class GroupTurnOrchestrator:
 
         # autonomous: LLM picks order over the remaining candidates.
         remaining = [c for c in eligible if c.id not in seen]
+
+        # Phase 13.3 — HYBRID first pass: try the deterministic
+        # natural-order activator before burning an e4b call. If it
+        # produces a non-empty order, we use it; otherwise we fall
+        # through to the LLM-based picker. This matches Mike's
+        # explicit choice "Hybrid: deterministic first, e4b fallback"
+        # and keeps the e4b model on port 5006 (speaker_selection_brain).
+        if remaining and not self._always_call_orchestrator:
+            natural_order = self._activate_natural_order(
+                req=req, eligible=remaining,
+            )
+            if natural_order:
+                order.extend(natural_order)
+                self._log_speakers_picked(
+                    method=(method or "natural_order"),
+                    order=order, brain_called=False, req=req,
+                )
+                return order
+            # else: empty roll — fall through to e4b.
 
         # always_call_orchestrator path: LLM gets *all* eligibles and the
         # mention-derived order as a preferred hint. We use this to
@@ -805,16 +904,19 @@ class GroupTurnOrchestrator:
         "example_dialog",
         "global_style",
         "rules",
+        "impersonation_guard",       # NEW Phase 13.3 — last system word
     )
     # User section order (fed as the user message for the turn).
     _USER_SECTION_ORDER: tuple[str, ...] = (
-        "lorebook_before_history",   # NEW
+        "group_roster",              # NEW Phase 13.3 — pre-history
+        "lorebook_before_history",
         "history",
         "memory",
         "pulse",
-        "lorebook_before_user_message",  # NEW
+        "lorebook_before_user_message",
         "user_message",
         "prev_turns",
+        "group_nudge",               # NEW Phase 13.3 — post-history
         "instruction",
     )
 
@@ -1019,7 +1121,47 @@ class GroupTurnOrchestrator:
             )
         )
 
+        # Phase 13.3 — impersonation-guard (system, very last). Mirrors
+        # SillyTavern's "[Don't write as {{user}}…]" canned line. Lands
+        # AFTER ``rules`` so it's the last thing in the system block.
+        sections.append(
+            PromptSection(
+                name="impersonation_guard",
+                priority=Priority.MUST,
+                text=(
+                    f"## Du bist NICHT der User\n"
+                    f"Du bist ausschließlich {card.name}. Schreibe nicht "
+                    f"aus der Sicht des Users (Mike). Beschreibe keine "
+                    f"Worte, Gedanken oder Handlungen des Users — der "
+                    f"spricht für sich selbst, in einem eigenen Turn. "
+                    f"Auch keine Worte oder Handlungen anderer "
+                    f"Charaktere — die haben ihre eigenen Turns."
+                ),
+                role="system",
+                max_tokens=120,
+            )
+        )
+
         # ─── USER sections ────────────────────────────────────────────
+        # Phase 13.3 — group roster: pre-history "[Gruppenchat. Anwesend: …]"
+        # marker, modeled after SillyTavern's ``default_new_group_chat_prompt``.
+        # Goes at the very top of the user content so the LLM enters
+        # the chat context with a clear "this is a group" framing.
+        peer_names = [c.name for c in (all_cards or []) if c.name]
+        if peer_names:
+            roster_line = (
+                f"[Gruppenchat. Anwesend: {', '.join(peer_names)}.]"
+            )
+            sections.append(
+                PromptSection(
+                    name="group_roster",
+                    priority=Priority.HIGH,
+                    text=roster_line,
+                    role="user",
+                    max_tokens=80,
+                )
+            )
+
         # Lore that should land in the user-content area (before history
         # or right before the user message).
         if "lorebook_before_history" in lore_sections:
@@ -1138,6 +1280,45 @@ class GroupTurnOrchestrator:
                 if not t.skipped and t.content and t.character_id != card.id:
                     last_speaker_name = t.character_name
                     break
+
+        # Phase 13.3 — group nudge (post-history). The single biggest
+        # behavioural lever from the SillyTavern research: stamping
+        # "[Schreibe als <char> + reagiere auf das Letzte + verteilt
+        # die Aufgaben]" right before the LLM generates breaks the
+        # parallel-monologue loop. Lands AFTER prev_turns and before
+        # the final ``instruction`` so the LLM sees it last.
+        if last_speaker_name:
+            nudge_text = (
+                f"[Schreibe die nächste Antwort ausschließlich als "
+                f"{card.name}. Reagiere konkret auf das, was "
+                f"{last_speaker_name} gerade gesagt oder getan hat — "
+                f"keine parallele Wiederholung. Wenn die Gruppe gerade "
+                f"diskutiert was zu tun ist, übernimm eine konkrete, "
+                f"andere Aufgabe als die anderen — einer sammelt Holz, "
+                f"ein anderer Wasser, ein dritter Essen. Nicht alle "
+                f"das Gleiche.]"
+            )
+        else:
+            nudge_text = (
+                f"[Schreibe die nächste Antwort ausschließlich als "
+                f"{card.name}. Reagiere konkret auf das, was zuletzt "
+                f"passiert ist. Wenn die Gruppe gerade diskutiert was "
+                f"zu tun ist, übernimm eine konkrete Aufgabe — einer "
+                f"sammelt Holz, ein anderer Wasser, ein dritter Essen. "
+                f"Nicht alle das Gleiche.]"
+            )
+        sections.append(
+            PromptSection(
+                name="group_nudge",
+                # MUST so it survives any token trimming. This is the
+                # last thing the LLM reads before generating, and it's
+                # the spine of the group dynamic.
+                priority=Priority.MUST,
+                text=nudge_text,
+                role="user",
+                max_tokens=200,
+            )
+        )
 
         instruction_text = _build_instruction(
             card_name=card.name,
