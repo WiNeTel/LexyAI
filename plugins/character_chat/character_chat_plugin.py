@@ -760,6 +760,74 @@ class CharacterChatPlugin(BasePlugin):
             cooldowns = self._skip_cooldowns.setdefault(session_id, {})
             cooldowns[char_id] = 1
 
+    async def _load_prior_turns_per_char(
+        self,
+        *,
+        session_id: str,
+        characters: list[CharacterCard],
+        limit: int = 5,
+    ) -> dict[str, list[str]]:
+        """Phase 13.5 (B+D) — fetch each char's last N own turns for the
+        cross-round repetition guard.
+
+        Returns a mapping {character_id: [oldest_text, ..., newest_text]}.
+        Empty values for chars without history. Best-effort: any DB
+        error is logged but doesn't block the round.
+        """
+        out: dict[str, list[str]] = {}
+        if not characters:
+            return out
+        try:
+            container = await self._get_rp_container(session_id)
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "character_chat.prior_turns_container_lookup_failed "
+                "session=%s error=%s",
+                session_id, str(exc),
+            )
+            container = None
+
+        if container is not None:
+            for c in characters:
+                try:
+                    rows = await container.list_turns(
+                        character_id=c.id, limit=limit,
+                    )
+                    out[c.id] = [
+                        r.content for r in rows
+                        if r.content and not r.skipped
+                    ]
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "character_chat.prior_turns_rp_failed "
+                        "session=%s char=%s error=%s",
+                        session_id, c.name, str(exc),
+                    )
+            return out
+
+        # Non-RP fallback — query the legacy character_turns table.
+        db = await self.api.get_db()
+        for c in characters:
+            try:
+                cursor = await db.execute(
+                    "SELECT content FROM character_turns "
+                    "WHERE session_id = ? AND character_id = ? "
+                    "AND skipped = 0 AND content != '' "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (session_id, c.id, limit),
+                )
+                rows = await cursor.fetchall()
+                # DB returns newest-first; reverse to oldest-first to
+                # match the container's ASC order.
+                out[c.id] = [str(r[0]) for r in reversed(rows)]
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "character_chat.prior_turns_legacy_failed "
+                    "session=%s char=%s error=%s",
+                    session_id, c.name, str(exc),
+                )
+        return out
+
     async def _is_rp_session(self, session_id: str) -> bool:
         """True if the given session is RP — checks both the registry
         (existing folder) AND the core session store's kind marker."""
@@ -2325,6 +2393,16 @@ class CharacterChatPlugin(BasePlugin):
             # any existing cooldowns down by 1.
             excluded = self._tick_skip_cooldowns(session_id)
 
+            # Phase 13.5 (B+D): pull each char's last 5 own turns so the
+            # repetition guard catches self-repetition across rounds. RP
+            # turns live in the per-session container; non-RP fall back
+            # to the legacy character_turns table.
+            prior_turns_by_char = await self._load_prior_turns_per_char(
+                session_id=session_id,
+                characters=characters,
+                limit=5,
+            )
+
             req = GroupTurnRequest(
                 session_id=session_id,
                 history=history,
@@ -2337,6 +2415,7 @@ class CharacterChatPlugin(BasePlugin):
                 lore_by_speaker=lore_by_speaker,
                 live_state_by_char=live_state_by_char,
                 excluded_speaker_ids=excluded,
+                prior_turns_by_char=prior_turns_by_char,
             )
 
             round_id = uuid.uuid4().hex[:12]

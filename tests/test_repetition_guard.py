@@ -136,3 +136,129 @@ class TestDetectRepetition:
         )
         assert is_rep is True
         assert jac >= 0.4
+
+
+# ─── Phase 13.5 (B+D): cross-round self-repetition ──────────────────────
+
+
+import asyncio
+import time
+
+from plugins.character_chat.character_card import CharacterCard
+from plugins.character_chat.group_turn import (
+    GroupTurnOrchestrator,
+    GroupTurnRequest,
+)
+
+
+class _SeqLLM:
+    """Returns scripted responses in order, recording every call."""
+
+    def __init__(self, replies: list[str]) -> None:
+        self.replies = list(replies)
+        self.calls: list[dict] = []
+
+    async def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        if not self.replies:
+            return ""
+        return self.replies.pop(0)
+
+
+def _card(name: str = "Mira", char_id: str = "mira-id") -> CharacterCard:
+    return CharacterCard(
+        id=char_id,
+        name=name,
+        persona=f"{name} ist Surf-Lehrerin.",
+        age_stage="adult",
+        created_at=time.time(),
+        updated_at=time.time(),
+    )
+
+
+class TestCrossRoundSelfRepetition:
+    """Phase 13.5 (B+D) — the guard now compares the new turn
+    against the SAME char's own recent turns from prior rounds, not
+    only co-speakers in the current round. Mira's 'wische mir den
+    Salzfilm von der Stirn' across three rounds was the trigger."""
+
+    def test_self_repetition_across_rounds_triggers_reprompt(self) -> None:
+        # First call: mostly the same boilerplate Mira already used.
+        # Second call (the re-prompt): something distinct.
+        new_text = (
+            "wische mir den Salzfilm von der Stirn und schaue zur "
+            "Brandung salz brennt schwer wische erneut den salzfilm"
+        )
+        prior = (
+            "wische mir den Salzfilm von der Stirn und schaue zur "
+            "Brandung salz brennt schwer schläfen dröhnen"
+        )
+        retry_text = (
+            "Mira hört das Knirschen von Holz an den Felsen und "
+            "richtet sich auf den Lärm aus"
+        )
+        llm = _SeqLLM([new_text, retry_text])
+        orch = GroupTurnOrchestrator(
+            llm_chat=llm, turn_selection="round_robin",
+        )
+        mira = _card()
+        req = GroupTurnRequest(
+            session_id="s1",
+            history=[],
+            characters=[mira],
+            user_message="Was machst du jetzt?",
+            prior_turns_by_char={mira.id: [prior]},
+        )
+        result = asyncio.run(orch.run_round(req))
+        # Two LLM calls happened: original + re-prompt.
+        assert len(llm.calls) == 2
+        # The re-prompt's system prompt carries the Anti-Wiederholung block.
+        retry_system = llm.calls[1]["messages"][0]["content"]
+        assert "Anti-Wiederholung" in retry_system
+        # Final visible turn is the retry (distinct, not the boilerplate).
+        assert result.turns[0].content == retry_text
+
+    def test_no_prior_turns_means_no_extra_reprompt(self) -> None:
+        """First-ever turn for a char (no own history yet) — only the
+        same-round predecessors guard fires (or nothing if alone)."""
+        llm = _SeqLLM(["irgendein turn-text"])
+        orch = GroupTurnOrchestrator(
+            llm_chat=llm, turn_selection="round_robin",
+        )
+        mira = _card()
+        req = GroupTurnRequest(
+            session_id="s1",
+            history=[],
+            characters=[mira],
+            user_message="Hi.",
+            prior_turns_by_char={},  # no priors
+        )
+        result = asyncio.run(orch.run_round(req))
+        # Single LLM call, no re-prompt.
+        assert len(llm.calls) == 1
+        assert result.turns[0].content == "irgendein turn-text"
+
+    def test_distinct_prior_does_not_trigger(self) -> None:
+        """When Mira's prior turn is about something completely
+        different, the new turn passes the guard cleanly."""
+        prior_about_palms = "klettere die Palme hoch und schüttle Kokosnüsse"
+        new_about_water = (
+            "wate vorsichtig in die Lagune und beobachte die Felsen "
+            "im flachen Wasser"
+        )
+        llm = _SeqLLM([new_about_water])
+        orch = GroupTurnOrchestrator(
+            llm_chat=llm, turn_selection="round_robin",
+        )
+        mira = _card()
+        req = GroupTurnRequest(
+            session_id="s1",
+            history=[],
+            characters=[mira],
+            user_message="Was tust du?",
+            prior_turns_by_char={mira.id: [prior_about_palms]},
+        )
+        result = asyncio.run(orch.run_round(req))
+        # No re-prompt; the prior is unrelated.
+        assert len(llm.calls) == 1
+        assert result.turns[0].content == new_about_water

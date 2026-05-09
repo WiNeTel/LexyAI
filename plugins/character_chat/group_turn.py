@@ -113,6 +113,15 @@ class GroupTurnRequest:
     # falls back to the unfiltered set so the round isn't completely
     # silent.
     excluded_speaker_ids: set[str] = field(default_factory=set)
+    # Phase 13.5 (B+D) — cross-round repetition memory. Last N turns of
+    # each character keyed by character_id, oldest first. The plugin
+    # populates this from the per-session turns store (RP container or
+    # legacy character_turns table). The repetition guard compares the
+    # new generation against BOTH this char's own past turns AND the
+    # other speakers' current-round turns. Without this, Mira repeats
+    # 'wische mir den Salzfilm von der Stirn' across three rounds
+    # because the 13.2 guard only saw within-round predecessors.
+    prior_turns_by_char: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -903,19 +912,29 @@ class GroupTurnOrchestrator:
             skipped = True
             content = ""
 
-        # Phase 13.2: repetition guard. If this turn re-mixes phrases
-        # the same-round predecessors already wrote, ask the LLM once
-        # more with an anti-repetition hint. Only re-prompt ONCE — a
-        # second loop would double the token cost and rarely help.
+        # Phase 13.2 + 13.5 (B+D): repetition guard. Compares the new
+        # turn against TWO pools:
+        #   * same-round others (13.2 — who else just spoke this round)
+        #   * THIS char's own recent turns from prior rounds (13.5 —
+        #     stops Mira repeating 'wische mir den Salzfilm von der
+        #     Stirn' three rounds in a row)
+        # If overlap above threshold, re-prompt ONCE with an anti-rep
+        # hint. Only one retry — a second loop doubles the token cost
+        # and rarely helps.
+        own_prior = req.prior_turns_by_char.get(card.id, [])
         if (
             content
             and not skipped
-            and previous_turns
+            and (previous_turns or own_prior)
         ):
             prev_texts = [
                 pt.content for pt in previous_turns
                 if pt.content and not pt.skipped
             ]
+            # Add this char's own prior turns so self-repetition across
+            # rounds also triggers the guard. Keep a small window —
+            # comparing against 50 ancient turns is wasted work.
+            prev_texts.extend(own_prior[-5:])
             is_rep, jac, samples = detect_repetition(
                 content, prev_texts, threshold=0.4,
             )
@@ -927,12 +946,13 @@ class GroupTurnOrchestrator:
                 )
                 anti_rep_hint = (
                     "\n\n## WICHTIG (Anti-Wiederholung)\n"
-                    "Deine Mit-Charaktere haben bereits ähnliche "
-                    "Phrasen verwendet. Vermeide diese Wendungen in "
-                    "deinem Beitrag — schreib KEINE Variation davon. "
-                    "Beschreibe stattdessen ETWAS ANDERES (z.B. einen "
-                    "Geruch, ein Geräusch in der Ferne, eine konkrete "
-                    "Aktion, eine spezifische Beobachtung). "
+                    "Folgende Phrasen wurden bereits verwendet (von dir "
+                    "selbst in einer vorherigen Runde oder von "
+                    "Mit-Charakteren in dieser Runde). Vermeide sie und "
+                    "schreib KEINE Variation davon — beschreibe etwas "
+                    "ANDERES (ein neuer Geruch, ein neues Geräusch, "
+                    "eine spezifische Aktion, eine andere Körpergeste, "
+                    "eine konkrete Beobachtung). "
                     f"Vermeiden: {', '.join(samples[:5])}."
                 )
                 retry_messages = [
