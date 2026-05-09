@@ -1133,15 +1133,25 @@ class GroupTurnOrchestrator:
                 )
             )
 
-        others_text = _format_others_block(card, all_cards)
+        others_text = _format_others_block(
+            card, all_cards,
+            live_state_by_char=req.live_state_by_char,
+        )
         if others_text:
             sections.append(
                 PromptSection(
                     name="others",
-                    priority=Priority.LOW,
+                    # Phase 13.5 (C): bumped LOW → MEDIUM so peer states
+                    # survive context-trimming. With LOW the section was
+                    # often dropped under tight budgets, leaving the LLM
+                    # blind to peer locations and free to hallucinate.
+                    priority=Priority.MEDIUM,
                     text=others_text,
                     role="system",
-                    max_tokens=200,
+                    # Higher cap because each peer now carries state
+                    # bits, not just a name. ~50 tokens per peer × 5
+                    # peers = 250 ceiling with headroom.
+                    max_tokens=350,
                 )
             )
 
@@ -1392,7 +1402,10 @@ class GroupTurnOrchestrator:
                 f"[Schreibe die nächste Antwort ausschließlich als "
                 f"{card.name}. Reagiere konkret auf das, was "
                 f"{last_speaker_name} gerade gesagt oder getan hat — "
-                f"keine parallele Wiederholung. Wenn die Gruppe gerade "
+                f"keine parallele Wiederholung. **Erfinde KEINE "
+                f"Aktionen oder Aufenthaltsorte für andere Charaktere** "
+                f"— ihr aktueller Zustand steht oben unter 'Andere "
+                f"Anwesende'; nimm den als Fakt. Wenn die Gruppe gerade "
                 f"diskutiert was zu tun ist, übernimm eine konkrete, "
                 f"andere Aufgabe als die anderen — einer sammelt Holz, "
                 f"ein anderer Wasser, ein dritter Essen. Nicht alle "
@@ -1402,10 +1415,13 @@ class GroupTurnOrchestrator:
             nudge_text = (
                 f"[Schreibe die nächste Antwort ausschließlich als "
                 f"{card.name}. Reagiere konkret auf das, was zuletzt "
-                f"passiert ist. Wenn die Gruppe gerade diskutiert was "
-                f"zu tun ist, übernimm eine konkrete Aufgabe — einer "
-                f"sammelt Holz, ein anderer Wasser, ein dritter Essen. "
-                f"Nicht alle das Gleiche.]"
+                f"passiert ist. **Erfinde KEINE Aktionen oder "
+                f"Aufenthaltsorte für andere Charaktere** — ihr "
+                f"aktueller Zustand steht oben unter 'Andere "
+                f"Anwesende'; nimm den als Fakt. Wenn die Gruppe gerade "
+                f"diskutiert was zu tun ist, übernimm eine konkrete "
+                f"Aufgabe — einer sammelt Holz, ein anderer Wasser, "
+                f"ein dritter Essen. Nicht alle das Gleiche.]"
             )
         sections.append(
             PromptSection(
@@ -1607,9 +1623,20 @@ def _format_history_tail(
 
 
 def _format_others_block(
-    card: CharacterCard, all_cards: list[CharacterCard]
+    card: CharacterCard,
+    all_cards: list[CharacterCard],
+    live_state_by_char: dict[str, dict[str, str]] | None = None,
 ) -> str:
-    """Render the '## Andere Anwesende' block with relationship hints."""
+    """Render the '## Andere Anwesende' block with relationship hints.
+
+    Phase 13.5 (C): when ``live_state_by_char`` is provided, each peer
+    line ALSO carries their current ``location`` / ``last_action`` so
+    this char can react truthfully instead of inventing scenes for
+    others. Mike's Castaway log: Sandra hallucinated 'Mira tritt aus
+    den Palmen mit einem Becher' while Mira was in the lagoon — the
+    LLM had no way to know Mira's actual location was 'lagune'.
+    """
+    state_by_id = live_state_by_char or {}
     lines: list[str] = []
     for other in all_cards or []:
         if other.id == card.id:
@@ -1617,13 +1644,34 @@ def _format_others_block(
         rel = card.relationships.get(other.id) or other.relationships.get(
             card.id
         )
+        # Build a "currently" suffix from the most truth-y state keys.
+        st = state_by_id.get(other.id) or {}
+        bits: list[str] = []
+        loc = st.get("location") or ""
+        if loc:
+            bits.append(f"Ort: {loc}")
+        last_act = st.get("last_action") or ""
+        if last_act:
+            bits.append(f"macht: {last_act}")
+        mood = st.get("mood") or ""
+        if mood:
+            bits.append(f"Stimmung: {mood}")
+        currently = (" — " + "; ".join(bits)) if bits else ""
+
+        head = f"- {other.name}"
         if rel:
-            lines.append(f"- {other.name}: {rel}")
-        else:
-            lines.append(f"- {other.name}")
+            head += f" ({rel})"
+        lines.append(f"{head}{currently}")
     if not lines:
         return ""
-    return "## Andere Anwesende\n" + "\n".join(lines)
+    return (
+        "## Andere Anwesende — was sie GERADE tun (Wahrheit für deinen Turn)\n"
+        + "\n".join(lines)
+        + "\n\n**Wichtig**: Erfinde KEINE Aktionen oder Aufenthaltsorte für "
+        "diese Charaktere. Nimm die hier genannte Realität als Fakt — "
+        "wenn du nicht weisst was sie tun, frag oder reagier nur auf "
+        "das, was du in den letzten Reaktionen liest."
+    )
 
 
 def _assemble_sections(

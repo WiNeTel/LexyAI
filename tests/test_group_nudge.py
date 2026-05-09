@@ -147,6 +147,63 @@ class TestGroupNudge:
         assert "nicht alle" in text_lower or "andere" in text_lower
 
 
+class TestAntiHallucination:
+    """Phase 13.5 (C) — peer states + anti-hallucination wording.
+
+    Mike's Castaway log: Sandra wrote "Mira tritt aus dem Schatten
+    der Palmen mit einem Plastikbecher" while Mira was actually
+    wading in the lagoon. The LLM had no way to know Mira's actual
+    location. Two fixes are pinned here:
+      1. The "## Andere Anwesende" block now embeds each peer's
+         live ``location`` / ``last_action`` / ``mood``.
+      2. The post-history ``group_nudge`` carries an explicit
+         "Erfinde KEINE Aktionen für andere Charaktere" sentence.
+    """
+
+    def test_others_block_includes_peer_locations(self) -> None:
+        sandra, mira = _card("Sandra"), _card("Mira")
+        sections = _build_sections(
+            sandra, characters=[sandra, mira],
+            live_state_by_char={
+                mira.id: {
+                    "location": "lagune",
+                    "last_action": "sucht_im_wasser_nach_treibgut",
+                    "mood": "fokussiert",
+                },
+            },
+        )
+        others = sections.get("others")
+        assert others is not None
+        assert "Mira" in others.text
+        # Peer's location, action, and mood must all surface.
+        assert "lagune" in others.text
+        assert "sucht_im_wasser_nach_treibgut" in others.text
+        assert "fokussiert" in others.text
+        # Anti-hallucination wording (the pin against story-driving).
+        assert "Erfinde KEINE Aktionen" in others.text
+
+    def test_others_block_falls_back_when_no_state(self) -> None:
+        """Cards without state still render — just no 'currently' tail."""
+        sandra, mira = _card("Sandra"), _card("Mira")
+        sections = _build_sections(
+            sandra, characters=[sandra, mira],
+            live_state_by_char={},
+        )
+        others = sections.get("others")
+        assert others is not None
+        assert "Mira" in others.text
+        # No phantom location string when state is missing.
+        assert "Ort:" not in others.text
+
+    def test_nudge_carries_anti_hallucination_sentence(self) -> None:
+        sandra, mira = _card("Sandra"), _card("Mira")
+        sections = _build_sections(sandra, characters=[sandra, mira])
+        nudge = sections.get("group_nudge")
+        assert nudge is not None
+        # Explicit "don't invent peer actions" — Mike's #1 chat issue.
+        assert "Erfinde KEINE Aktionen" in nudge.text
+
+
 class TestImpersonationGuard:
     def test_guard_present_in_system(self) -> None:
         sandra = _card("Sandra")
