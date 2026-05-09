@@ -1637,17 +1637,23 @@ class CharacterChatPlugin(BasePlugin):
 
         self._pulse_cooldowns[session_id] = now
 
-        # Resolve the card so we can enrich the pulse text. Fallback chain:
-        #   1. ``pulse_text`` from the scheduler payload (legacy / manual)
-        #   2. ``card.proactive_pulse_prompt`` (per-character override)
-        #   3. LLM-generated text via PulseGenerator (smart_pulses_enabled)
-        #   4. Static age-stage default (last resort, original behaviour)
+        # Resolve the card so we can enrich the pulse text. Fallback chain
+        # (Phase 13.5 hotfix — reordered so smart_pulses always wins when
+        # available; the old order let imperative ``proactive_pulse_prompt``
+        # templates leak into the visible chat as raw instructions):
+        #   1. scheduler-payload ``pulse_text`` (caller-provided, e.g. tests)
+        #   2. PulseGenerator (smart_pulses_enabled) — uses persona +
+        #      state + history + ``proactive_pulse_prompt`` AS GUIDANCE
+        #      to produce a NARRATIVE pulse. This is the normal path.
+        #   3. ``card.proactive_pulse_prompt`` verbatim — only when
+        #      smart_pulses is OFF or the generator failed AND the card
+        #      author actually wrote narrative text there (guarded by a
+        #      heuristic check below).
+        #   4. Static age-stage default — last resort.
         if self._store is not None and not pulse_text:
             card = await self._store.get(character_id)
             if card is not None:
-                if card.proactive_pulse_prompt:
-                    pulse_text = card.proactive_pulse_prompt
-                elif self._smart_pulses_enabled and self._pulse_generator is not None:
+                if self._smart_pulses_enabled and self._pulse_generator is not None:
                     others = await self._store.list_in_session(session_id)
                     history = self._load_session_history(session_id)
                     sess_state = await self._get_session_state(session_id)
@@ -1658,6 +1664,7 @@ class CharacterChatPlugin(BasePlugin):
                             others_in_session=others,
                             recent_history=history,
                             scene=scene,
+                            style_guidance=card.proactive_pulse_prompt or "",
                         )
                     except Exception as exc:  # noqa: BLE001
                         log.warning(
@@ -1666,6 +1673,14 @@ class CharacterChatPlugin(BasePlugin):
                             str(exc),
                         )
                         pulse_text = ""
+                if not pulse_text and card.proactive_pulse_prompt:
+                    # Fallback to the card-authored text only if it looks
+                    # narrative (Phase 13.5 hotfix). Imperative templates
+                    # like 'Lena REAGIERT auf einen Charakter NAMENTLICH'
+                    # would leak into chat verbatim if we used them here;
+                    # the heuristic catches the obvious markers.
+                    if not _looks_imperative_template(card.proactive_pulse_prompt):
+                        pulse_text = card.proactive_pulse_prompt
                 if not pulse_text:
                     pulse_text = _default_pulse(card.age_stage)
 
@@ -4055,3 +4070,29 @@ _DEFAULT_PULSE_PATTERNS: dict[str, str] = {
 def _default_pulse(age_stage: str) -> str:
     """Fallback pulse text if the card doesn't define one."""
     return _DEFAULT_PULSES.get(age_stage, "*bewegt sich*")
+
+
+# Phase 13.5 hotfix — heuristic to detect imperative pulse-prompt
+# templates (e.g. Castaway scenario style: "Lena REAGIERT auf einen
+# anderen Charakter NAMENTLICH. Wähle EINS: ..."). These are LLM
+# instructions, NOT chat content — they must NEVER be used as the
+# visible pulse text. The check is intentionally simple: any of the
+# clear imperative markers below = treat as instruction.
+_IMPERATIVE_PULSE_MARKERS: tuple[str, ...] = (
+    "Wähle EINS",
+    "Wähle eins",
+    "REAGIERT auf",
+    "MACHT eine konkrete",
+    "ist SCHON UNTERWEGS",
+    "MACHT etwas Beobachtbares",
+    "Verbote:",
+    "ABSOLUTES VERBOT",
+)
+
+
+def _looks_imperative_template(text: str) -> bool:
+    """True when the pulse text reads like an LLM instruction template
+    rather than narrative chat content."""
+    if not text:
+        return False
+    return any(marker in text for marker in _IMPERATIVE_PULSE_MARKERS)
