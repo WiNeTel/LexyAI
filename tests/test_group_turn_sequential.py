@@ -294,8 +294,13 @@ async def test_archived_characters_are_filtered_out() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pulse_originator_does_not_speak_again() -> None:
-    """Baby cries → baby is pulse originator, only others react."""
+async def test_pulse_originator_appears_as_visible_turn() -> None:
+    """Phase 13.5 (A): the pulse-from char now ALSO surfaces as the
+    first turn, so the chat shows what they actually did (the pulse
+    text). Without this fix, the pulse-trigger char (e.g. Yara firing
+    every 10 min) never appears in the visible chat — only the
+    reactions do — and the user can't tell what's happening.
+    """
     llm = _FakeLLM(
         route_by_system={
             "Turn-Orchestrator": "lexy",
@@ -312,15 +317,48 @@ async def test_pulse_originator_does_not_speak_again() -> None:
         pulse_text="schreit laut",
     )
     result = await orch.run_round(req)
-    # Luna doesn't speak again because she's the pulse originator.
-    assert [t.character_name for t in result.turns] == ["Lexy"]
-    # Lexy's prompt should reference the pulse.
+    # Luna appears FIRST with the pulse_text as her content; Lexy
+    # follows as the regular LLM-generated reaction.
+    names = [t.character_name for t in result.turns]
+    assert names == ["Luna", "Lexy"]
+    luna_turn = result.turns[0]
+    assert luna_turn.content == "schreit laut"
+    assert luna_turn.skipped is False
+    assert luna_turn.character_id == "luna"
+    # Lexy's prompt should still reference the pulse via the Impuls
+    # section (kept for backwards compat — the LLM sees the pulse in
+    # both places, but the duplicate is small and harmless).
     lexy_call = llm.calls[-1]
     lexy_user = next(
         m["content"] for m in lexy_call["messages"] if m["role"] == "user"
     )
     assert "Impuls" in lexy_user
     assert "schreit laut" in lexy_user
+
+
+@pytest.mark.asyncio
+async def test_pulse_originator_unknown_char_id_skips_visible_turn() -> None:
+    """Defensive: if pulse_from_id points at a char not in
+    ``req.characters`` (stale cache, race), don't crash — just skip
+    the synthesised turn and proceed with the normal reactions."""
+    llm = _FakeLLM(
+        route_by_system={
+            "Turn-Orchestrator": "lexy",
+            "Du bist Lexy": "...",
+        }
+    )
+    orch = GroupTurnOrchestrator(llm_chat=llm, turn_selection="autonomous")
+    req = GroupTurnRequest(
+        session_id="s1",
+        history=[],
+        characters=[_lexy(), _luna("baby")],
+        user_message="",
+        pulse_from_id="ghost-char-id-not-in-roster",
+        pulse_text="something",
+    )
+    result = await orch.run_round(req)
+    # No synthesised turn for the missing char; only Lexy's reaction.
+    assert [t.character_name for t in result.turns] == ["Lexy"]
 
 
 @pytest.mark.asyncio

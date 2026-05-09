@@ -389,13 +389,32 @@ class GroupTurnOrchestrator:
 
         by_id = {c.id: c for c in req.characters}
         turns: list[CharacterTurn] = []
+
+        # Phase 13.5 (A): if a pulse fired, synthesise a visible turn for
+        # the pulse-from character containing the pulse_text. Without this
+        # the trigger char never appears in the chat — only the OTHERS
+        # who reacted to her pulse get persisted, and the user can't see
+        # what she actually did. Mike's diagnosis: "Yara taucht nie auf"
+        # despite firing pulses every 10 min. The pulse_text is already
+        # her "voice"; we just persist it under her name so it's visible.
+        if req.pulse_from_id and req.pulse_text:
+            pulse_card = by_id.get(req.pulse_from_id)
+            if pulse_card is not None:
+                turns.append(CharacterTurn(
+                    character_id=pulse_card.id,
+                    character_name=pulse_card.name,
+                    content=req.pulse_text,
+                    skipped=False,
+                    order=0,
+                ))
+
         for idx, char_id in enumerate(speaker_order):
             card = by_id.get(char_id)
             if card is None:
                 continue
             turn = await self._run_single_turn(
                 card=card,
-                order=idx,
+                order=idx + (1 if turns else 0),
                 previous_turns=turns,
                 req=req,
                 all_cards=req.characters,
