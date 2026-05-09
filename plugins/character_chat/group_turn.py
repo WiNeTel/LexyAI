@@ -386,7 +386,21 @@ class GroupTurnOrchestrator:
         speaker_order = await self._pick_speakers(
             req=req, eligible=eligible, forced=forced + extras
         )
-        speaker_order = speaker_order[: self._max_speakers]
+        # Phase 13.5 hotfix v3 — when the user explicitly @-mentions or
+        # NL-names character(s), DON'T auto-fill to max_speakers. Mike's
+        # gripe: he writes '@Sandra hilf mir' and Lena also chimes in
+        # because slot 2 of max_speakers=2 gets filled by the LLM/round-
+        # robin path. Plus when both chars share identical tracked_stats
+        # (arousal=extrem_notgeil etc.) the second answer mirrors the
+        # first emotionally even though sequential prompting differs.
+        # When user names someone, only the named char(s) speak.
+        # ``extras`` (pulse-mention-propagation) ALSO counts as 'user-
+        # like intent' from a pulse — keep it in the cap too.
+        explicit_count = len(forced) + len(extras)
+        if explicit_count > 0:
+            speaker_order = speaker_order[: explicit_count]
+        else:
+            speaker_order = speaker_order[: self._max_speakers]
         if at_mentions or nl_mentions or extras:
             log.info(
                 "character_chat.mentions_parsed at=%s nl=%s extras=%s order=%s",

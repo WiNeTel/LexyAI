@@ -1766,6 +1766,15 @@ class CharacterChatPlugin(BasePlugin):
         # Fetch session context once.
         state = await self._get_session_state(session_id)
         scene = str(state.get("scene") or "")
+        # Phase 13.5 hotfix v3 — Mike's mode 1 gate. The auto_react
+        # path (in _run_round_safe) already respects mode=1 'characters
+        # only, Lexy silent', but the autonomous_sim tick had its own
+        # Lexy-roll path that ignored the mode flag — Lexy was still
+        # bursting into the RP chat every 10 min ('Hey Mike? Vielleicht
+        # sollten wir uns mal um Wasser kümmern…'). Mode 1 RP sessions
+        # now skip the Lexy probability roll entirely; only character
+        # turns fire from the sim tick.
+        sess_mode = int(state.get("character_mode") or 0)
 
         try:
             characters = await self._store.list_in_session(session_id)
@@ -1773,8 +1782,16 @@ class CharacterChatPlugin(BasePlugin):
             characters = []
 
         # Roll for Lexy's turn. Lexy always gets a chance, even without
-        # any characters attached (in that case probability = 1).
-        lexy_roll = random.random() < self._lexy_turn_probability or not characters
+        # any characters attached (in that case probability = 1) — UNLESS
+        # the session is in mode 1 with characters attached, in which
+        # case Lexy stays silent and only chars get sim ticks.
+        if sess_mode == 1 and characters:
+            lexy_roll = False
+        else:
+            lexy_roll = (
+                random.random() < self._lexy_turn_probability
+                or not characters
+            )
 
         if lexy_roll:
             prompt = (

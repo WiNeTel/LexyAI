@@ -528,9 +528,20 @@
         // user just clicked Send there. Cross-tab notifications
         // (character_pulse from a stale RP-session while the user is
         // in chat) are routed separately by their explicit session_id.
-        const targetWindow = (state.activeTab === "rp" && rpChatWindow)
+        //
+        // Phase 13.5 hotfix v3 — RP tab is for character RP only.
+        // Lexy's assistant streams and autonomous_thinking thoughts
+        // belong in the regular chat tab regardless of which tab the
+        // user happens to be looking at; they pollute the in-character
+        // narrative when mixed in. Mike's report: 'thought' bubbles
+        // and Lexy 'assistant' replies kept landing in the RP window.
+        const isRpTab = state.activeTab === "rp" && rpChatWindow;
+        const isAgentRole = role === "assistant" || role === "thought" || role === "tool";
+        const targetWindow = (isRpTab && !isAgentRole)
             ? rpChatWindow
-            : chatWindow;
+            : (isRpTab && isAgentRole)
+                ? chatWindow  // route Lexy/thought to chat tab even when RP is active
+                : chatWindow;
         targetWindow.appendChild(wrapper);
         targetWindow.scrollTop = targetWindow.scrollHeight;
         return wrapper.querySelector(".bubble");

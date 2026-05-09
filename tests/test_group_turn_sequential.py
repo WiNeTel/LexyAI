@@ -294,6 +294,104 @@ async def test_archived_characters_are_filtered_out() -> None:
 
 
 @pytest.mark.asyncio
+async def test_at_mention_caps_speaker_count_to_mention_count() -> None:
+    """Phase 13.5 hotfix v3 — when the user @-mentions ONE char, that
+    char alone speaks. The auto-fill that previously promoted a 2nd
+    char into the slot via talkativeness/round-robin is suppressed
+    when the user explicitly named someone.
+
+    Mike's report: he writes '@Sandra hilf mir' and Lena ALSO
+    answers because max_speakers_per_round=2. With identical
+    tracked_state across both chars (e.g. arousal=extrem_notgeil),
+    the parallel reply mirrors emotionally and feels like a copy.
+    The cap stops the auto-fill at the named-count, restoring the
+    explicit '/whisper-style' control the user expected.
+    """
+    llm = _FakeLLM(
+        route_by_system={
+            "Du bist Sandra": "Sandra: ich helfe dir.",
+            "Du bist Lena": "Lena: ich auch.",
+        }
+    )
+    sandra = CharacterCard(id="sandra", name="Sandra", talkativeness=0.5)
+    lena = CharacterCard(id="lena", name="Lena", talkativeness=0.5)
+    orch = GroupTurnOrchestrator(
+        llm_chat=llm,
+        max_speakers_per_round=2,  # default would let 2 in
+        turn_selection="round_robin",
+    )
+    req = GroupTurnRequest(
+        session_id="s1",
+        history=[],
+        characters=[sandra, lena],
+        user_message="@Sandra hilf mir.",
+    )
+    result = await orch.run_round(req)
+    # Only Sandra speaks — Lena does NOT auto-fill the second slot.
+    assert [t.character_name for t in result.turns] == ["Sandra"]
+
+
+@pytest.mark.asyncio
+async def test_two_at_mentions_both_speak() -> None:
+    """When the user names TWO chars, both speak. The cap follows
+    the explicit count, not max_speakers."""
+    llm = _FakeLLM(
+        route_by_system={
+            "Du bist Sandra": "Sandra: ich helfe.",
+            "Du bist Lena": "Lena: ich auch.",
+        }
+    )
+    sandra = CharacterCard(id="sandra", name="Sandra")
+    lena = CharacterCard(id="lena", name="Lena")
+    mira = CharacterCard(id="mira", name="Mira")
+    orch = GroupTurnOrchestrator(
+        llm_chat=llm,
+        max_speakers_per_round=4,
+        turn_selection="round_robin",
+    )
+    req = GroupTurnRequest(
+        session_id="s1",
+        history=[],
+        characters=[sandra, lena, mira],
+        user_message="@Sandra @Lena, was machen wir?",
+    )
+    result = await orch.run_round(req)
+    # Both named chars speak; Mira (not named) stays silent.
+    names = [t.character_name for t in result.turns]
+    assert "Sandra" in names
+    assert "Lena" in names
+    assert "Mira" not in names
+
+
+@pytest.mark.asyncio
+async def test_no_mention_uses_full_max_speakers() -> None:
+    """Without a user mention, the cap stays at max_speakers — the
+    autonomous fill path is unchanged for non-targeted messages."""
+    llm = _FakeLLM(
+        route_by_system={
+            "Du bist Sandra": "Sandra: ja.",
+            "Du bist Lena": "Lena: ja.",
+        }
+    )
+    sandra = CharacterCard(id="sandra", name="Sandra")
+    lena = CharacterCard(id="lena", name="Lena")
+    orch = GroupTurnOrchestrator(
+        llm_chat=llm,
+        max_speakers_per_round=2,
+        turn_selection="round_robin",
+    )
+    req = GroupTurnRequest(
+        session_id="s1",
+        history=[],
+        characters=[sandra, lena],
+        user_message="Was sollen wir denn jetzt machen?",  # no @-name
+    )
+    result = await orch.run_round(req)
+    # Both speak — no explicit mention → max_speakers cap applies.
+    assert len(result.turns) == 2
+
+
+@pytest.mark.asyncio
 async def test_pulse_originator_appears_as_visible_turn() -> None:
     """Phase 13.5 (A): the pulse-from char now ALSO surfaces as the
     first turn, so the chat shows what they actually did (the pulse
