@@ -92,6 +92,65 @@ class TestImperativeDetection:
             '"Sandra? Bist du da?" *flüstert leise*'
         ) is False
 
+    def test_case_insensitive_match(self) -> None:
+        """Mike's leak: e4b echoed the guidance with mixed casing
+        ('macht etwas BEOBACHTBARES' instead of the original
+        'MACHT etwas Beobachtbares'). The detector must not be
+        fooled by simple case shuffling."""
+        # Lowercase 'macht', uppercase 'BEOBACHTBARES' — the exact
+        # leaked pattern from Mike's chat.
+        leaked = (
+            "Yara macht etwas BEOBACHTBARES. Wähle EINS: zeigt mit "
+            "dem Finger auf etwas Konkretes."
+        )
+        assert _looks_imperative_template(leaked) is True
+
+    def test_kein_passives_marker(self) -> None:
+        """Even partial leaks that only kept the 'KEIN passives' line
+        from the Verbote: section are caught."""
+        partial = (
+            "*sucht im Sand* 'Sandra...?' Verbote: KEIN passives "
+            "Sand-Anstarren."
+        )
+        assert _looks_imperative_template(partial) is True
+
+    def test_kein_schweigen_marker(self) -> None:
+        """The Yara prompt ends with 'KEIN SCHWEIGEN — wenn keiner
+        antwortet'. If the generator echoes that fragment alone, we
+        still want to flag it."""
+        partial = "Yara handelt nicht. KEIN SCHWEIGEN."
+        assert _looks_imperative_template(partial) is True
+
+    def test_real_castaway_yara_leak_caught(self) -> None:
+        """Verbatim from Mike's report — a full leak of the Yara
+        prompt as displayed pulse text. The full thing must be
+        flagged, not just a fragment."""
+        leaked = (
+            "Yara macht etwas BEOBACHTBARES. Wähle EINS: zeigt mit "
+            "dem Finger auf etwas Konkretes (Rauch, Trümmer im "
+            "Wasser, Spur im Sand, ein Vogel über dem Hügel), fasst "
+            "die Lage in EINEM Satz zusammen ('Wir haben Wasser, "
+            "aber kein Werkzeug.'), oder stellt eine konkrete Frage "
+            "die voranbringt ('Wer hat das Süßwasser schon "
+            "getestet?'). KEIN SCHWEIGEN — wenn keiner antwortet, "
+            "spricht sie aus was sie gerade sieht. Verbote: KEIN "
+            "passives Sitzen, KEIN 'starre in den Sand'-Loop."
+        )
+        assert _looks_imperative_template(leaked) is True
+
+    def test_real_castaway_lena_leak_caught(self) -> None:
+        leaked = (
+            "Lena REAGIERT auf einen anderen Charakter NAMENTLICH. "
+            "Wähle EINS: spricht Sandra direkt an ('Sandra, ich hab "
+            "Hunger'), folgt Mira zum Wald, fragt Yara was zu tun "
+            "ist, klammert sich an Sandras Arm. Sie ist 16 und "
+            "ängstlich, ABER KEINE STATUE — sie macht etwas, sie "
+            "spricht jemanden an. Verbote: KEIN passives "
+            "Sand-Anstarren, KEIN 'mein Kopf dröhnt'-Loop. Sie "
+            "nutzt einen Namen einer anderen Person."
+        )
+        assert _looks_imperative_template(leaked) is True
+
 
 # ─── PulseGenerator.style_guidance ──────────────────────────────────
 

@@ -1673,6 +1673,19 @@ class CharacterChatPlugin(BasePlugin):
                             str(exc),
                         )
                         pulse_text = ""
+                    # Phase 13.5 hotfix v2: Mike's report — the e4b brain
+                    # sometimes echoes the guidance back instead of
+                    # generating narrative ('Lena REAGIERT auf einen
+                    # anderen Charakter NAMENTLICH. Wähle EINS:'). Drop
+                    # those outputs and fall through to the next
+                    # fallback. Without this guard the leak persists.
+                    if pulse_text and _looks_imperative_template(pulse_text):
+                        log.warning(
+                            "character_chat.pulse_generator_echoed_guidance "
+                            "character=%s — dropping and falling back",
+                            card.name,
+                        )
+                        pulse_text = ""
                 if not pulse_text and card.proactive_pulse_prompt:
                     # Fallback to the card-authored text only if it looks
                     # narrative (Phase 13.5 hotfix). Imperative templates
@@ -1685,6 +1698,20 @@ class CharacterChatPlugin(BasePlugin):
                     pulse_text = _default_pulse(card.age_stage)
 
         if not pulse_text:
+            pulse_text = "*bemerkt etwas und bewegt sich*"
+
+        # Phase 13.5 hotfix v2: absolute final guard. Whatever the
+        # source of pulse_text (scheduler payload, generator output,
+        # verbatim card.prompt, default), if it still looks like an
+        # imperative template after all fallbacks, replace it with the
+        # generic default. Persisting it as a chat turn would leak the
+        # template into the visible window (Mike's report).
+        if _looks_imperative_template(pulse_text):
+            log.warning(
+                "character_chat.pulse_text_imperative_post_guard "
+                "character_id=%s — replacing with default",
+                character_id,
+            )
             pulse_text = "*bemerkt etwas und bewegt sich*"
 
         log.info(
@@ -4078,15 +4105,23 @@ def _default_pulse(age_stage: str) -> str:
 # instructions, NOT chat content — they must NEVER be used as the
 # visible pulse text. The check is intentionally simple: any of the
 # clear imperative markers below = treat as instruction.
+#
+# All markers are matched case-INSENSITIVELY because the e4b brain
+# sometimes echoes the guidance with mixed casing (e.g. 'macht
+# etwas BEOBACHTBARES' instead of 'MACHT etwas Beobachtbares').
 _IMPERATIVE_PULSE_MARKERS: tuple[str, ...] = (
-    "Wähle EINS",
-    "Wähle eins",
-    "REAGIERT auf",
-    "MACHT eine konkrete",
-    "ist SCHON UNTERWEGS",
-    "MACHT etwas Beobachtbares",
-    "Verbote:",
-    "ABSOLUTES VERBOT",
+    "wähle eins",
+    "wähle einen",
+    "reagiert auf einen",
+    "macht eine konkrete",
+    "ist schon unterwegs",
+    "macht etwas beobachtbares",
+    "verbote:",
+    "absolutes verbot",
+    # Common framing tokens that appear ONLY in instruction templates.
+    "verbote :",
+    "kein passives",
+    "kein schweigen",
 )
 
 
@@ -4095,4 +4130,5 @@ def _looks_imperative_template(text: str) -> bool:
     rather than narrative chat content."""
     if not text:
         return False
-    return any(marker in text for marker in _IMPERATIVE_PULSE_MARKERS)
+    lowered = text.lower()
+    return any(marker in lowered for marker in _IMPERATIVE_PULSE_MARKERS)
