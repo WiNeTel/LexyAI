@@ -51,9 +51,21 @@ echo Vision:   yes
 echo Audio:    no
 echo.
 
+:: Custom Heretic-variant Jinja template. The GGUF's embedded template
+:: uses non-standard tokens (<|turn>, <|channel>, <|think|>) that
+:: llama.cpp's C++ legacy parser doesn't understand — it falls back
+:: to a "compatibility workaround" that re-renders into
+:: <start_of_turn>...<end_of_turn>, which is NOT what this model was
+:: trained with. Pointing --jinja at the model's own
+:: chat_template.jinja makes llama.cpp render with the exact tokens
+:: the weights expect. Big consistency win for narrative quality.
+set CHAT_TEMPLATE=%MODEL_DIR%\gemma-4-26B-A4B\chat_template.jinja
+
 "%LLAMA_DIR%\llama-server.exe" ^
     --model "%MODEL%" ^
     %MMPROJ_ARG% ^
+    --jinja ^
+    --chat-template-file "%CHAT_TEMPLATE%" ^
     --host 0.0.0.0 ^
     --port 5005 ^
     --ctx-size 50000 ^
@@ -66,6 +78,6 @@ echo.
     --mlock ^
     --api-key sk-lexy-local ^
     --alias gemma-4-26b-a4b-it ^
-	--parallel 2
+    --parallel 2
 
 pause
