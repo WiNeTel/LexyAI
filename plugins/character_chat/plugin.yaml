@@ -47,6 +47,15 @@ config_defaults:
   # message ("pregnant Luna kicks", "hungry baby cries"). Option B from the
   # design review — intensive but the point of the feature.
   proactive_pulses_enabled: true
+  # Phase 13.6 — age-stage gate for pulse timers. Default ['baby',
+  # 'toddler']: only those register their own per-character timer.
+  # Adults/teens/children rely on the sim-tick path (one LLM-picked
+  # speaker every simulation_default_interval_minutes) for ambient
+  # activity. Mike's RP feedback was that per-adult pulses degenerated
+  # into 'Was hast du gesehen?' loops because every char's timer fired
+  # independently with no contextual hook. Set to [] to disable the
+  # gate entirely (legacy behaviour, every age gets pulses).
+  pulse_age_stages: ["baby", "toddler"]
   # Global RP style prompt — injected as MUST-priority system section into
   # EVERY character turn. Use this to enforce a uniform style across all
   # characters (Mike's request: "alle charaktere sollen im gleichen Style

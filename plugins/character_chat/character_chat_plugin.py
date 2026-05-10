@@ -312,6 +312,16 @@ class CharacterChatPlugin(BasePlugin):
         self._pulse_history_window: int = 6
         self._pulse_max_tokens: int = 600  # was 200 — Phase 13.2
         self._proactive_pulses_enabled: bool = True
+        # Phase 13.6 — age-stage gate for pulse registration. Babies and
+        # toddlers can't autonomously initiate (they need a timer to
+        # 'cry', 'tug at sleeve' etc.); adults/teens/children plan and
+        # speak on their own when the user prompts or the sim ticks.
+        # Mike's RP feedback: pulse-driven adult turns produced
+        # 'Was hast du gesehen?'-loops because every char fired its
+        # own timer; the autonomous_sim tick path is the cleaner
+        # ambient-activity mechanism for grown-up chars. Empty list
+        # = no age gate (legacy behaviour, every age gets pulses).
+        self._pulse_age_stages: list[str] = ["baby", "toddler"]
         self._lexy_auto_reacts: bool = True
         self._memory_strict_isolation: bool = True
         # Context window knobs. 0 = read live from brain config.
@@ -918,6 +928,16 @@ class CharacterChatPlugin(BasePlugin):
         self._proactive_pulses_enabled = bool(
             cfg.get("proactive_pulses_enabled", True)
         )
+        # Phase 13.6 — age-stage gate. Default ['baby', 'toddler']:
+        # only those age stages register pulse timers. Set to [] to
+        # disable the gate (every age gets pulses, legacy behaviour).
+        raw_age_stages = cfg.get("pulse_age_stages", ["baby", "toddler"])
+        if isinstance(raw_age_stages, list):
+            self._pulse_age_stages = [
+                str(s).strip() for s in raw_age_stages if str(s).strip()
+            ]
+        else:
+            self._pulse_age_stages = ["baby", "toddler"]
         self._lexy_auto_reacts = bool(cfg.get("lexy_auto_reacts_to_pulses", True))
         self._memory_strict_isolation = bool(
             cfg.get("memory_strict_isolation", True)
@@ -3577,6 +3597,21 @@ class CharacterChatPlugin(BasePlugin):
         """
         if not self._proactive_pulses_enabled or not card.proactive_pulse_pattern:
             return ""
+        # Phase 13.6 — age-stage gate. Adults/teens/children typically
+        # don't need a per-character timer; the sim-tick path provides
+        # ambient activity for them. Babies/toddlers do need timers
+        # because they can't decide on their own when to cry/tug. An
+        # empty allow-list = no gate (legacy behaviour).
+        if (
+            self._pulse_age_stages
+            and card.age_stage not in self._pulse_age_stages
+        ):
+            log.info(
+                "character_chat.pulse_skipped_age_gate "
+                "character=%s age_stage=%s allowed=%s",
+                card.name, card.age_stage, self._pulse_age_stages,
+            )
+            return ""
         scheduler = self.api.get_plugin("scheduler")
         if scheduler is None:
             log.warning("character_chat.scheduler_unavailable_for_pulse")
@@ -3817,6 +3852,20 @@ class CharacterChatPlugin(BasePlugin):
                 stale_reasons["dead_character"] += len(timer_ids)
                 continue
 
+            # Phase 13.6 — age-stage gate. If the character's age stage
+            # is no longer in the allowed pulse list (e.g. defaults
+            # changed from 'all ages' to 'baby+toddler only'), cancel
+            # the pre-existing timers. New ones won't be re-registered
+            # because _register_pulse_timer has the same gate.
+            if (
+                self._pulse_age_stages
+                and card.age_stage not in self._pulse_age_stages
+            ):
+                stale.extend(timer_ids)
+                stale_reasons.setdefault("age_gated", 0)
+                stale_reasons["age_gated"] += len(timer_ids)
+                continue
+
             # Cancel timers whose session no longer exists. We only
             # apply this when the SessionStore reported at least one
             # known session — otherwise a brand-new install would
@@ -3843,12 +3892,13 @@ class CharacterChatPlugin(BasePlugin):
 
         log.info(
             "character_chat.pulse_timers_rehydrated restored=%d "
-            "cancelled=%d (dead_char=%d dead_session=%d dup=%d)",
+            "cancelled=%d (dead_char=%d dead_session=%d dup=%d age_gated=%d)",
             restored,
             len(stale),
             stale_reasons["dead_character"],
             stale_reasons["dead_session"],
             stale_reasons["duplicate"],
+            stale_reasons.get("age_gated", 0),
         )
 
         # ── Phase 2: Create missing timers for attached characters ────
