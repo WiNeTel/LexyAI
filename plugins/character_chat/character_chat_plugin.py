@@ -4141,26 +4141,56 @@ def _default_pulse(age_stage: str) -> str:
 # All markers are matched case-INSENSITIVELY because the e4b brain
 # sometimes echoes the guidance with mixed casing (e.g. 'macht
 # etwas BEOBACHTBARES' instead of 'MACHT etwas Beobachtbares').
-_IMPERATIVE_PULSE_MARKERS: tuple[str, ...] = (
-    "wähle eins",
-    "wähle einen",
-    "reagiert auf einen",
-    "macht eine konkrete",
-    "ist schon unterwegs",
-    "macht etwas beobachtbares",
-    "verbote:",
-    "absolutes verbot",
-    # Common framing tokens that appear ONLY in instruction templates.
+#
+# Phase 13.5 hotfix v5 — markers tightened. Mike's session log
+# showed all four chars getting their pulse-text replaced with the
+# default (`pulse_text_imperative_post_guard ... replacing with
+# default`) because the previous v4 markers were too generic:
+# 'reagiert auf einen', 'ist schon unterwegs' etc. occur in
+# perfectly valid narrative output ('Mira ist schon unterwegs zum
+# Wald', 'Yara reagiert auf einen lauten Knall'). The guard then
+# killed legitimate generations.
+#
+# New rule: a pulse counts as imperative ONLY if it contains a
+# STRONG marker (a phrase that's structurally impossible in
+# narrative — colon-separated lists, all-caps verbote sections),
+# OR if it contains 2+ medium markers (reinforcing each other).
+_IMPERATIVE_STRONG_MARKERS: tuple[str, ...] = (
+    "wähle eins:",        # template list-start with colon
+    "wähle eins und",     # Mira's template pattern ('Wähle EINS und beschreibe...')
+    "wähle einen:",
+    "verbote:",           # template ban list
     "verbote :",
+    "absolutes verbot",
+    "macht etwas beobachtbares",  # verbatim from Yara's template
+    "macht eine konkrete aktion",  # verbatim from Sandra's template
+    "reagiert auf einen anderen charakter",  # verbatim from Lena's template
+    "aber keine statue",   # verbatim from Lena's template
+)
+_IMPERATIVE_MEDIUM_MARKERS: tuple[str, ...] = (
+    "wähle eins",         # without specific suffix — can appear in narrative
+    "wähle einen",
     "kein passives",
     "kein schweigen",
+    "ist schon unterwegs",  # plausible narrative ('Mira ist schon unterwegs zum Wald'),
+                            # but combined with 'wähle eins' = template
 )
 
 
 def _looks_imperative_template(text: str) -> bool:
     """True when the pulse text reads like an LLM instruction template
-    rather than narrative chat content."""
+    rather than narrative chat content.
+
+    Strong markers trigger immediately. Medium markers need 2+ hits
+    in the same text to trigger — single-marker matches let valid
+    narrative ('kein passives Warten mehr') through.
+    """
     if not text:
         return False
     lowered = text.lower()
-    return any(marker in lowered for marker in _IMPERATIVE_PULSE_MARKERS)
+    if any(marker in lowered for marker in _IMPERATIVE_STRONG_MARKERS):
+        return True
+    medium_hits = sum(
+        1 for marker in _IMPERATIVE_MEDIUM_MARKERS if marker in lowered
+    )
+    return medium_hits >= 2

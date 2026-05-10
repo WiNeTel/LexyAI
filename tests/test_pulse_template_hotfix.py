@@ -106,19 +106,69 @@ class TestImperativeDetection:
         assert _looks_imperative_template(leaked) is True
 
     def test_kein_passives_marker(self) -> None:
-        """Even partial leaks that only kept the 'KEIN passives' line
-        from the Verbote: section are caught."""
+        """Echo'd 'Verbote: KEIN passives ...' template fragment
+        triggers via the strong 'verbote:' marker (and as a bonus
+        also matches the 'kein passives' medium marker)."""
         partial = (
             "*sucht im Sand* 'Sandra...?' Verbote: KEIN passives "
             "Sand-Anstarren."
         )
         assert _looks_imperative_template(partial) is True
 
-    def test_kein_schweigen_marker(self) -> None:
-        """The Yara prompt ends with 'KEIN SCHWEIGEN — wenn keiner
-        antwortet'. If the generator echoes that fragment alone, we
-        still want to flag it."""
-        partial = "Yara handelt nicht. KEIN SCHWEIGEN."
+    def test_kein_schweigen_alone_does_not_trigger(self) -> None:
+        """Phase 13.5 hotfix v5: 'kein schweigen' alone could
+        plausibly appear in narrative ('Genug, kein Schweigen mehr.').
+        The medium marker needs reinforcement (2+ hits) before the
+        guard kicks in. This test ensures false positives don't
+        block valid narrative."""
+        narrative = (
+            "*tritt einen Schritt vor und hebt den Kopf* "
+            "'Genug, kein Schweigen mehr — ich rede jetzt.'"
+        )
+        # No strong marker, only 1 medium marker → not flagged.
+        assert _looks_imperative_template(narrative) is False
+
+    def test_two_medium_markers_trigger(self) -> None:
+        """If both 'wähle eins' AND 'kein passives' appear in the
+        SAME output, that's strong evidence of an echoed template
+        and the guard fires."""
+        partial = (
+            "Du sollst etwas machen. Wähle eins von den Optionen. "
+            "Kein passives Verhalten."
+        )
+        # 2 medium markers → triggers.
+        assert _looks_imperative_template(partial) is True
+
+    def test_narrative_with_ist_schon_unterwegs_not_flagged(self) -> None:
+        """Phase 13.5 hotfix v5 — Mike's session log: e4b produced
+        narrative containing 'ist schon unterwegs' ('Mira ist schon
+        unterwegs zum Wald'). The previous heuristic caught it as
+        imperative, replaced with default; the new heuristic lets
+        it through because that phrase is plausible narrative."""
+        narrative = (
+            "*Mira tritt auf den Pfad und sagt:* 'Ich bin schon "
+            "unterwegs zum Bach, ihr könnt mir folgen.'"
+        )
+        assert _looks_imperative_template(narrative) is False
+
+    def test_narrative_with_reagiert_auf_einen_not_flagged(self) -> None:
+        """'reagiert auf einen lauten Knall' is valid narrative —
+        the v5 heuristic only flags the FULL phrase 'reagiert auf
+        einen anderen charakter' (verbatim template marker)."""
+        narrative = (
+            "*Yara reagiert auf einen lauten Knall hinter ihr und "
+            "fährt zusammen* 'Was war das?'"
+        )
+        assert _looks_imperative_template(narrative) is False
+
+    def test_narrative_with_macht_eine_konkrete_aktion_full_phrase(self) -> None:
+        """The full template phrase 'macht eine konkrete aktion'
+        IS still flagged (it's verbatim from Sandra's template).
+        Only the looser 'macht eine konkrete' (without 'aktion')
+        was the false-positive risk; we kept the precise variant."""
+        partial = (
+            "Sandra macht eine konkrete Aktion statt nur zu fühlen."
+        )
         assert _looks_imperative_template(partial) is True
 
     def test_real_castaway_yara_leak_caught(self) -> None:
