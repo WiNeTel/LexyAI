@@ -61,6 +61,17 @@ echo.
 :: the weights expect. Big consistency win for narrative quality.
 set CHAT_TEMPLATE=%MODEL_DIR%\gemma-4-26B-A4B\chat_template.jinja
 
+:: --split-mode none keeps the entire 26B-A4B on the main-gpu (P40)
+:: instead of letting llama.cpp's default 'layer' split spill ~5 GB
+:: of tensors onto the RTX 3060. The 3060 is reserved for the E4B
+:: fast brain on :5006; without this flag the main brain ate ~9.5
+:: of the 12 GB on that GPU, leaving E4B no room.
+::
+:: ctx 32768 + parallel 1 fit on the P40 (24 GB) with comfortable
+:: headroom: 16 GB tensors + 6.6 GB KV cache (single slot) + 1.3 GB
+:: compute = ~24 GB ceiling. parallel=2 doubled the KV → OOM. RP
+:: rounds rarely overlap a user turn; llama.cpp queues the second
+:: call with maybe 1-2 s of extra latency, which is fine.
 "%LLAMA_DIR%\llama-server.exe" ^
     --model "%MODEL%" ^
     %MMPROJ_ARG% ^
@@ -68,9 +79,10 @@ set CHAT_TEMPLATE=%MODEL_DIR%\gemma-4-26B-A4B\chat_template.jinja
     --chat-template-file "%CHAT_TEMPLATE%" ^
     --host 0.0.0.0 ^
     --port 5005 ^
-    --ctx-size 50000 ^
+    --ctx-size 32768 ^
     --n-gpu-layers -1 ^
     --main-gpu 1 ^
+    --split-mode none ^
     --threads 8 ^
     --batch-size 1024 ^
     --ubatch-size 512 ^
@@ -78,6 +90,6 @@ set CHAT_TEMPLATE=%MODEL_DIR%\gemma-4-26B-A4B\chat_template.jinja
     --mlock ^
     --api-key sk-lexy-local ^
     --alias gemma-4-26b-a4b-it ^
-    --parallel 2
+    --parallel 1
 
 pause
