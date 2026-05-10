@@ -1658,13 +1658,30 @@ class CharacterChatPlugin(BasePlugin):
                     history = self._load_session_history(session_id)
                     sess_state = await self._get_session_state(session_id)
                     scene = str(sess_state.get("scene") or "")
+                    # Phase 13.5 hotfix v4: don't pass an imperative
+                    # template as ``style_guidance``. Mike's Castaway
+                    # log: Yara's pulse was constantly the default
+                    # fallback because e4b (Gemma 12B) couldn't follow
+                    # the meta-instruction "here's an imperative
+                    # template, generate narrative that obeys it".
+                    # The model echoed it back → heuristic caught the
+                    # echo → fallback → default. Without the imperative
+                    # guidance, the generator produces persona-driven
+                    # narrative (its original purpose pre-13.2). The
+                    # imperative still influences via the persona
+                    # action-discipline suffix anyway.
+                    raw_guidance = card.proactive_pulse_prompt or ""
+                    if _looks_imperative_template(raw_guidance):
+                        guidance_for_gen = ""
+                    else:
+                        guidance_for_gen = raw_guidance
                     try:
                         pulse_text = await self._pulse_generator.generate(
                             character=card,
                             others_in_session=others,
                             recent_history=history,
                             scene=scene,
-                            style_guidance=card.proactive_pulse_prompt or "",
+                            style_guidance=guidance_for_gen,
                         )
                     except Exception as exc:  # noqa: BLE001
                         log.warning(
@@ -1673,12 +1690,10 @@ class CharacterChatPlugin(BasePlugin):
                             str(exc),
                         )
                         pulse_text = ""
-                    # Phase 13.5 hotfix v2: Mike's report — the e4b brain
-                    # sometimes echoes the guidance back instead of
-                    # generating narrative ('Lena REAGIERT auf einen
-                    # anderen Charakter NAMENTLICH. Wähle EINS:'). Drop
-                    # those outputs and fall through to the next
-                    # fallback. Without this guard the leak persists.
+                    # Belt + braces: even with imperative guidance
+                    # stripped, e4b can still drift back to echoing
+                    # phrases from the persona ('Verbote: KEIN ...').
+                    # Drop any output that still looks templated.
                     if pulse_text and _looks_imperative_template(pulse_text):
                         log.warning(
                             "character_chat.pulse_generator_echoed_guidance "

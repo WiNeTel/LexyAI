@@ -217,3 +217,77 @@ class TestStyleGuidance:
         ))
         user_prompt = llm.calls[0]["messages"][1]["content"]
         assert "Aktions-Vorgabe" not in user_prompt
+
+
+# ─── Phase 13.5 hotfix v4: imperative-prompt sidestep ──────────────
+
+
+class TestImperativeSidestep:
+    """Phase 13.5 hotfix v4 — when card.proactive_pulse_prompt looks
+    imperative, the plugin must NOT pass it as style_guidance to the
+    generator. Mike's chat showed Yara's pulse as the generic default
+    text every single time because e4b kept echoing the imperative
+    instead of generating narrative; my heuristic caught the echo,
+    fallback fired, and the default leaked. Stripping the imperative
+    from the guidance lets the generator produce persona-driven
+    narrative reliably."""
+
+    def test_imperative_prompt_not_passed_as_guidance(self) -> None:
+        """Simulate the plugin's branch: when raw guidance looks
+        imperative, the generator gets called WITHOUT guidance."""
+        from plugins.character_chat.character_chat_plugin import (
+            _looks_imperative_template,
+        )
+
+        imperative = (
+            "Yara macht etwas BEOBACHTBARES. Wähle EINS: zeigt mit "
+            "dem Finger... Verbote: KEIN passives Sitzen."
+        )
+        # Confirm the heuristic flags it (consistency with prior tests).
+        assert _looks_imperative_template(imperative) is True
+
+        llm = _FakeLLM()
+        gen = PulseGenerator(llm_chat=llm, brain="e4b")
+        card = _card("Yara", pulse_prompt=imperative)
+        # The plugin calls generate with style_guidance="" when the
+        # raw prompt is imperative. Verify the prompt-sans-guidance
+        # path works as expected.
+        asyncio.run(gen.generate(
+            character=card,
+            others_in_session=[],
+            recent_history=[],
+            style_guidance="",  # plugin clears imperatives before pass-through
+        ))
+        user_prompt = llm.calls[0]["messages"][1]["content"]
+        # Aktions-Vorgabe section not present (no guidance to embed).
+        assert "Aktions-Vorgabe" not in user_prompt
+        # The imperative text itself doesn't appear in the prompt
+        # body either — the LLM has nothing to echo.
+        assert "Wähle EINS" not in user_prompt
+        assert "Verbote:" not in user_prompt
+
+    def test_narrative_prompt_still_passed_as_guidance(self) -> None:
+        """A hand-written narrative pulse_prompt (the original design
+        intent) still flows through to the generator as guidance —
+        only imperatives get stripped."""
+        narrative = (
+            "*hört ein Knirschen aus dem Wald und zuckt unsicher "
+            "zusammen, Augen weit aufgerissen*"
+        )
+        from plugins.character_chat.character_chat_plugin import (
+            _looks_imperative_template,
+        )
+        assert _looks_imperative_template(narrative) is False
+        # In the plugin path, this narrative would flow through.
+        llm = _FakeLLM()
+        gen = PulseGenerator(llm_chat=llm, brain="e4b")
+        card = _card("Yara", pulse_prompt=narrative)
+        asyncio.run(gen.generate(
+            character=card,
+            others_in_session=[],
+            recent_history=[],
+            style_guidance=narrative,  # narrative passes through
+        ))
+        user_prompt = llm.calls[0]["messages"][1]["content"]
+        assert "Aktions-Vorgabe" in user_prompt
+        assert "Knirschen aus dem Wald" in user_prompt
