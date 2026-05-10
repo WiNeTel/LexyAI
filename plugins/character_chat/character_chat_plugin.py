@@ -1854,26 +1854,102 @@ class CharacterChatPlugin(BasePlugin):
                 )
             return
 
-        # Character turn: run a 1-speaker round, no pulse originator.
-        # The orchestrator's LLM-picker selects who makes sense right now.
+        # Phase 13.7c — Discussion-Mode: 2 speakers per sim-tick (was 1)
+        # with a topic anchor that makes the round feel like an actual
+        # exchange instead of a solo monologue. The topic surrogates a
+        # user message — Char A reacts to it, Char B reacts to A, both
+        # turns persist as a Mini-Round.
         if self._orchestrator is None:
             return
+        topic = await self._pick_sim_topic(session_id, characters)
         original_max = self._orchestrator._max_speakers  # type: ignore[attr-defined]
         try:
-            self._orchestrator._max_speakers = 1  # type: ignore[attr-defined]
+            # 2 speakers = a real exchange. A 3-speaker round would
+            # also work but doubles LLM time; 2 is the sweet spot.
+            self._orchestrator._max_speakers = 2  # type: ignore[attr-defined]
             log.info(
-                "character_chat.sim_tick_character session=%s candidates=%d",
+                "character_chat.sim_tick_character session=%s candidates=%d "
+                "topic=%r",
                 session_id, len(characters),
+                (topic[:60] + "…") if len(topic) > 60 else topic,
             )
             await self._run_round_safe(
                 session_id=session_id,
-                user_message="",
+                user_message=topic,  # the topic acts as the round's user-trigger
                 pulse_from_id="",
                 pulse_text="",
                 scene=scene,
             )
         finally:
             self._orchestrator._max_speakers = original_max  # type: ignore[attr-defined]
+
+    async def _pick_sim_topic(
+        self,
+        session_id: str,
+        characters: list[CharacterCard],
+    ) -> str:
+        """Phase 13.7c — synthesise a topic anchor for an autonomous
+        sim tick.
+
+        Without a topic, sim-tick rounds produce 'Was ist los?' loops
+        because chars have nothing to react to. The topic surrogates a
+        user message — the orchestrator builds the round around it,
+        char A reacts on the first turn, char B reacts to A on the
+        second.
+
+        Order of preference:
+          1. Recent user message (< 30 min) → still mid-conversation
+          2. Critical tracked_stats (durst=akut etc.) → state-driven
+          3. Random pick from a small Castaway-survival backlog
+        """
+        # 1. Recent user message
+        history = self._load_session_history(session_id)
+        now = time.time()
+        for msg in reversed(history or []):
+            if msg.get("role") != "user":
+                continue
+            ts_raw = msg.get("created_at") or msg.get("timestamp") or now
+            try:
+                ts = float(ts_raw)
+            except (TypeError, ValueError):
+                ts = now
+            if now - ts < 30 * 60:
+                content = str(msg.get("content", "")).strip()
+                if content:
+                    return content
+            break  # only check the most recent user msg
+
+        # 2. Critical state hits across all attached chars
+        try:
+            container = await self._get_rp_container(session_id)
+        except Exception:  # noqa: BLE001
+            container = None
+        if container is not None:
+            for c in characters:
+                try:
+                    st = await container.get_char_state(c.id)
+                except Exception:  # noqa: BLE001
+                    continue
+                if not st:
+                    continue
+                durst = str(st.get("durst") or "").lower()
+                if any(k in durst for k in ("akut", "kritisch", "stark")):
+                    return (
+                        f"{c.name}'s Durst ist kritisch geworden. "
+                        "Was tun? Wer holt Wasser, wer kümmert sich um sie?"
+                    )
+                hunger = str(st.get("hunger") or "").lower()
+                if any(k in hunger for k in ("akut", "knurrend", "stark")):
+                    return (
+                        f"{c.name} hat starken Hunger. Was gibt's auf "
+                        "der Insel zu essen?"
+                    )
+
+        # 3. Random rotation from a 5-item backlog. Generic enough to
+        # work outside Castaway too — talks about water, shelter,
+        # inventory, food, fire — universal survival topics.
+        import random as _random
+        return _random.choice(_SIM_TOPIC_BACKLOG)
 
     async def _on_session_project_changed(self, event: Any) -> None:
         """React when a session is moved to a different project.
@@ -4156,6 +4232,25 @@ def _describe_trigger(
     if user_message:
         return ("user", user_message)
     return ("spontaneous", "")
+
+
+# Phase 13.7c — fallback pool of survival-themed sim-tick topics.
+# Used by _pick_sim_topic when no recent user message and no critical
+# state pressure. Generic enough to fit any survival-flavoured RP
+# scenario; if the user runs a non-survival session and dislikes the
+# bias, override via plugin.yaml in a future revision.
+_SIM_TOPIC_BACKLOG: tuple[str, ...] = (
+    "Wer holt als nächstes Wasser am Bach? Sollen wir in Paaren "
+    "losziehen oder einzeln?",
+    "Wir brauchen Schatten bevor die Sonne hochsteht. Wo machen wir "
+    "das Lager — Strand oder weiter hinten?",
+    "Was hat die Brandung uns angespült? Sollten wir den Strand "
+    "systematisch absuchen?",
+    "Was machen wir wegen Essen heute Abend? Früchte vom Wald, oder "
+    "Krabben am Riff?",
+    "Wenn es dunkel wird brauchen wir Feuer. Wer hat schon mal welches "
+    "gemacht?",
+)
 
 
 _DEFAULT_PULSES: dict[str, str] = {

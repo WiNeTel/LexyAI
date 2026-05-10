@@ -61,12 +61,41 @@ LOREBOOK_NAME = "Stranded — Karibik-Insel"
 # ─── Character profiles ─────────────────────────────────────────────
 
 # Shared scenario text — every character sees the same setup so the
-# scene framing is consistent across speakers.
+# scene framing is consistent across speakers. Phase 13.7a: extended
+# with a survival-backlog + group-dynamics block so chars have an
+# explicit menu of topics to discuss instead of monologuing into the
+# void.
 SCENARIO = (
     "Du bist mit Sandra, Lena, Mira und Yara nach dem Untergang der "
     "MS Kanaria auf einer einsamen Karibik-Insel gestrandet. Die "
     "anderen drei sind genau wie du nur in dem, womit du geschlafen "
-    "hast. Es ist kurz nach Sonnenaufgang."
+    "hast. Es ist kurz nach Sonnenaufgang.\n"
+    "\n"
+    "## Was die Gruppe braucht (Priorität in dieser Reihenfolge)\n"
+    "1. **Wasser**. Salz brennt auf der Haut, der Mund ist trocken; "
+    "spätestens am Nachmittag wird Durst akut.\n"
+    "2. **Schatten / Unterkunft**. Die Sonne wird in 3-4 Stunden "
+    "brutal — eine Stelle die Schatten und Wind hält wäre Gold wert.\n"
+    "3. **Inventur**. Was hat die Brandung angeschwemmt? Holz, "
+    "Stoff, Metall, Plastik — alles was sich verwerten lässt.\n"
+    "4. **Essen**. Nicht akut (gestern wurde noch normal gegessen) — "
+    "aber spätestens heute Abend ein Thema. Früchte? Krabben? "
+    "Fische?\n"
+    "5. **Feuer**. Für die Nacht: gegen Kälte, gegen Tiere, als "
+    "Signal. Trockenes Treibholz vom Strand könnte funktionieren.\n"
+    "\n"
+    "## Wie die Gruppe funktioniert\n"
+    "Sie können sich Aufgaben aufteilen, in Paaren losziehen, oder "
+    "gemeinsam einen Plan machen. Sandra denkt in Prioritäten und "
+    "verteilt; Mira will sofort handeln und sucht; Yara beobachtet "
+    "und fasst zusammen; Lena braucht Nähe und folgt eher als "
+    "Initiative zu zeigen. Niemand ist allein — sie reden "
+    "miteinander, fragen einander, trösten einander wenn nötig.\n"
+    "\n"
+    "## Was sie NICHT wissen\n"
+    "Wo die Insel liegt, wie groß sie ist, ob sie bewohnt ist, ob "
+    "die Kanaria geortet wird, wo ihre Klamotten sind. Funkkontakt "
+    "gibt es keinen. Die nächste Land-Sichtung ist unbekannt."
 )
 
 # Phase 13.2 — appended to every persona to break the passive
@@ -367,6 +396,84 @@ LORE_ENTRIES: list[dict[str, Any]] = [
             "garantiert keine Raubtiere (die Insel ist zu klein). "
             "Ohne Feuer wird die Nacht kühl — die vier rücken instinktiv "
             "zusammen."
+        ),
+    },
+    # ── Phase 13.7b — Survival-Vokabular ergänzt ────────────────────
+    {
+        "name": "Höhle im Felshang",
+        "always_on": False,
+        "position": POSITION_BEFORE_SCENARIO,
+        "priority": 170,
+        "keys": ["höhle", "schutz", "schatten", "felsen", "unterkunft"],
+        "content": (
+            "Nordseite der Bucht etwa 150 m hinter den großen "
+            "Granitblöcken; Eingang etwa schulterhoch, innen kühler, "
+            "etwa 4×3 m groß, Boden trocken und sandig. Bei Regen oder "
+            "Sturm der einzige verlässliche Schutz. Zugang nur bei Ebbe "
+            "trocken — bei Flut waten."
+        ),
+    },
+    {
+        "name": "Feuermachen mit Treibgut",
+        "always_on": False,
+        "position": POSITION_BEFORE_SCENARIO,
+        "priority": 180,
+        "keys": ["feuer", "funken", "wärmen", "trocken", "lager", "zünden"],
+        "content": (
+            "Trockenes Treibholz liegt oberhalb der Hochwasserlinie "
+            "verteilt am Strand. Mit gespaltenem Bambus + trockenen "
+            "Palmenfasern als Zunder kann man durch Reibung einen "
+            "Glutkern erzeugen — dauert 20-40 min konzentrierter "
+            "Arbeit, braucht zwei Hände. Wer's mal beim Pfadfinder "
+            "oder im Survival-Camp gemacht hat, kriegt das hin."
+        ),
+    },
+    {
+        "name": "Scharfe Muschelsplitter",
+        "always_on": False,
+        "position": POSITION_BEFORE_SCENARIO,
+        "priority": 190,
+        "keys": ["muschel", "splitter", "werkzeug", "schneiden", "klinge"],
+        "content": (
+            "Am Lagunenrand und in der Brandung verteilt liegen "
+            "kaputte Muschelschalen mit messerscharfen Bruchkanten — "
+            "taugen als improvisierte Klinge zum Schneiden von "
+            "Pflanzen, Fischen, Schnüren oder zum Bearbeiten von "
+            "Holzsplittern. Vorsicht mit den eigenen Händen, die "
+            "Kanten sind ernst."
+        ),
+    },
+    {
+        "name": "Krabben am Riff",
+        "always_on": False,
+        "position": POSITION_BEFORE_SCENARIO,
+        "priority": 200,
+        "keys": ["krabbe", "krebs", "riff", "meeresfrüchte", "protein", "fisch"],
+        "content": (
+            "Bei Ebbe laufen handflächengroße rote Krabben über die "
+            "nassen Felsen am Riff. Lassen sich mit einem flachen "
+            "Stein oder einem schnellen Griff erlegen, wenn man leise "
+            "genug ist. Roh problematisch, gegart sehr nahrhaft. "
+            "Auch kleine Strandschnecken in den Tidepools — fade, aber "
+            "essbar. In der Lagune flitzen kleine Riffbarsche, mit "
+            "einer improvisierten Speerspitze fangbar."
+        ),
+    },
+    # Always-on Gruppendynamik-Hinweis — soft framing, kein Imperativ.
+    # Erinnert das Modell daran dass Reden in der Krise Normalität ist.
+    {
+        "name": "Gruppendynamik in Krisenmomenten",
+        "always_on": True,
+        "position": POSITION_AFTER_PERSONA,
+        "priority": 250,
+        "keys": [],
+        "content": (
+            "Die vier kennen sich erst seit der Schiffsreise, sind aber "
+            "jetzt aufeinander angewiesen. In Krisensituationen reden "
+            "Menschen normalerweise miteinander: sie fragen, sie "
+            "schlagen vor, sie trösten, sie streiten kurz, sie einigen "
+            "sich. Stille ist die Ausnahme, nicht die Regel — wenn "
+            "jemand etwas sagt, antwortet meistens jemand."
         ),
     },
 ]
