@@ -1,6 +1,6 @@
 """
-Pin that ``configure_logging`` mutes the noisy HTTP-client library
-loggers.
+Phase 13.4 — pin that ``configure_logging`` mutes the noisy
+HTTP-client library loggers.
 
 Background: ``httpx`` and ``chromadb`` log every single request at
 INFO level. With the WhatsApp/Telegram bridge polling

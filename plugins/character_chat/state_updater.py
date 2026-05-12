@@ -3,8 +3,7 @@ Character state-update parser.
 
 Each character may emit a ``<state>...</state>`` block at the end of its
 turn. The block contains semicolon-separated ``key=value`` pairs naming
-the character's current location, mood, and last action — values the LLM
-itself decides based on its turn. The parser:
+properties of the character's current scene-state. The parser:
 
 1. Strips the block from the visible turn text (so the user only sees the
    in-character reply).
@@ -13,9 +12,11 @@ itself decides based on its turn. The parser:
    content. A bad block is silently dropped — the turn still goes
    through, just without a state update.
 
-The set of recognised keys is intentionally small (``location``, ``mood``,
-``last_action``) so the prompt instruction stays short and the LLM doesn't
-hallucinate ten new fields per turn. Unknown keys are dropped on parse.
+Phase 13: the set of recognised keys is no longer hard-coded. Whatever
+the session's ``tracked_stats`` configures is what gets persisted —
+:class:`RPSessionContainer.update_char_state` filters by the session's
+allowed keys. The parser here only enforces *shape* (snake_case),
+not membership.
 """
 
 from __future__ import annotations
@@ -24,17 +25,17 @@ import re
 from typing import Final
 
 
-# Anchor keys that we always render with a localised label and, when set,
-# always show in the prompt. The full state dict can carry ANY additional
-# string-keyed fields the LLM finds useful (clothing, posture, injury,
-# proximity, ...) — those render under a generic "## Sonstiges" block.
+# Phase 13: kept as a hint for the prompt-builder and for any non-RP
+# code path that still wants a default whitelist. The state_updater
+# itself no longer filters by this set — the per-session ``tracked_stats``
+# does, and that's where Mike configures it.
 ANCHOR_STATE_KEYS: Final[tuple[str, ...]] = (
     "location",
     "mood",
     "last_action",
-    "clothing",      # NEW (Mike's "nackt"-Beispiel) — physical appearance
-    "posture",       # NEW — sitting / standing / lying / kneeling
-    "condition",     # NEW — health / injury / fatigue
+    "clothing",
+    "posture",
+    "condition",
 )
 
 # Backwards-compat alias kept for any external test that imports this.
@@ -53,6 +54,17 @@ _KEY_RE: Final = re.compile(r"^[a-z][a-z0-9_]*$")
 _STATE_BLOCK_RE: Final[re.Pattern[str]] = re.compile(
     r"<state>(.*?)</state>",
     re.IGNORECASE | re.DOTALL,
+)
+
+# Phase 13.2: dangling-tag fallback. When the LLM hits its max_tokens
+# cap mid-state-block, the closing ``</state>`` never lands and the
+# regex above won't match. The user then sees raw "<state>location=
+# beach; mood=anxious; last_action=looking at" in the chat. This second
+# regex catches the trailing open-tag fragment so it gets stripped too.
+# We also try to parse what little we can from it (best-effort).
+_DANGLING_STATE_RE: Final[re.Pattern[str]] = re.compile(
+    r"<state>([^<]*)$",
+    re.IGNORECASE,
 )
 
 
@@ -91,13 +103,43 @@ def parse_state_block(content: str) -> tuple[str, dict[str, str]]:
             # the renderer or the SQL serialiser.
             if not key or len(key) > _KEY_MAX_LEN:
                 continue
-            if key not in ANCHOR_STATE_KEYS and not _KEY_RE.match(key):
+            # Phase 13: any snake_case key is shape-valid here. The
+            # caller (RPSessionContainer.update_char_state) filters
+            # by the session's tracked_stats — that's where Mike's
+            # configuration is the source of truth.
+            if not _KEY_RE.match(key):
                 continue
             if len(value) > _VALUE_MAX_LEN:
                 value = value[:_VALUE_MAX_LEN].rstrip() + "…"
             updates[key] = value
 
     cleaned = _STATE_BLOCK_RE.sub("", content).strip()
+
+    # Phase 13.2: dangling open-tag handler. If the LLM cut off mid-
+    # state-block (max_tokens hit), there's an unmatched ``<state>``
+    # at the end. Best-effort parse what we can find before the cut,
+    # then strip the fragment.
+    dangling_match = _DANGLING_STATE_RE.search(cleaned)
+    if dangling_match is not None:
+        body = dangling_match.group(1)
+        for pair in re.split(r"[;\n]+", body):
+            pair = pair.strip()
+            if not pair or "=" not in pair:
+                continue
+            key, _, value = pair.partition("=")
+            key = key.strip().lower()
+            value = value.strip().strip("'\"")
+            if not key or len(key) > _KEY_MAX_LEN:
+                continue
+            if not _KEY_RE.match(key):
+                continue
+            if len(value) > _VALUE_MAX_LEN:
+                value = value[:_VALUE_MAX_LEN].rstrip() + "…"
+            # Don't overwrite cleanly-parsed updates from the closed
+            # block above — they're more trustworthy.
+            updates.setdefault(key, value)
+        cleaned = _DANGLING_STATE_RE.sub("", cleaned).rstrip()
+
     return cleaned, updates
 
 
@@ -120,7 +162,7 @@ def merge_state(
         key = key.strip().lower()
         if not key or len(key) > _KEY_MAX_LEN:
             continue
-        if key not in ANCHOR_STATE_KEYS and not _KEY_RE.match(key):
+        if not _KEY_RE.match(key):
             continue
         if value == "":
             merged.pop(key, None)

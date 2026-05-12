@@ -249,6 +249,77 @@ class MemoryManager:
 
     # ─── Wipe operations ───────────────────────────────────────────
 
+    async def ensure_collection(self, name: str) -> None:
+        """Idempotently register a (possibly new) ChromaDB collection.
+
+        Phase 13 introduced per-RP-session collections (``rp__<id>``)
+        that are created on demand instead of being declared up-front
+        in config. This method is the entry point: it registers the
+        name in the in-process cache so ``store`` / ``recall`` can
+        target it like any built-in collection.
+        """
+        if self._client is None:
+            raise RuntimeError("MemoryManager not initialised")
+        if name in self._collections:
+            return
+        try:
+            self._collections[name] = self._client.get_or_create_collection(
+                name=name
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "memory.ensure_collection_failed",
+                collection=name,
+                error=str(exc),
+            )
+            raise
+        log.info("memory.collection_ensured", collection=name)
+
+    async def delete_collection(self, name: str) -> dict[str, int]:
+        """Permanently delete a collection AND its FTS rows.
+
+        Used by the RP session container's ``destroy()`` — when Mike
+        deletes a session, the per-session collection vanishes
+        completely (no recreate, unlike :meth:`wipe_collection`).
+
+        Returns ``{"chroma": <count_before>, "fts": <rows_deleted>}``.
+        """
+        if self._client is None:
+            raise RuntimeError("MemoryManager not initialised")
+        prev_count = 0
+        col = self._collections.get(name)
+        if col is not None:
+            try:
+                prev_count = col.count()
+            except Exception:  # noqa: BLE001
+                prev_count = 0
+        try:
+            self._client.delete_collection(name=name)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "memory.delete_collection_chroma_failed",
+                collection=name,
+                error=str(exc),
+            )
+        self._collections.pop(name, None)
+
+        fts_deleted = 0
+        if self._fts is not None:
+            cursor = await self._fts.execute(
+                "DELETE FROM items_fts WHERE collection = ?",
+                (name,),
+            )
+            fts_deleted = cursor.rowcount if cursor.rowcount is not None else 0
+            await self._fts.commit()
+
+        log.info(
+            "memory.collection_deleted",
+            collection=name,
+            chroma_items=int(prev_count),
+            fts_rows=int(fts_deleted),
+        )
+        return {"chroma": int(prev_count), "fts": int(fts_deleted)}
+
     async def wipe_collection(self, name: str) -> dict[str, int]:
         """
         Drop and recreate a single ChromaDB collection and delete its

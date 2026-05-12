@@ -525,6 +525,37 @@ class SessionStore:
             self._sessions.clear()
             self._persist()
 
+    def delete(self, session_id: str) -> bool:
+        """Permanently remove a session (history + metadata).
+
+        Returns ``True`` if the session existed and was removed.
+        Used by RP session destroy flows (Phase 13) where a single
+        session needs to disappear without touching the others.
+        """
+        with self._lock:
+            if session_id not in self._sessions:
+                return False
+            self._sessions.pop(session_id, None)
+            self._persist()
+            return True
+
+    def delete_by_kind(self, kind: str) -> int:
+        """Drop every session whose ``meta.kind`` equals ``kind``.
+
+        Returns the number of sessions removed. Phase 13 uses this
+        with ``kind="rp"`` for the one-shot legacy wipe.
+        """
+        with self._lock:
+            target_ids = [
+                sid for sid, entry in self._sessions.items()
+                if str(((entry.get("meta") or {}).get("kind", ""))) == kind
+            ]
+            for sid in target_ids:
+                self._sessions.pop(sid, None)
+            if target_ids:
+                self._persist()
+            return len(target_ids)
+
     # ─── Metadata mutations ─────────────────────────────────────────
 
     def set_project(

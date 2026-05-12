@@ -55,10 +55,65 @@ from .lorebook_store import (
 )
 from .mention_parser import parse_nl_mentions
 from .pulse_generator import PulseGenerator
+from .rp_session_registry import RPSessionRegistry
+from .rp_session_store import (
+    MemoryBackend,
+    RPSessionContainer,
+    TurnRow,
+    parse_stats_input,
+)
 from .state_updater import merge_state, parse_state_block
 
 
 log = get_logger(module="character_chat")
+
+
+# ─── Memory backend adapter (Phase 13) ───────────────────────────────
+
+
+class _PluginAPIMemoryBackend:
+    """Adapt :class:`PluginAPI` to the :class:`MemoryBackend` protocol.
+
+    The RP session container only knows about ``MemoryBackend`` (so
+    tests can fake it). The plugin wires this adapter so containers
+    can store/recall through the standard PluginAPI without seeing
+    the Manager directly.
+    """
+
+    def __init__(self, api: Any) -> None:
+        self._api = api
+
+    async def ensure_collection(self, name: str) -> None:
+        await self._api.memory_ensure_collection(name)
+
+    async def delete_collection(self, name: str) -> None:
+        await self._api.memory_delete_collection(name)
+
+    async def store(
+        self,
+        text: str,
+        collection: str = "facts",
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        return await self._api.memory_store(
+            text=text, collection=collection, metadata=metadata,
+        )
+
+    async def recall(
+        self,
+        query: str,
+        collection: str | None = None,
+        limit: int = 5,
+        project_id: str | None = None,
+        metadata_equals: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        return await self._api.memory_recall(
+            query=query,
+            collection=collection,
+            limit=limit,
+            project_id=project_id,
+            metadata_equals=metadata_equals,
+        )
 
 
 # ─── Tool schemas ─────────────────────────────────────────────────────────────
@@ -225,9 +280,17 @@ class CharacterChatPlugin(BasePlugin):
         super().__init__(api, manifest)
         # Config (populated in on_load)
         self._default_brain: str = "e4b"
-        self._max_tokens: int = 320
+        # Phase 13.2: 320 was too tight for German narrative RP — Mike
+        # saw mid-sentence cut-offs and ``<state>`` blocks leaking into
+        # the visible chat because the cut-off snipped the closing tag.
+        # 4096 lets even verbose narrators finish their full action.
+        self._max_tokens: int = 4096
         self._temperature: float = 0.8
-        self._max_speakers: int = 4
+        # Phase 13.2: 4 speakers per round produced an "ich auch / ich
+        # auch / ich auch"-loop where every char repeated the same
+        # sand-staring beat. 2 keeps the dynamic alive over time —
+        # different chars react to different pulses.
+        self._max_speakers: int = 2
         self._turn_selection: str = "autonomous"
         # Brain used for the cheap speaker-selection classifier. Independent
         # of ``default_brain`` so the big A4B brain stays free to do actual
@@ -247,8 +310,18 @@ class CharacterChatPlugin(BasePlugin):
         self._smart_pulses_enabled: bool = True
         self._pulse_generation_brain: str = "e4b"
         self._pulse_history_window: int = 6
-        self._pulse_max_tokens: int = 200
+        self._pulse_max_tokens: int = 600  # was 200 — Phase 13.2
         self._proactive_pulses_enabled: bool = True
+        # Phase 13.6 — age-stage gate for pulse registration. Babies and
+        # toddlers can't autonomously initiate (they need a timer to
+        # 'cry', 'tug at sleeve' etc.); adults/teens/children plan and
+        # speak on their own when the user prompts or the sim ticks.
+        # Mike's RP feedback: pulse-driven adult turns produced
+        # 'Was hast du gesehen?'-loops because every char fired its
+        # own timer; the autonomous_sim tick path is the cleaner
+        # ambient-activity mechanism for grown-up chars. Empty list
+        # = no age gate (legacy behaviour, every age gets pulses).
+        self._pulse_age_stages: list[str] = ["baby", "toddler"]
         self._lexy_auto_reacts: bool = True
         self._memory_strict_isolation: bool = True
         # Context window knobs. 0 = read live from brain config.
@@ -279,6 +352,19 @@ class CharacterChatPlugin(BasePlugin):
         self._pulse_generator: PulseGenerator | None = None
         self._lore_store: LorebookStore | None = None
         self._lore_engine: LorebookEngine = LorebookEngine()
+        # Phase 13: per-RP-session container registry. Created lazily
+        # in ``on_load`` once the data dir is known. RP sessions own
+        # their own folder + Chroma collection; recall/state writes
+        # for those sessions go through the registry instead of the
+        # global character_chat tables.
+        self._rp_registry: RPSessionRegistry | None = None
+        # Phase 13.2: skip-cooldown table. When a character returns an
+        # empty / pass turn, we mark them with a small cooldown so the
+        # next round's speaker selection avoids them — otherwise the
+        # LLM-orchestrator keeps picking the same silent character and
+        # produces "*Yara schweigt*" five rounds in a row.
+        # Keyed: ``{session_id: {character_id: rounds_remaining}}``.
+        self._skip_cooldowns: dict[str, dict[str, int]] = {}
         # Serialise round execution per session so two concurrent
         # run_round requests don't interleave their broadcasts.
         self._session_locks: dict[str, asyncio.Lock] = {}
@@ -341,6 +427,23 @@ class CharacterChatPlugin(BasePlugin):
         )
         await db.commit()
 
+        # Phase 13: per-RP-session container registry. Sessions live
+        # in ``data/rp_sessions/<session_id>/`` (NOT under plugin-data,
+        # because conceptually they're session-scoped artefacts that
+        # the gateway also reads). Memory backend is the PluginAPI
+        # adapter so containers route through standard memory ops.
+        from pathlib import Path
+        rp_root = Path("data/rp_sessions")
+        rp_root.mkdir(parents=True, exist_ok=True)
+        self._rp_registry = RPSessionRegistry(
+            rp_root, _PluginAPIMemoryBackend(self.api),
+        )
+        # Phase 13 wipe-once: on first load after the upgrade, clear
+        # all legacy RP data (character_turns / character_sessions /
+        # source=character_chat memories) so Mike sees a guaranteed
+        # empty state. Marker file prevents re-wipe on every restart.
+        await self._maybe_wipe_legacy_rp_data(db)
+
         # Orchestrator (with per-character memory-recall wired in)
         self._rebuild_orchestrator()
 
@@ -394,15 +497,32 @@ class CharacterChatPlugin(BasePlugin):
         )
 
     async def _character_recall(
-        self, *, character_id: str, query: str, limit: int = 3
+        self,
+        *,
+        character_id: str,
+        query: str,
+        limit: int = 3,
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Per-character memory fetch with strict isolation.
 
-        Uses the extended ``memory_recall`` API (Phase 3b) to filter by
-        ``character_id`` metadata so Luna only ever sees her own memory,
-        never Lexy's. Returns raw recall items.
+        Phase 13: when ``session_id`` belongs to an RP session, recall
+        is scoped to that session's dedicated Chroma collection — so
+        Sandra in Session B sees nothing from Session A even if she's
+        the same character. For non-RP sessions (or missing session_id)
+        the legacy global ``context`` collection is used.
         """
         try:
+            if session_id and self._rp_registry is not None:
+                if self._rp_registry.is_rp_session(session_id):
+                    container = await self._rp_registry.get(session_id)
+                    if container is not None:
+                        return await container.memory_recall(
+                            query=query,
+                            character_id=character_id,
+                            limit=limit,
+                        )
+            # Legacy fallback: pre-Phase-13 global character recall.
             return await self.api.memory_recall(
                 query=query,
                 collection="context",
@@ -413,9 +533,353 @@ class CharacterChatPlugin(BasePlugin):
             log.warning(
                 "character_chat.recall_unavailable",
                 character_id=character_id,
+                session_id=session_id,
                 error=str(exc),
             )
             return []
+
+    async def _maybe_wipe_legacy_rp_data(
+        self, db: Any,
+    ) -> None:
+        """Phase 13 wipe-once: drop legacy RP data on first load.
+
+        Mike's Phase 13 ask: *"alle Memorys und sessions sollten
+        gelöscht sein"*. We honour that by clearing every legacy
+        artefact that pre-dates the RP container architecture.
+
+        Marker file ``data/.phase13_wiped`` records the version that
+        last ran; if the file shows an OLDER version (or doesn't
+        exist), the wipe runs again. Phase 13.1 added scheduler-
+        timer cleanup, so first-time installations and existing
+        Phase-13 installs both end up cleaned up.
+        """
+        from pathlib import Path
+        WIPE_VERSION = "13.1"
+        marker = Path("data/.phase13_wiped")
+        if marker.exists():
+            try:
+                payload = json.loads(marker.read_text(encoding="utf-8"))
+                last_version = str(payload.get("version") or "13.0")
+            except Exception:  # noqa: BLE001
+                last_version = "13.0"
+            if last_version >= WIPE_VERSION:
+                return
+            log.warning(
+                "character_chat.phase13_wipe_upgrading",
+                from_version=last_version,
+                to_version=WIPE_VERSION,
+            )
+        else:
+            log.warning("character_chat.phase13_wipe_starting")
+        # 1) character_turns + character_sessions: blow them away.
+        deleted_turns = 0
+        deleted_sess = 0
+        try:
+            cur = await db.execute("DELETE FROM character_turns")
+            deleted_turns = cur.rowcount or 0
+            cur = await db.execute("DELETE FROM character_sessions")
+            deleted_sess = cur.rowcount or 0
+            # Reset characters.state to '{}' so the legacy state column
+            # doesn't keep injecting stale clothing/posture into prompts.
+            await db.execute("UPDATE characters SET state = '{}'")
+            # Detach all characters from sessions — active_sessions
+            # was a global-shared list and is no longer authoritative.
+            await db.execute("UPDATE characters SET active_sessions = '[]'")
+            await db.commit()
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "character_chat.phase13_db_wipe_failed", error=str(exc),
+            )
+
+        # 2) Drop every memory item tagged source=character_chat from
+        #    the global "context" collection (and FTS mirror). We
+        #    reach into Chroma directly here — no public delete-by-
+        #    metadata helper exists yet, and adding one for a one-
+        #    shot wipe would be over-engineering.
+        deleted_mem = 0
+        try:
+            mem = self._app_memory()
+            if mem is not None and getattr(mem, "_collections", None):
+                col = mem._collections.get("context")
+                if col is not None:
+                    got = col.get(where={"source": "character_chat"})
+                    ids = list(got.get("ids") or [])
+                    if ids:
+                        col.delete(ids=ids)
+                        deleted_mem = len(ids)
+                    # FTS mirror
+                    fts = getattr(mem, "_fts", None)
+                    if fts is not None and ids:
+                        for chunk_start in range(0, len(ids), 500):
+                            chunk = ids[chunk_start:chunk_start + 500]
+                            placeholders = ",".join("?" * len(chunk))
+                            await fts.execute(
+                                f"DELETE FROM items_fts WHERE id IN ({placeholders})",
+                                chunk,
+                            )
+                        await fts.commit()
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "character_chat.phase13_mem_wipe_failed", error=str(exc),
+            )
+
+        # 3) Strip kind=rp sessions from the core session store.
+        deleted_core_sessions = 0
+        try:
+            ss = self._app_session_store()
+            if ss is not None and hasattr(ss, "delete_by_kind"):
+                deleted_core_sessions = await ss.delete_by_kind("rp")
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "character_chat.phase13_session_wipe_failed",
+                error=str(exc),
+            )
+
+        # 4) (NEW in 13.1) Kill every character_pulse:* and
+        #    autonomous_sim:* timer in the scheduler. Mike reported
+        #    that ghost timers from pre-Phase-13 sessions kept firing
+        #    against now-dead session_ids — they survived the DB
+        #    wipe because they live in the scheduler plugin's own
+        #    table. Phase 13's clean-slate promise demands they go.
+        cancelled_timers = 0
+        try:
+            cancelled_timers = await self._cancel_all_character_timers()
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "character_chat.phase13_timer_wipe_failed", error=str(exc),
+            )
+
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        import time as _time
+        marker.write_text(
+            json.dumps({
+                "version": WIPE_VERSION,
+                "wiped_at": _time.time(),
+                "character_turns": deleted_turns,
+                "character_sessions": deleted_sess,
+                "memory_items": deleted_mem,
+                "core_sessions": deleted_core_sessions,
+                "timers_cancelled": cancelled_timers,
+            }, indent=2),
+            encoding="utf-8",
+        )
+        log.warning(
+            "character_chat.phase13_wipe_complete",
+            character_turns=deleted_turns,
+            character_sessions=deleted_sess,
+            memory_items=deleted_mem,
+            core_sessions=deleted_core_sessions,
+            timers_cancelled=cancelled_timers,
+        )
+
+    async def _cancel_all_character_timers(self) -> int:
+        """Cancel every ``character_pulse:*`` and ``autonomous_sim:*``
+        recurring timer in the scheduler.
+
+        Used by the Phase-13 wipe to clear ghosts from pre-Phase-13
+        sessions. Returns the number of timers cancelled.
+        """
+        try:
+            listing = await self.api.call_tool("list_timers", {})
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "character_chat.timer_list_failed", error=str(exc),
+            )
+            return 0
+        cancelled = 0
+        for t in (listing or {}).get("timers", []):
+            label = str(t.get("label") or "")
+            if not (
+                label.startswith("character_pulse:")
+                or label.startswith("autonomous_sim:")
+            ):
+                continue
+            timer_id = t.get("id")
+            if not timer_id:
+                continue
+            try:
+                await self.api.call_tool(
+                    "cancel_timer", {"id": timer_id},
+                )
+                cancelled += 1
+            except Exception:  # noqa: BLE001
+                pass
+        # Reset our in-process bookkeeping — the timers we tracked are
+        # all gone; future attaches will create fresh ones.
+        self._pulse_timers.clear()
+        self._simulation_timers.clear()
+        return cancelled
+
+    def _app_memory(self) -> Any:
+        """Best-effort lookup of MemoryManager via the PluginAPI."""
+        # PluginAPI doesn't expose memory directly; we access it via
+        # the application held by the API. Wrapped in try/except since
+        # the surface is private and may move in future refactors.
+        try:
+            return getattr(self.api, "_app").memory  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _app_session_store(self) -> Any:
+        try:
+            return getattr(self.api, "_app").session_store  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _tick_skip_cooldowns(self, session_id: str) -> set[str]:
+        """Snapshot the chars on cooldown for THIS round, then tick.
+
+        Phase 13.2: when a character is silent in round N, they're put
+        on a 1-round cooldown. This call runs at the START of round
+        N+1: every char in the cooldown table at that moment is
+        excluded for this round, *then* their counter is decremented;
+        whoever drops to ≤ 0 becomes eligible again from round N+2 on.
+        That gives the contract Mike asked for: "skipped once → out
+        for one round, then back in".
+        """
+        cooldowns = self._skip_cooldowns.get(session_id)
+        if not cooldowns:
+            return set()
+        # Snapshot first — every char currently on cooldown is
+        # excluded for this round, regardless of remaining count.
+        excluded: set[str] = set(cooldowns.keys())
+        # Then decrement and prune.
+        for char_id in list(cooldowns.keys()):
+            cooldowns[char_id] -= 1
+            if cooldowns[char_id] <= 0:
+                cooldowns.pop(char_id, None)
+        if not cooldowns:
+            self._skip_cooldowns.pop(session_id, None)
+        return excluded
+
+    def _record_skip_cooldowns(
+        self, session_id: str, turns: list[Any],
+    ) -> None:
+        """After a round, mark every skipped character with a 1-round
+        cooldown. Phase 13.2 — prevents the LLM-orchestrator from
+        looping the same silent char.
+        """
+        if not turns:
+            return
+        for turn in turns:
+            if not getattr(turn, "skipped", False):
+                continue
+            char_id = getattr(turn, "character_id", None)
+            if not char_id:
+                continue
+            cooldowns = self._skip_cooldowns.setdefault(session_id, {})
+            cooldowns[char_id] = 1
+
+    async def _load_prior_turns_per_char(
+        self,
+        *,
+        session_id: str,
+        characters: list[CharacterCard],
+        limit: int = 5,
+    ) -> dict[str, list[str]]:
+        """Phase 13.5 (B+D) — fetch each char's last N own turns for the
+        cross-round repetition guard.
+
+        Returns a mapping {character_id: [oldest_text, ..., newest_text]}.
+        Empty values for chars without history. Best-effort: any DB
+        error is logged but doesn't block the round.
+        """
+        out: dict[str, list[str]] = {}
+        if not characters:
+            return out
+        try:
+            container = await self._get_rp_container(session_id)
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "character_chat.prior_turns_container_lookup_failed "
+                "session=%s error=%s",
+                session_id, str(exc),
+            )
+            container = None
+
+        if container is not None:
+            for c in characters:
+                try:
+                    rows = await container.list_turns(
+                        character_id=c.id, limit=limit,
+                    )
+                    out[c.id] = [
+                        r.content for r in rows
+                        if r.content and not r.skipped
+                    ]
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "character_chat.prior_turns_rp_failed "
+                        "session=%s char=%s error=%s",
+                        session_id, c.name, str(exc),
+                    )
+            return out
+
+        # Non-RP fallback — query the legacy character_turns table.
+        db = await self.api.get_db()
+        for c in characters:
+            try:
+                cursor = await db.execute(
+                    "SELECT content FROM character_turns "
+                    "WHERE session_id = ? AND character_id = ? "
+                    "AND skipped = 0 AND content != '' "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (session_id, c.id, limit),
+                )
+                rows = await cursor.fetchall()
+                # DB returns newest-first; reverse to oldest-first to
+                # match the container's ASC order.
+                out[c.id] = [str(r[0]) for r in reversed(rows)]
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "character_chat.prior_turns_legacy_failed "
+                    "session=%s char=%s error=%s",
+                    session_id, c.name, str(exc),
+                )
+        return out
+
+    async def _is_rp_session(self, session_id: str) -> bool:
+        """True if the given session is RP — checks both the registry
+        (existing folder) AND the core session store's kind marker."""
+        if not session_id:
+            return False
+        if self._rp_registry is not None and self._rp_registry.is_rp_session(
+            session_id
+        ):
+            return True
+        # Fallback: ask the session store. A session that was just
+        # created with kind="rp" but doesn't have a folder yet still
+        # qualifies — the next attach will materialise the folder.
+        ss = self._app_session_store()
+        if ss is None:
+            return False
+        try:
+            meta = ss.get_meta(session_id) if hasattr(ss, "get_meta") else None
+        except Exception:  # noqa: BLE001
+            return False
+        if not isinstance(meta, dict):
+            return False
+        return str(meta.get("kind", "")) == "rp"
+
+    async def _get_rp_container(
+        self,
+        session_id: str,
+        *,
+        title: str = "",
+        scene: str = "",
+        tracked_stats: dict[str, str] | None = None,
+    ) -> RPSessionContainer | None:
+        """Return the container for an RP session, creating if missing."""
+        if not session_id or self._rp_registry is None:
+            return None
+        if not await self._is_rp_session(session_id):
+            return None
+        return await self._rp_registry.get_or_create(
+            session_id,
+            title=title,
+            scene=scene,
+            tracked_stats=tracked_stats,
+        )
 
     async def on_config_changed(self, cfg: dict[str, Any]) -> None:
         self._apply_config(cfg)
@@ -464,6 +928,16 @@ class CharacterChatPlugin(BasePlugin):
         self._proactive_pulses_enabled = bool(
             cfg.get("proactive_pulses_enabled", True)
         )
+        # Phase 13.6 — age-stage gate. Default ['baby', 'toddler']:
+        # only those age stages register pulse timers. Set to [] to
+        # disable the gate (every age gets pulses, legacy behaviour).
+        raw_age_stages = cfg.get("pulse_age_stages", ["baby", "toddler"])
+        if isinstance(raw_age_stages, list):
+            self._pulse_age_stages = [
+                str(s).strip() for s in raw_age_stages if str(s).strip()
+            ]
+        else:
+            self._pulse_age_stages = ["baby", "toddler"]
         self._lexy_auto_reacts = bool(cfg.get("lexy_auto_reacts_to_pulses", True))
         self._memory_strict_isolation = bool(
             cfg.get("memory_strict_isolation", True)
@@ -873,6 +1347,16 @@ class CharacterChatPlugin(BasePlugin):
         # cleanup already removes them on shutdown, but we defensively
         # unregister so a disable/re-enable cycle doesn't double-book.
         await self._cancel_all_pulse_timers()
+        # Phase 13: close every open RP session container so SQLite
+        # handles drop cleanly on shutdown.
+        if self._rp_registry is not None:
+            try:
+                await self._rp_registry.shutdown()
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "character_chat.rp_registry_shutdown_failed",
+                    error=str(exc),
+                )
         log.info("character_chat.disabled")
 
     # ─── Hook: before_user_input intercept ───────────────────────────────
@@ -1025,8 +1509,15 @@ class CharacterChatPlugin(BasePlugin):
         # respond to baby-crying, toddler-tugging etc. without the user
         # having to type anything — the core agent speaks *as Lexy* in
         # the session, naturally reacting to what the characters did.
+        # Phase 13: respect the session's character_mode. Mode 1 ("only
+        # characters, Lexy stays silent") is Mike's autonomous-test
+        # setting — Lexy butting in there breaks the immersion. Only
+        # Mode 0 (chat-tab default) and Mode 2 (hybrid) get auto-react.
+        sess_state_for_react = await self._get_session_state(session_id)
+        sess_mode = int(sess_state_for_react.get("character_mode") or 0)
         if (
             self._lexy_auto_reacts
+            and sess_mode != 1
             and pulse_from_id
             and result
             and result.get("ok")
@@ -1166,27 +1657,51 @@ class CharacterChatPlugin(BasePlugin):
 
         self._pulse_cooldowns[session_id] = now
 
-        # Resolve the card so we can enrich the pulse text. Fallback chain:
-        #   1. ``pulse_text`` from the scheduler payload (legacy / manual)
-        #   2. ``card.proactive_pulse_prompt`` (per-character override)
-        #   3. LLM-generated text via PulseGenerator (smart_pulses_enabled)
-        #   4. Static age-stage default (last resort, original behaviour)
+        # Resolve the card so we can enrich the pulse text. Fallback chain
+        # (Phase 13.5 hotfix — reordered so smart_pulses always wins when
+        # available; the old order let imperative ``proactive_pulse_prompt``
+        # templates leak into the visible chat as raw instructions):
+        #   1. scheduler-payload ``pulse_text`` (caller-provided, e.g. tests)
+        #   2. PulseGenerator (smart_pulses_enabled) — uses persona +
+        #      state + history + ``proactive_pulse_prompt`` AS GUIDANCE
+        #      to produce a NARRATIVE pulse. This is the normal path.
+        #   3. ``card.proactive_pulse_prompt`` verbatim — only when
+        #      smart_pulses is OFF or the generator failed AND the card
+        #      author actually wrote narrative text there (guarded by a
+        #      heuristic check below).
+        #   4. Static age-stage default — last resort.
         if self._store is not None and not pulse_text:
             card = await self._store.get(character_id)
             if card is not None:
-                if card.proactive_pulse_prompt:
-                    pulse_text = card.proactive_pulse_prompt
-                elif self._smart_pulses_enabled and self._pulse_generator is not None:
+                if self._smart_pulses_enabled and self._pulse_generator is not None:
                     others = await self._store.list_in_session(session_id)
                     history = self._load_session_history(session_id)
                     sess_state = await self._get_session_state(session_id)
                     scene = str(sess_state.get("scene") or "")
+                    # Phase 13.5 hotfix v4: don't pass an imperative
+                    # template as ``style_guidance``. Mike's Castaway
+                    # log: Yara's pulse was constantly the default
+                    # fallback because e4b (Gemma 12B) couldn't follow
+                    # the meta-instruction "here's an imperative
+                    # template, generate narrative that obeys it".
+                    # The model echoed it back → heuristic caught the
+                    # echo → fallback → default. Without the imperative
+                    # guidance, the generator produces persona-driven
+                    # narrative (its original purpose pre-13.2). The
+                    # imperative still influences via the persona
+                    # action-discipline suffix anyway.
+                    raw_guidance = card.proactive_pulse_prompt or ""
+                    if _looks_imperative_template(raw_guidance):
+                        guidance_for_gen = ""
+                    else:
+                        guidance_for_gen = raw_guidance
                     try:
                         pulse_text = await self._pulse_generator.generate(
                             character=card,
                             others_in_session=others,
                             recent_history=history,
                             scene=scene,
+                            style_guidance=guidance_for_gen,
                         )
                     except Exception as exc:  # noqa: BLE001
                         log.warning(
@@ -1195,10 +1710,43 @@ class CharacterChatPlugin(BasePlugin):
                             str(exc),
                         )
                         pulse_text = ""
+                    # Belt + braces: even with imperative guidance
+                    # stripped, e4b can still drift back to echoing
+                    # phrases from the persona ('Verbote: KEIN ...').
+                    # Drop any output that still looks templated.
+                    if pulse_text and _looks_imperative_template(pulse_text):
+                        log.warning(
+                            "character_chat.pulse_generator_echoed_guidance "
+                            "character=%s — dropping and falling back",
+                            card.name,
+                        )
+                        pulse_text = ""
+                if not pulse_text and card.proactive_pulse_prompt:
+                    # Fallback to the card-authored text only if it looks
+                    # narrative (Phase 13.5 hotfix). Imperative templates
+                    # like 'Lena REAGIERT auf einen Charakter NAMENTLICH'
+                    # would leak into chat verbatim if we used them here;
+                    # the heuristic catches the obvious markers.
+                    if not _looks_imperative_template(card.proactive_pulse_prompt):
+                        pulse_text = card.proactive_pulse_prompt
                 if not pulse_text:
                     pulse_text = _default_pulse(card.age_stage)
 
         if not pulse_text:
+            pulse_text = "*bemerkt etwas und bewegt sich*"
+
+        # Phase 13.5 hotfix v2: absolute final guard. Whatever the
+        # source of pulse_text (scheduler payload, generator output,
+        # verbatim card.prompt, default), if it still looks like an
+        # imperative template after all fallbacks, replace it with the
+        # generic default. Persisting it as a chat turn would leak the
+        # template into the visible window (Mike's report).
+        if _looks_imperative_template(pulse_text):
+            log.warning(
+                "character_chat.pulse_text_imperative_post_guard "
+                "character_id=%s — replacing with default",
+                character_id,
+            )
             pulse_text = "*bemerkt etwas und bewegt sich*"
 
         log.info(
@@ -1253,6 +1801,15 @@ class CharacterChatPlugin(BasePlugin):
         # Fetch session context once.
         state = await self._get_session_state(session_id)
         scene = str(state.get("scene") or "")
+        # Phase 13.5 hotfix v3 — Mike's mode 1 gate. The auto_react
+        # path (in _run_round_safe) already respects mode=1 'characters
+        # only, Lexy silent', but the autonomous_sim tick had its own
+        # Lexy-roll path that ignored the mode flag — Lexy was still
+        # bursting into the RP chat every 10 min ('Hey Mike? Vielleicht
+        # sollten wir uns mal um Wasser kümmern…'). Mode 1 RP sessions
+        # now skip the Lexy probability roll entirely; only character
+        # turns fire from the sim tick.
+        sess_mode = int(state.get("character_mode") or 0)
 
         try:
             characters = await self._store.list_in_session(session_id)
@@ -1260,8 +1817,16 @@ class CharacterChatPlugin(BasePlugin):
             characters = []
 
         # Roll for Lexy's turn. Lexy always gets a chance, even without
-        # any characters attached (in that case probability = 1).
-        lexy_roll = random.random() < self._lexy_turn_probability or not characters
+        # any characters attached (in that case probability = 1) — UNLESS
+        # the session is in mode 1 with characters attached, in which
+        # case Lexy stays silent and only chars get sim ticks.
+        if sess_mode == 1 and characters:
+            lexy_roll = False
+        else:
+            lexy_roll = (
+                random.random() < self._lexy_turn_probability
+                or not characters
+            )
 
         if lexy_roll:
             prompt = (
@@ -1289,26 +1854,102 @@ class CharacterChatPlugin(BasePlugin):
                 )
             return
 
-        # Character turn: run a 1-speaker round, no pulse originator.
-        # The orchestrator's LLM-picker selects who makes sense right now.
+        # Phase 13.7c — Discussion-Mode: 2 speakers per sim-tick (was 1)
+        # with a topic anchor that makes the round feel like an actual
+        # exchange instead of a solo monologue. The topic surrogates a
+        # user message — Char A reacts to it, Char B reacts to A, both
+        # turns persist as a Mini-Round.
         if self._orchestrator is None:
             return
+        topic = await self._pick_sim_topic(session_id, characters)
         original_max = self._orchestrator._max_speakers  # type: ignore[attr-defined]
         try:
-            self._orchestrator._max_speakers = 1  # type: ignore[attr-defined]
+            # 2 speakers = a real exchange. A 3-speaker round would
+            # also work but doubles LLM time; 2 is the sweet spot.
+            self._orchestrator._max_speakers = 2  # type: ignore[attr-defined]
             log.info(
-                "character_chat.sim_tick_character session=%s candidates=%d",
+                "character_chat.sim_tick_character session=%s candidates=%d "
+                "topic=%r",
                 session_id, len(characters),
+                (topic[:60] + "…") if len(topic) > 60 else topic,
             )
             await self._run_round_safe(
                 session_id=session_id,
-                user_message="",
+                user_message=topic,  # the topic acts as the round's user-trigger
                 pulse_from_id="",
                 pulse_text="",
                 scene=scene,
             )
         finally:
             self._orchestrator._max_speakers = original_max  # type: ignore[attr-defined]
+
+    async def _pick_sim_topic(
+        self,
+        session_id: str,
+        characters: list[CharacterCard],
+    ) -> str:
+        """Phase 13.7c — synthesise a topic anchor for an autonomous
+        sim tick.
+
+        Without a topic, sim-tick rounds produce 'Was ist los?' loops
+        because chars have nothing to react to. The topic surrogates a
+        user message — the orchestrator builds the round around it,
+        char A reacts on the first turn, char B reacts to A on the
+        second.
+
+        Order of preference:
+          1. Recent user message (< 30 min) → still mid-conversation
+          2. Critical tracked_stats (durst=akut etc.) → state-driven
+          3. Random pick from a small Castaway-survival backlog
+        """
+        # 1. Recent user message
+        history = self._load_session_history(session_id)
+        now = time.time()
+        for msg in reversed(history or []):
+            if msg.get("role") != "user":
+                continue
+            ts_raw = msg.get("created_at") or msg.get("timestamp") or now
+            try:
+                ts = float(ts_raw)
+            except (TypeError, ValueError):
+                ts = now
+            if now - ts < 30 * 60:
+                content = str(msg.get("content", "")).strip()
+                if content:
+                    return content
+            break  # only check the most recent user msg
+
+        # 2. Critical state hits across all attached chars
+        try:
+            container = await self._get_rp_container(session_id)
+        except Exception:  # noqa: BLE001
+            container = None
+        if container is not None:
+            for c in characters:
+                try:
+                    st = await container.get_char_state(c.id)
+                except Exception:  # noqa: BLE001
+                    continue
+                if not st:
+                    continue
+                durst = str(st.get("durst") or "").lower()
+                if any(k in durst for k in ("akut", "kritisch", "stark")):
+                    return (
+                        f"{c.name}'s Durst ist kritisch geworden. "
+                        "Was tun? Wer holt Wasser, wer kümmert sich um sie?"
+                    )
+                hunger = str(st.get("hunger") or "").lower()
+                if any(k in hunger for k in ("akut", "knurrend", "stark")):
+                    return (
+                        f"{c.name} hat starken Hunger. Was gibt's auf "
+                        "der Insel zu essen?"
+                    )
+
+        # 3. Random rotation from a 5-item backlog. Generic enough to
+        # work outside Castaway too — talks about water, shelter,
+        # inventory, food, fire — universal survival topics.
+        import random as _random
+        return _random.choice(_SIM_TOPIC_BACKLOG)
 
     async def _on_session_project_changed(self, event: Any) -> None:
         """React when a session is moved to a different project.
@@ -1590,6 +2231,21 @@ class CharacterChatPlugin(BasePlugin):
         # ``set_kind`` is idempotent (returns False on no-change) so we
         # only broadcast when it actually flips.
         await self._maybe_tag_session_rp(session_id)
+        # Phase 13: ensure an RP container exists for this session and
+        # snapshot the character's session-state from the session's
+        # tracked_stats defaults. We never clobber existing live state
+        # on re-attach (snapshot is a no-op if state is already set).
+        try:
+            container = await self._get_rp_container(session_id)
+            if container is not None:
+                await container.snapshot_template_for_char(id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "character_chat.rp_snapshot_failed",
+                character_id=id,
+                session_id=session_id,
+                error=str(exc),
+            )
         # If the card has a proactive-pulse pattern, register it with the
         # scheduler now (idempotent: duplicate attach simply re-registers).
         if updated.proactive_pulse_pattern:
@@ -1885,6 +2541,38 @@ class CharacterChatPlugin(BasePlugin):
                 pulse_text=pulse_text,
             )
 
+            # Phase 13: pull each speaker's live state from the RP
+            # container so the orchestrator's prompt builder sees the
+            # CURRENT session-state, not the stale character.state.
+            live_state_by_char: dict[str, dict[str, str]] = {}
+            try:
+                container = await self._get_rp_container(session_id)
+                if container is not None:
+                    for c in characters:
+                        st = await container.get_char_state(c.id)
+                        if st:
+                            live_state_by_char[c.id] = st
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "character_chat.rp_state_load_failed",
+                    session_id=session_id,
+                    error=str(exc),
+                )
+
+            # Phase 13.2: build the skip-cooldown exclusion set + tick
+            # any existing cooldowns down by 1.
+            excluded = self._tick_skip_cooldowns(session_id)
+
+            # Phase 13.5 (B+D): pull each char's last 5 own turns so the
+            # repetition guard catches self-repetition across rounds. RP
+            # turns live in the per-session container; non-RP fall back
+            # to the legacy character_turns table.
+            prior_turns_by_char = await self._load_prior_turns_per_char(
+                session_id=session_id,
+                characters=characters,
+                limit=5,
+            )
+
             req = GroupTurnRequest(
                 session_id=session_id,
                 history=history,
@@ -1895,6 +2583,9 @@ class CharacterChatPlugin(BasePlugin):
                 scene=scene,
                 extra_forced=extra_forced,
                 lore_by_speaker=lore_by_speaker,
+                live_state_by_char=live_state_by_char,
+                excluded_speaker_ids=excluded,
+                prior_turns_by_char=prior_turns_by_char,
             )
 
             round_id = uuid.uuid4().hex[:12]
@@ -1913,6 +2604,11 @@ class CharacterChatPlugin(BasePlugin):
             )
 
             result = await self._orchestrator.run_round(req)
+
+            # Phase 13.2: anyone who skipped this round earns a 1-round
+            # cooldown so the LLM-orchestrator doesn't keep picking
+            # them silent again next round.
+            self._record_skip_cooldowns(session_id, result.turns)
 
             await self._persist_and_broadcast_turns(
                 session_id=session_id,
@@ -2196,9 +2892,17 @@ class CharacterChatPlugin(BasePlugin):
     async def _fetch_turn_row(
         self, turn_id: str
     ) -> dict[str, Any] | None:
-        """Read a single character_turns row by id."""
+        """Read a single character_turns row by id.
+
+        Phase 13: a turn for an RP session lives in that session's
+        container, not in the global ``character_turns`` table. We
+        try the legacy table first (for non-RP sessions), then fall
+        back to scanning RP containers. Each container only opens
+        its SQLite handle on demand so this stays cheap.
+        """
         if not turn_id:
             return None
+        # Legacy path
         db = await self.api.get_db()
         async with db.execute(
             "SELECT id, session_id, character_id, character_name, round_id, "
@@ -2207,21 +2911,49 @@ class CharacterChatPlugin(BasePlugin):
             (turn_id,),
         ) as cur:
             row = await cur.fetchone()
-        if row is None:
+        if row is not None:
+            return {
+                "id": row[0],
+                "session_id": row[1],
+                "character_id": row[2],
+                "character_name": row[3],
+                "round_id": row[4],
+                "order": int(row[5] or 0),
+                "content": row[6],
+                "skipped": bool(row[7]),
+                "trigger_kind": row[8],
+                "trigger_text": row[9],
+                "created_at": float(row[10]),
+                "_in_rp_container": False,
+            }
+        # RP fallback: scan every known RP container.
+        if self._rp_registry is None:
             return None
-        return {
-            "id": row[0],
-            "session_id": row[1],
-            "character_id": row[2],
-            "character_name": row[3],
-            "round_id": row[4],
-            "order": int(row[5] or 0),
-            "content": row[6],
-            "skipped": bool(row[7]),
-            "trigger_kind": row[8],
-            "trigger_text": row[9],
-            "created_at": float(row[10]),
-        }
+        try:
+            session_ids = await self._rp_registry.list_session_ids()
+        except Exception:  # noqa: BLE001
+            return None
+        for sid in session_ids:
+            container = await self._rp_registry.get(sid)
+            if container is None:
+                continue
+            t = await container.get_turn(turn_id)
+            if t is not None:
+                return {
+                    "id": t.id,
+                    "session_id": sid,
+                    "character_id": t.character_id,
+                    "character_name": t.character_name,
+                    "round_id": t.round_id,
+                    "order": t.order_num,
+                    "content": t.content,
+                    "skipped": t.skipped,
+                    "trigger_kind": t.trigger_kind,
+                    "trigger_text": t.trigger_text,
+                    "created_at": t.created_at,
+                    "_in_rp_container": True,
+                }
+        return None
 
     async def _ws_turn_edit(
         self, client: Any, message: dict[str, Any]
@@ -2242,13 +2974,18 @@ class CharacterChatPlugin(BasePlugin):
                  "error": "turn not found"}
             )
             return
-        db = await self.api.get_db()
-        await db.execute(
-            "UPDATE character_turns SET content = ?, skipped = 0 "
-            "WHERE id = ?",
-            (new_content, turn_id),
-        )
-        await db.commit()
+        if existing.get("_in_rp_container"):
+            container = await self._get_rp_container(existing["session_id"])
+            if container is not None:
+                await container.update_turn_content(turn_id, new_content)
+        else:
+            db = await self.api.get_db()
+            await db.execute(
+                "UPDATE character_turns SET content = ?, skipped = 0 "
+                "WHERE id = ?",
+                (new_content, turn_id),
+            )
+            await db.commit()
         # Broadcast so all open tabs render the new text.
         await self.api.ws_broadcast(
             {
@@ -2284,11 +3021,16 @@ class CharacterChatPlugin(BasePlugin):
                  "error": "turn not found"}
             )
             return
-        db = await self.api.get_db()
-        await db.execute(
-            "DELETE FROM character_turns WHERE id = ?", (turn_id,),
-        )
-        await db.commit()
+        if existing.get("_in_rp_container"):
+            container = await self._get_rp_container(existing["session_id"])
+            if container is not None:
+                await container.delete_turn(turn_id)
+        else:
+            db = await self.api.get_db()
+            await db.execute(
+                "DELETE FROM character_turns WHERE id = ?", (turn_id,),
+            )
+            await db.commit()
         await self.api.ws_broadcast(
             {
                 "type": "character_turn_deleted",
@@ -2341,31 +3083,56 @@ class CharacterChatPlugin(BasePlugin):
             )
             return
 
-        db = await self.api.get_db()
-        async with db.execute(
-            "SELECT id, character_id, character_name, content, skipped, "
-            "order_num FROM character_turns "
-            "WHERE round_id = ? AND id != ? "
-            "ORDER BY order_num ASC",
-            (round_id, turn_id),
-        ) as cur:
-            siblings = list(await cur.fetchall())
-        prior_turns = [
-            CharacterTurn(
-                character_id=row[1], character_name=row[2],
-                content=row[3] or "", skipped=bool(row[4]),
-                order=int(row[5] or 0),
+        # Phase 13: load siblings + delete old turn from the right
+        # store. RP sessions live in their container; non-RP keep
+        # using the legacy global ``character_turns`` table.
+        in_container = bool(existing.get("_in_rp_container"))
+        if in_container:
+            container = await self._get_rp_container(session_id)
+            if container is None:
+                await client.send_json(
+                    {"type": "character_turn_regenerate_ack", "ok": False,
+                     "error": "rp container not available"}
+                )
+                return
+            sibling_rows = await container.list_turns_for_round(round_id)
+            prior_turns = [
+                CharacterTurn(
+                    character_id=tr.character_id,
+                    character_name=tr.character_name,
+                    content=tr.content,
+                    skipped=tr.skipped,
+                    order=tr.order_num,
+                )
+                for tr in sibling_rows
+                if tr.id != turn_id and tr.order_num < int(existing["order"] or 0)
+            ]
+            await container.delete_turn(turn_id)
+        else:
+            db = await self.api.get_db()
+            async with db.execute(
+                "SELECT id, character_id, character_name, content, skipped, "
+                "order_num FROM character_turns "
+                "WHERE round_id = ? AND id != ? "
+                "ORDER BY order_num ASC",
+                (round_id, turn_id),
+            ) as cur:
+                siblings = list(await cur.fetchall())
+            prior_turns = [
+                CharacterTurn(
+                    character_id=row[1], character_name=row[2],
+                    content=row[3] or "", skipped=bool(row[4]),
+                    order=int(row[5] or 0),
+                )
+                for row in siblings
+                if int(row[5] or 0) < int(existing["order"] or 0)
+            ]
+            # Drop the old row + tell the UI it's gone before we generate
+            # the replacement (so tabs show a brief "regenerating…" state).
+            await db.execute(
+                "DELETE FROM character_turns WHERE id = ?", (turn_id,),
             )
-            for row in siblings
-            if int(row[5] or 0) < int(existing["order"] or 0)
-        ]
-
-        # Drop the old row + tell the UI it's gone before we generate the
-        # replacement (so tabs show a brief "regenerating…" state).
-        await db.execute(
-            "DELETE FROM character_turns WHERE id = ?", (turn_id,),
-        )
-        await db.commit()
+            await db.commit()
         await self.api.ws_broadcast(
             {
                 "type": "character_turn_deleted",
@@ -2394,6 +3161,20 @@ class CharacterChatPlugin(BasePlugin):
                     pulse_text = trigger_text[close + 1 :].strip()
         sess_state = await self._get_session_state(session_id)
         scene = str(sess_state.get("scene") or "")
+        # Phase 13: same live_state injection as run_round.
+        live_state_by_char: dict[str, dict[str, str]] = {}
+        try:
+            container = await self._get_rp_container(session_id)
+            if container is not None:
+                for c in all_chars:
+                    st = await container.get_char_state(c.id)
+                    if st:
+                        live_state_by_char[c.id] = st
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "character_chat.rp_state_load_failed_regen",
+                session_id=session_id, error=str(exc),
+            )
         req = GroupTurnRequest(
             session_id=session_id,
             history=history,
@@ -2402,6 +3183,7 @@ class CharacterChatPlugin(BasePlugin):
             pulse_from_id=pulse_from,
             pulse_text=pulse_text,
             scene=scene,
+            live_state_by_char=live_state_by_char,
         )
         try:
             new_turn = await self._orchestrator._run_single_turn(
@@ -2634,58 +3416,112 @@ class CharacterChatPlugin(BasePlugin):
         trigger_text: str,
         turns: list[CharacterTurn],
     ) -> None:
+        # Phase 13: when this is an RP session, we route ALL writes
+        # (turns + state + memory) through the per-session container.
+        # Non-RP sessions use the legacy global tables and global
+        # ``context`` collection — unchanged.
+        container: RPSessionContainer | None = None
+        try:
+            container = await self._get_rp_container(session_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "character_chat.rp_container_lookup_failed",
+                session_id=session_id,
+                error=str(exc),
+            )
+
         db = await self.api.get_db()
         now = time.time()
         for t in turns:
             turn_id = uuid.uuid4().hex[:12]
 
-            # Strip any <state>...</state> block from the visible content and
-            # apply the parsed state diff to the character. We mutate the turn
-            # object in place so downstream broadcasts and the DB row see the
-            # cleaned content, never the raw block.
+            # Strip any <state>...</state> block from the visible content
+            # and apply the parsed state diff to the right scope.
             if not t.skipped and t.content:
                 cleaned, state_updates = parse_state_block(t.content)
                 if cleaned != t.content:
                     t.content = cleaned
-                if state_updates and self._store is not None:
+                if state_updates:
                     try:
-                        current = await self._store.get(t.character_id)
-                        if current is not None:
-                            merged = merge_state(current.state, state_updates)
-                            await self._store.update(
-                                t.character_id, state=merged
+                        if container is not None:
+                            # RP path: state lives in the session, not
+                            # on the character. tracked_stats filtering
+                            # happens inside update_char_state.
+                            await container.update_char_state(
+                                t.character_id, state_updates,
                             )
                             log.info(
-                                "character_chat.state_updated character=%s "
-                                "updates=%s",
+                                "character_chat.state_updated_rp "
+                                "character=%s updates=%s",
+                                t.character_name,
+                                state_updates,
+                            )
+                        else:
+                            # Phase 13: non-RP sessions DROP state
+                            # updates from LLM ``<state>`` blocks. The
+                            # old behaviour wrote them to the global
+                            # ``characters.state`` column, which
+                            # contaminated the character's defaults
+                            # for OTHER RP sessions (Mike's whole bug
+                            # report). State now belongs strictly to
+                            # the session that produced it.
+                            log.debug(
+                                "character_chat.state_update_dropped "
+                                "(non-rp session) character=%s updates=%s",
                                 t.character_name,
                                 state_updates,
                             )
                     except Exception as exc:  # noqa: BLE001
                         log.warning(
-                            "character_chat.state_update_failed character=%s error=%s",
+                            "character_chat.state_update_failed "
+                            "character=%s error=%s",
                             t.character_name,
                             str(exc),
                         )
-            await db.execute(
-                "INSERT INTO character_turns (id, session_id, character_id, "
-                "character_name, round_id, order_num, content, skipped, "
-                "trigger_kind, trigger_text, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    turn_id,
-                    session_id,
-                    t.character_id,
-                    t.character_name,
-                    round_id,
-                    t.order,
-                    t.content,
-                    1 if t.skipped else 0,
-                    trigger_kind,
-                    trigger_text,
-                    now,
-                ),
-            )
+
+            # Persist the turn. RP → container.turns.db.
+            #                Non-RP → legacy global character_turns.
+            if container is not None:
+                try:
+                    await container.append_turn(TurnRow(
+                        id=turn_id,
+                        character_id=t.character_id,
+                        character_name=t.character_name,
+                        round_id=round_id,
+                        order_num=t.order,
+                        content=t.content,
+                        skipped=t.skipped,
+                        trigger_kind=trigger_kind,
+                        trigger_text=trigger_text,
+                        created_at=now,
+                    ))
+                except Exception as exc:  # noqa: BLE001
+                    log.error(
+                        "character_chat.rp_turn_persist_failed",
+                        session_id=session_id,
+                        character=t.character_name,
+                        error=str(exc),
+                    )
+            else:
+                await db.execute(
+                    "INSERT INTO character_turns (id, session_id, character_id, "
+                    "character_name, round_id, order_num, content, skipped, "
+                    "trigger_kind, trigger_text, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        turn_id,
+                        session_id,
+                        t.character_id,
+                        t.character_name,
+                        round_id,
+                        t.order,
+                        t.content,
+                        1 if t.skipped else 0,
+                        trigger_kind,
+                        trigger_text,
+                        now,
+                    ),
+                )
 
             # Broadcast per turn so the UI can render them streaming-style.
             await self.api.ws_broadcast(
@@ -2714,30 +3550,41 @@ class CharacterChatPlugin(BasePlugin):
                     name=f"character_chat.tts.{turn_id}",
                 )
 
-            # Strict-isolation memory write: each character stores their OWN
-            # view of the exchange, tagged with character_id. Phase-3 recall
-            # will filter on character_id so Luna only sees Luna's memory.
+            # Memory write — RP routes to the per-session collection,
+            # non-RP uses the global ``context`` collection.
             if self._memory_strict_isolation and not t.skipped and t.content:
                 try:
-                    await self.api.memory_store(
-                        text=t.content,
-                        collection="context",
-                        metadata={
-                            "source": "character_chat",
-                            "character_id": t.character_id,
-                            "character_name": t.character_name,
-                            "session_id": session_id,
-                            "round_id": round_id,
-                            "trigger_kind": trigger_kind,
-                        },
-                    )
+                    if container is not None:
+                        await container.memory_write(
+                            text=t.content,
+                            character_id=t.character_id,
+                            metadata={
+                                "character_name": t.character_name,
+                                "round_id": round_id,
+                                "trigger_kind": trigger_kind,
+                            },
+                        )
+                    else:
+                        await self.api.memory_store(
+                            text=t.content,
+                            collection="context",
+                            metadata={
+                                "source": "character_chat",
+                                "character_id": t.character_id,
+                                "character_name": t.character_name,
+                                "session_id": session_id,
+                                "round_id": round_id,
+                                "trigger_kind": trigger_kind,
+                            },
+                        )
                 except Exception as exc:  # noqa: BLE001
                     log.warning(
                         "character_chat.memory_store_failed",
                         character=t.character_name,
                         error=str(exc),
                     )
-        await db.commit()
+        if container is None:
+            await db.commit()
 
     async def _speak_character_turn(
         self,
@@ -2825,6 +3672,21 @@ class CharacterChatPlugin(BasePlugin):
         the previous timer first.
         """
         if not self._proactive_pulses_enabled or not card.proactive_pulse_pattern:
+            return ""
+        # Phase 13.6 — age-stage gate. Adults/teens/children typically
+        # don't need a per-character timer; the sim-tick path provides
+        # ambient activity for them. Babies/toddlers do need timers
+        # because they can't decide on their own when to cry/tug. An
+        # empty allow-list = no gate (legacy behaviour).
+        if (
+            self._pulse_age_stages
+            and card.age_stage not in self._pulse_age_stages
+        ):
+            log.info(
+                "character_chat.pulse_skipped_age_gate "
+                "character=%s age_stage=%s allowed=%s",
+                card.name, card.age_stage, self._pulse_age_stages,
+            )
             return ""
         scheduler = self.api.get_plugin("scheduler")
         if scheduler is None:
@@ -3066,6 +3928,20 @@ class CharacterChatPlugin(BasePlugin):
                 stale_reasons["dead_character"] += len(timer_ids)
                 continue
 
+            # Phase 13.6 — age-stage gate. If the character's age stage
+            # is no longer in the allowed pulse list (e.g. defaults
+            # changed from 'all ages' to 'baby+toddler only'), cancel
+            # the pre-existing timers. New ones won't be re-registered
+            # because _register_pulse_timer has the same gate.
+            if (
+                self._pulse_age_stages
+                and card.age_stage not in self._pulse_age_stages
+            ):
+                stale.extend(timer_ids)
+                stale_reasons.setdefault("age_gated", 0)
+                stale_reasons["age_gated"] += len(timer_ids)
+                continue
+
             # Cancel timers whose session no longer exists. We only
             # apply this when the SessionStore reported at least one
             # known session — otherwise a brand-new install would
@@ -3092,12 +3968,13 @@ class CharacterChatPlugin(BasePlugin):
 
         log.info(
             "character_chat.pulse_timers_rehydrated restored=%d "
-            "cancelled=%d (dead_char=%d dead_session=%d dup=%d)",
+            "cancelled=%d (dead_char=%d dead_session=%d dup=%d age_gated=%d)",
             restored,
             len(stale),
             stale_reasons["dead_character"],
             stale_reasons["dead_session"],
             stale_reasons["duplicate"],
+            stale_reasons.get("age_gated", 0),
         )
 
         # ── Phase 2: Create missing timers for attached characters ────
@@ -3357,6 +4234,25 @@ def _describe_trigger(
     return ("spontaneous", "")
 
 
+# Phase 13.7c — fallback pool of survival-themed sim-tick topics.
+# Used by _pick_sim_topic when no recent user message and no critical
+# state pressure. Generic enough to fit any survival-flavoured RP
+# scenario; if the user runs a non-survival session and dislikes the
+# bias, override via plugin.yaml in a future revision.
+_SIM_TOPIC_BACKLOG: tuple[str, ...] = (
+    "Wer holt als nächstes Wasser am Bach? Sollen wir in Paaren "
+    "losziehen oder einzeln?",
+    "Wir brauchen Schatten bevor die Sonne hochsteht. Wo machen wir "
+    "das Lager — Strand oder weiter hinten?",
+    "Was hat die Brandung uns angespült? Sollten wir den Strand "
+    "systematisch absuchen?",
+    "Was machen wir wegen Essen heute Abend? Früchte vom Wald, oder "
+    "Krabben am Riff?",
+    "Wenn es dunkel wird brauchen wir Feuer. Wer hat schon mal welches "
+    "gemacht?",
+)
+
+
 _DEFAULT_PULSES: dict[str, str] = {
     "baby": "*schreit laut und sucht nach Mama*",
     "toddler": "*zieht an Mamas Ärmel* Mama, schau!",
@@ -3378,3 +4274,68 @@ _DEFAULT_PULSE_PATTERNS: dict[str, str] = {
 def _default_pulse(age_stage: str) -> str:
     """Fallback pulse text if the card doesn't define one."""
     return _DEFAULT_PULSES.get(age_stage, "*bewegt sich*")
+
+
+# Phase 13.5 hotfix — heuristic to detect imperative pulse-prompt
+# templates (e.g. Castaway scenario style: "Lena REAGIERT auf einen
+# anderen Charakter NAMENTLICH. Wähle EINS: ..."). These are LLM
+# instructions, NOT chat content — they must NEVER be used as the
+# visible pulse text. The check is intentionally simple: any of the
+# clear imperative markers below = treat as instruction.
+#
+# All markers are matched case-INSENSITIVELY because the e4b brain
+# sometimes echoes the guidance with mixed casing (e.g. 'macht
+# etwas BEOBACHTBARES' instead of 'MACHT etwas Beobachtbares').
+#
+# Phase 13.5 hotfix v5 — markers tightened. Mike's session log
+# showed all four chars getting their pulse-text replaced with the
+# default (`pulse_text_imperative_post_guard ... replacing with
+# default`) because the previous v4 markers were too generic:
+# 'reagiert auf einen', 'ist schon unterwegs' etc. occur in
+# perfectly valid narrative output ('Mira ist schon unterwegs zum
+# Wald', 'Yara reagiert auf einen lauten Knall'). The guard then
+# killed legitimate generations.
+#
+# New rule: a pulse counts as imperative ONLY if it contains a
+# STRONG marker (a phrase that's structurally impossible in
+# narrative — colon-separated lists, all-caps verbote sections),
+# OR if it contains 2+ medium markers (reinforcing each other).
+_IMPERATIVE_STRONG_MARKERS: tuple[str, ...] = (
+    "wähle eins:",        # template list-start with colon
+    "wähle eins und",     # Mira's template pattern ('Wähle EINS und beschreibe...')
+    "wähle einen:",
+    "verbote:",           # template ban list
+    "verbote :",
+    "absolutes verbot",
+    "macht etwas beobachtbares",  # verbatim from Yara's template
+    "macht eine konkrete aktion",  # verbatim from Sandra's template
+    "reagiert auf einen anderen charakter",  # verbatim from Lena's template
+    "aber keine statue",   # verbatim from Lena's template
+)
+_IMPERATIVE_MEDIUM_MARKERS: tuple[str, ...] = (
+    "wähle eins",         # without specific suffix — can appear in narrative
+    "wähle einen",
+    "kein passives",
+    "kein schweigen",
+    "ist schon unterwegs",  # plausible narrative ('Mira ist schon unterwegs zum Wald'),
+                            # but combined with 'wähle eins' = template
+)
+
+
+def _looks_imperative_template(text: str) -> bool:
+    """True when the pulse text reads like an LLM instruction template
+    rather than narrative chat content.
+
+    Strong markers trigger immediately. Medium markers need 2+ hits
+    in the same text to trigger — single-marker matches let valid
+    narrative ('kein passives Warten mehr') through.
+    """
+    if not text:
+        return False
+    lowered = text.lower()
+    if any(marker in lowered for marker in _IMPERATIVE_STRONG_MARKERS):
+        return True
+    medium_hits = sum(
+        1 for marker in _IMPERATIVE_MEDIUM_MARKERS if marker in lowered
+    )
+    return medium_hits >= 2

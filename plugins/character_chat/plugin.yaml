@@ -13,17 +13,20 @@ config_defaults:
   # memory — persönlichkeitsreiche Antworten sind die halbe Miete. Lexys
   # eigene Turns laufen weiterhin über den Agent-Router auf ihrem Standardbrain.
   default_brain: "a4b"
-  # Per-character response budget. Gross genug für 2-3 narrative Absätze
-  # inklusive *Handlungen in Sternen* und Dialog — RP braucht Platz für
-  # Szene + Gefühl + Dialog, 320 cuttet regelmäßig mitten im Satz.
-  # Bei Gemma4 27B (a4b) mit 32k Context sind 1536 komfortabel im Rahmen.
-  max_tokens_per_turn: 1536
+  # Per-character response budget. Phase 13.2: Mike's smoke-test
+  # showed cut-offs at 1536 (and earlier 320) for verbose German RP —
+  # the LLM started a 5-paragraph monologue and got snipped mid-state-
+  # block, leaving "<state>location=beach…" visible in the chat. 4096
+  # is comfortable for a4b's 32k context window.
+  max_tokens_per_turn: 4096
   # Temperature per turn — RP wants a bit of warmth, not clinical prose.
   temperature: 0.8
   # Sequential-turn budget: how many characters speak in one round after a user
-  # message. If the LLM-picked speaker list is longer, the overflow is dropped
-  # (prevents 10-character echo chambers).
-  max_speakers_per_round: 4
+  # message. Phase 13.2: dropped from 4 → 2. With 4 chars all reacting to
+  # every pulse the chat became "ich auch / ich auch / ich auch" — same
+  # beat 4 times. Two = pulse-trigger + one reaction; over time all four
+  # speak but each round has variation.
+  max_speakers_per_round: 2
   # How a round's speaker order is chosen. "autonomous" = LLM picks who reacts
   # and in what order based on context; "round_robin" = deterministic fallback.
   turn_selection: "autonomous"
@@ -44,6 +47,15 @@ config_defaults:
   # message ("pregnant Luna kicks", "hungry baby cries"). Option B from the
   # design review — intensive but the point of the feature.
   proactive_pulses_enabled: true
+  # Phase 13.6 — age-stage gate for pulse timers. Default ['baby',
+  # 'toddler']: only those register their own per-character timer.
+  # Adults/teens/children rely on the sim-tick path (one LLM-picked
+  # speaker every simulation_default_interval_minutes) for ambient
+  # activity. Mike's RP feedback was that per-adult pulses degenerated
+  # into 'Was hast du gesehen?' loops because every char's timer fired
+  # independently with no contextual hook. Set to [] to disable the
+  # gate entirely (legacy behaviour, every age gets pulses).
+  pulse_age_stages: ["baby", "toddler"]
   # Global RP style prompt — injected as MUST-priority system section into
   # EVERY character turn. Use this to enforce a uniform style across all
   # characters (Mike's request: "alle charaktere sollen im gleichen Style
@@ -91,9 +103,10 @@ config_defaults:
   # that the LLM stays focused on "right now" instead of getting derailed
   # by an old thread.
   pulse_history_window: 6
-  # Output budget for the pulse generator. 200 tokens fits 1-2 sentences
-  # plus a *Sternchen-Aktion*; bigger is wasteful for a one-shot pulse.
-  pulse_max_tokens: 200
+  # Output budget for the pulse generator. Phase 13.2: 200 → 600.
+  # German RP pulses with a *Sternchen-Aktion* + dialogue easily run
+  # past 200 — and a cut-off pulse text leaks an unclosed state-tag.
+  pulse_max_tokens: 600
   # Lexy's own auto-react to a proactive pulse. The user can still stay silent,
   # but Lexy reflexively answers "Luna, alles gut?" when her baby cries.
   lexy_auto_reacts_to_pulses: true

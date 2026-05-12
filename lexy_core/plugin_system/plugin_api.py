@@ -239,6 +239,34 @@ class PluginAPI:
             metadata_equals=metadata_equals,
         )
 
+    async def memory_ensure_collection(self, name: str) -> None:
+        """Idempotently register a memory collection by name.
+
+        Phase 13 — used by the character_chat plugin's RP session
+        registry to spin up per-session collections (``rp__<id>``) at
+        attach time without requiring config changes.
+        """
+        if not self._app.memory:
+            self._log.warning(
+                "memory.ensure_skipped", reason="memory_not_ready"
+            )
+            return
+        await self._app.memory.ensure_collection(name)
+
+    async def memory_delete_collection(self, name: str) -> dict[str, int]:
+        """Delete a memory collection (Chroma + FTS rows).
+
+        Returns ``{"chroma": <count>, "fts": <rows>}`` describing what
+        was removed. Used by the RP session container's ``destroy()``.
+        """
+        if not self._app.memory:
+            self._log.warning(
+                "memory.delete_collection_skipped",
+                reason="memory_not_ready",
+            )
+            return {"chroma": 0, "fts": 0}
+        return await self._app.memory.delete_collection(name)
+
     async def memory_search_fts(
         self,
         query: str,
