@@ -90,6 +90,7 @@ set CHAT_TEMPLATE=%MODEL_DIR%\gemma-4-26B-A4B\chat_template.jinja
     --mlock ^
     --api-key sk-lexy-local ^
     --alias gemma-4-26b-a4b-it ^
-    --parallel 1
+    --parallel 1 ^
+    --cache-ram 0
 
 pause
