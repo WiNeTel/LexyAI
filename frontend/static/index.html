@@ -13,11 +13,19 @@
     -->
     <link rel="stylesheet" href="/static/style.css?v=20260506g" />
     <link rel="stylesheet" href="/static/holo.css?v=20260506g" />
+    <link rel="stylesheet" href="/static/avatar-world/avatar-world.css?v=20260511a" />
     <!-- Three.js for 3D Avatar Stage. Bundled locally so Lexy works
          offline / on air-gapped LANs (cdnjs blocked or unreachable).
          Falls back gracefully — holo.js uses ``typeof THREE === 'undefined'``
          to skip the avatar stage when the script didn't load. -->
     <script src="/static/vendor/three.min.js?v=20260506g" defer></script>
+    <!-- BabylonJS for the Avatar-World layer (3D character + apartment).
+         Loaded from CDN until we vendor it locally. The avatar-world
+         bootstrap waits for `window.BABYLON` and shows a placeholder
+         hint if neither path produced the engine. -->
+    <script src="https://cdn.babylonjs.com/babylon.js" defer></script>
+    <script src="https://cdn.babylonjs.com/loaders/babylonjs.loaders.min.js" defer></script>
+    <script src="https://cdn.babylonjs.com/gui/babylon.gui.min.js" defer></script>
 </head>
 <body>
 
@@ -1035,6 +1043,24 @@
 
     <div id="toast-container"></div>
 
+    <!-- ═══ AVATAR WORLD (BabylonJS PiP) ═════════════════════════════
+         Floating 3D avatar + apartment. Phase 0 shows a placeholder
+         capsule; Phase 1A swaps in a Ready Player Me GLB. Hidden by
+         default on first paint to avoid layout flash; view_mode.js
+         restores the last mode from localStorage. -->
+    <div id="lexy-avatar-pip" class="lexy-avatar-pip" data-view-mode="pip">
+        <div class="lexy-avatar-header">
+            <span class="lexy-avatar-title">Lexy — pip</span>
+            <div class="lexy-avatar-controls">
+                <button data-view-mode-btn="pip" title="Picture-in-Picture">▫</button>
+                <button data-view-mode-btn="ambient" title="Ambient view">◫</button>
+                <button data-view-mode-btn="conversation" title="Conversation view">▢</button>
+                <button data-view-mode-btn="close" title="Hide">✕</button>
+            </div>
+        </div>
+        <canvas id="lexy-avatar-canvas"></canvas>
+    </div>
+
     <!-- ─── Coder approval modal (Phase 10.B) ─────────────────── -->
     <div id="coder-approval-overlay" class="coder-overlay" hidden>
         <div class="coder-modal" role="dialog" aria-modal="true" aria-labelledby="coder-approval-title">
@@ -1323,5 +1349,24 @@
          consistent across cache layers. -->
     <script src="/static/holo.js?v=20260506g"></script>
     <script src="/static/app.js?v=20260506g"></script>
+
+    <!-- Avatar World — order matters: net first (registers handlers),
+         then shared constants (morph_map), then scene + loader, then
+         drivers (bone_animator BEFORE emotion so emotion_driver can
+         route shapes to bones when morphs are missing), then UI,
+         finally index.js boots everything. All scripts are IIFEs so
+         load order is the only contract. -->
+    <script src="/static/avatar-world/net/ws_listener.js?v=20260512a"></script>
+    <script src="/static/avatar-world/avatar/morph_map.js?v=20260512a"></script>
+    <script src="/static/avatar-world/scene/apartment.js?v=20260512a"></script>
+    <script src="/static/avatar-world/scene/background.js?v=20260512a"></script>
+    <script src="/static/avatar-world/scene/lighting.js?v=20260512a"></script>
+    <script src="/static/avatar-world/avatar/loader.js?v=20260512a"></script>
+    <script src="/static/avatar-world/avatar/bone_animator.js?v=20260512a"></script>
+    <script src="/static/avatar-world/avatar/emotion_driver.js?v=20260512a"></script>
+    <script src="/static/avatar-world/avatar/idle_driver.js?v=20260512a"></script>
+    <script src="/static/avatar-world/avatar/lip_sync.js?v=20260512a"></script>
+    <script src="/static/avatar-world/ui/view_mode.js?v=20260512a"></script>
+    <script src="/static/avatar-world/index.js?v=20260512a"></script>
 </body>
 </html>

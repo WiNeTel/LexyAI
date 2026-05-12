@@ -468,7 +468,21 @@
             sigSpeaking.textContent = speaking ? "true" : "false";
             sigSpeaking.style.color = speaking ? "var(--accent)" : "var(--text-dim)";
         }
+        // Forward the lifecycle to the avatar-world lip-sync driver so
+        // the avatar's mouth tracks TTS playback. Safe when the driver
+        // isn't loaded yet — the calls are simple optional chains.
+        if (window.LexyAvatar && window.LexyAvatar.lipSync) {
+            if (speaking) {
+                window.LexyAvatar.lipSync.onSpeakStart({ source: "audio_player" });
+            } else {
+                window.LexyAvatar.lipSync.onSpeakEnd({ source: "audio_player" });
+            }
+        }
     });
+    // Expose the live audio player so the avatar lip-sync driver can
+    // read its AnalyserNode without re-creating an AudioContext.
+    window.Lexy = window.Lexy || {};
+    window.Lexy.audio = state.audio;
     state.visualizer = new ArcReactorVisualizer(arcReactorCanvas, state.audio);
     // The arc reactor runs constantly (idle breathing pulse when silent).
     state.visualizer.start();
@@ -882,6 +896,11 @@
         const ws = new WebSocket(url);
         ws.binaryType = "blob";
         state.ws = ws;
+        // Expose the live socket so the avatar-world layer can reuse it
+        // (avoids a second client session and double-broadcast). The
+        // reference is overwritten on every reconnect.
+        window.Lexy = window.Lexy || {};
+        window.Lexy.ws = ws;
         sysWs.textContent = "connecting…";
 
         ws.onopen = () => {
@@ -1501,6 +1520,17 @@
                 break;
 
             default:
+                // Forward avatar.* frames to the avatar-world layer when
+                // it's loaded. Keeps the dispatch concentrated here so
+                // the avatar layer doesn't need a second WebSocket.
+                if (
+                    typeof data.type === "string"
+                    && data.type.startsWith("avatar.")
+                    && window.LexyAvatar
+                    && typeof window.LexyAvatar.onWS === "function"
+                ) {
+                    window.LexyAvatar.onWS(data);
+                }
                 break;
         }
     }
@@ -1848,6 +1878,12 @@
         }
         if (state.ttsEnabled) state.audio.ensureContext();
         else state.audio.stop();
+        // Avatar lip-sync follows TTS — when the user turns voice off
+        // we close the mouth immediately so it doesn't keep moving on
+        // any stale audio still draining.
+        if (window.LexyAvatar && window.LexyAvatar.lipSync) {
+            window.LexyAvatar.lipSync.setEnabled(state.ttsEnabled);
+        }
     });
 
     // ── loadRoleplay (Phase 9.12) ──────────────────────────────────
@@ -1906,6 +1942,16 @@
             state.audio.ensureContext();
         } else {
             state.audio.stop();
+        }
+        // Mirror to the RP toggle so the two stay in sync, and switch
+        // the avatar lip-sync driver off when TTS is off so the mouth
+        // stops moving on any leftover audio.
+        if (rpTtsToggle) {
+            rpTtsToggle.dataset.active = state.ttsEnabled ? "true" : "false";
+            rpTtsToggle.textContent = state.ttsEnabled ? "TTS on" : "TTS off";
+        }
+        if (window.LexyAvatar && window.LexyAvatar.lipSync) {
+            window.LexyAvatar.lipSync.setEnabled(state.ttsEnabled);
         }
     });
 
