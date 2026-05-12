@@ -55,6 +55,39 @@
         return map;
     }
 
+    function _applyMmdAliases(map) {
+        // For every ARKit shape name in MMD_ALIASES that's NOT already in
+        // the loaded map, try the aliases in order. First hit becomes the
+        // value under the ARKit key — so emotion_driver / lip_sync that
+        // look up "jawOpen" suddenly find the MMD "あ" target. Aliases
+        // never override an existing direct match.
+        const aliases = (window.LexyAvatar && window.LexyAvatar.morphs)
+            ? window.LexyAvatar.morphs.MMD_ALIASES
+            : null;
+        if (!aliases) return { aliased: 0, missing: 0 };
+
+        let aliased = 0;
+        let missing = 0;
+        for (const arkit of Object.keys(aliases)) {
+            if (map.has(arkit)) continue;     // already direct-matched
+            const candidates = aliases[arkit] || [];
+            let hit = null;
+            for (const candidate of candidates) {
+                if (map.has(candidate)) {
+                    hit = candidate;
+                    break;
+                }
+            }
+            if (hit) {
+                map.set(arkit, map.get(hit));
+                aliased += 1;
+            } else if (candidates.length > 0) {
+                missing += 1;
+            }
+        }
+        return { aliased, missing };
+    }
+
     function _collectBones(skeletons) {
         const map = new Map();
         for (const skel of skeletons || []) {
@@ -132,6 +165,15 @@
 
         const morphTargets = _collectMorphTargets(meshes);
         const bones = _collectBones(result.skeletons);
+
+        const aliasStats = _applyMmdAliases(morphTargets);
+        if (aliasStats.aliased > 0) {
+            console.info(
+                "avatar.loader: aliased " + aliasStats.aliased
+                + " ARKit shapes from MMD targets (missing="
+                + aliasStats.missing + ")"
+            );
+        }
 
         if (morphTargets.size === 0) {
             console.warn(

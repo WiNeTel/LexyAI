@@ -230,6 +230,9 @@
             speakAura: sceneRefs.speakAura,
             handle,
         });
+        if (window.LexyAvatar.outfit) {
+            window.LexyAvatar.outfit.init(handle);
+        }
         if (window.LexyAvatar.background) {
             window.LexyAvatar.background.init({
                 scene: sceneRefs.scene,

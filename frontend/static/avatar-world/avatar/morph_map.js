@@ -118,10 +118,85 @@
         tired:     [0.45, 0.45, 0.50],
     };
 
+    // ── MMD (MikuMikuDance) → ARKit alias table ────────────────────
+    //
+    // Genshin-Style / VRoid / MMD models ship blendshapes named in
+    // Japanese instead of ARKit. The loader uses this table to alias
+    // every ARKit shape name to whatever MMD target the asset
+    // actually has — emotion_driver and lip_sync don't need to know
+    // which naming convention the GLB used.
+    //
+    // First match wins. The alias list is forgiving: if none of the
+    // aliases match, the shape is silently dropped (Bone-fallback
+    // takes over for jaw / eye / head).
+    const MMD_ALIASES = {
+        // ── Mouth — visemes / lip-sync ───────────────────────────
+        [SHAPES.jawOpen]:        ["あ", "あ２", "笑い"],
+        [SHAPES.mouthClose]:     ["ん"],
+        [SHAPES.mouthFunnel]:    ["お", "う"],
+        [SHAPES.mouthPucker]:    ["う", "ω"],
+        [SHAPES.mouthStretchL]:  ["口横広げ", "い", "い１"],
+        [SHAPES.mouthStretchR]:  ["口横広げ", "い", "い１"],
+
+        // ── Mouth — smiles / frowns ──────────────────────────────
+        [SHAPES.mouthSmileL]:    ["にやり", "にっこり", "なごみ左", "なごみ", "口角上げ", "にこり左", "にこり"],
+        [SHAPES.mouthSmileR]:    ["にやり", "にっこり", "なごみ右", "なごみ", "口角上げ", "にこり右", "にこり"],
+        [SHAPES.mouthFrownL]:    ["困る左", "困る", "困る２左", "困る２"],
+        [SHAPES.mouthFrownR]:    ["困る右", "困る", "困る２右", "困る２"],
+        [SHAPES.mouthDimpleL]:   ["なごみ左", "なごみ"],
+        [SHAPES.mouthDimpleR]:   ["なごみ右", "なごみ"],
+
+        // ── Eyes — blinks ────────────────────────────────────────
+        [SHAPES.eyeBlinkL]:      ["ウィンク", "ウィンク２", "まばたき"],
+        [SHAPES.eyeBlinkR]:      ["ウィンク右", "ウィンク２右", "まばたき"],
+
+        // ── Eyes — wide / squint ─────────────────────────────────
+        [SHAPES.eyeWideL]:       ["瞳大", "びっくり"],
+        [SHAPES.eyeWideR]:       ["瞳大", "びっくり"],
+        [SHAPES.eyeSquintL]:     ["瞳小", "じと目", "ジト目"],
+        [SHAPES.eyeSquintR]:     ["瞳小", "じと目", "ジト目"],
+
+        // ── Eyes — gaze direction ────────────────────────────────
+        [SHAPES.eyeLookUpL]:     ["上左", "上"],
+        [SHAPES.eyeLookUpR]:     ["上右", "上"],
+        [SHAPES.eyeLookDownL]:   ["下左", "下"],
+        [SHAPES.eyeLookDownR]:   ["下右", "下"],
+        [SHAPES.eyeLookInL]:     ["前左", "前"],
+        [SHAPES.eyeLookInR]:     ["前右", "前"],
+        [SHAPES.eyeLookOutL]:    ["前左", "前"],
+        [SHAPES.eyeLookOutR]:    ["前右", "前"],
+
+        // ── Brows ────────────────────────────────────────────────
+        [SHAPES.browDownL]:      ["怒り左", "怒り目", "怒り"],
+        [SHAPES.browDownR]:      ["怒り右", "怒り目", "怒り"],
+        [SHAPES.browInnerUp]:    ["困る", "真面目"],
+        [SHAPES.browOuterUpL]:   ["喜び", "眼角上"],
+        [SHAPES.browOuterUpR]:   ["喜び", "眼角上"],
+
+        // ── Cheeks / nose ────────────────────────────────────────
+        [SHAPES.cheekPuff]:      ["ぷく", "ω"],
+        [SHAPES.cheekSquintL]:   ["なごみ左", "なごみ"],
+        [SHAPES.cheekSquintR]:   ["なごみ右", "なごみ"],
+    };
+
+    // Bonus: MMD emotion-mesh overlays. Layered ON TOP of normal
+    // emotions to deepen the expression — purely additive.
+    //   照れ (blush) lights up on strong "happy"
+    //   汗 (sweat)  on intense "thinking"
+    //   涙 (tear)   on intense "tired"
+    //   //// (embarrassed sweat) reserved for future "shy" emotion
+    const MMD_EMOTION_OVERLAY = {
+        happy:    { "照れ": 0.5 },
+        thinking: { "汗":   0.4 },
+        tired:    { "涙":   0.3 },
+    };
+
     window.LexyAvatar = window.LexyAvatar || {};
     window.LexyAvatar.morphs = {
         SHAPES,
         EMOTION_PRESETS,
         EMOTION_COLORS,
+        MMD_ALIASES,
+        MMD_EMOTION_OVERLAY,
     };
 })();

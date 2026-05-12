@@ -183,9 +183,9 @@
     }
 
     function _applyEmotionToBase(emotionName, intensity) {
-        const presets = window.LexyAvatar && window.LexyAvatar.morphs
-            ? window.LexyAvatar.morphs.EMOTION_PRESETS
-            : null;
+        const morphs = window.LexyAvatar && window.LexyAvatar.morphs;
+        const presets = morphs ? morphs.EMOTION_PRESETS : null;
+        const overlays = morphs ? morphs.MMD_EMOTION_OVERLAY : null;
         if (!presets) return;
         // First, zero out any base shape that was used by the previous
         // emotion but isn't part of the new one — so a switch from
@@ -196,6 +196,16 @@
         const preset = presets[emotionName] || presets.neutral;
         for (const [shape, weightAt1] of Object.entries(preset)) {
             baseShapes.set(shape, weightAt1 * intensity);
+        }
+
+        // Layer MMD emotion-mesh overlays on top — these are raw MMD
+        // morph names (照れ, 汗, 涙) sitting on a separate mesh. They
+        // resolve through _writeTarget like any other shape and are
+        // silently dropped on assets that don't have an emotions mesh.
+        if (overlays && overlays[emotionName]) {
+            for (const [shape, weightAt1] of Object.entries(overlays[emotionName])) {
+                baseShapes.set(shape, weightAt1 * intensity);
+            }
         }
     }
 
