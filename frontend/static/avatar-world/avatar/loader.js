@@ -142,12 +142,22 @@
         }
 
         // Auto-start every animation group that came with the asset
-        // (idle / walk / pose loops). CesiumMan, Michelle, Soldier etc.
-        // each ship one walk/idle clip; without this they pose-frozen
-        // and the user reads it as "the avatar doesn't move". Looping
-        // is on because none of these clips were authored for
-        // one-shot playback — they're all idle cycles.
+        // (idle / walk / pose loops). CesiumMan / Soldier ship one
+        // clip — Michelle from three.js examples is just a mesh +
+        // skeleton without embedded animation, so this list will be
+        // empty and the avatar lands in T-pose. Either drop in a GLB
+        // with an idle clip, or rely on the idle_driver's breathing
+        // and bone-animator's head-tilt for visible life.
         const animationGroups = result.animationGroups || [];
+        const skeletonRanges = (result.skeletons || []).flatMap(
+            (s) => (s && s.getAnimationRanges) ? s.getAnimationRanges() : []
+        );
+        console.info(
+            "avatar.loader: asset contains "
+            + animationGroups.length + " animation group(s), "
+            + skeletonRanges.length + " skeleton range(s), "
+            + (result.skeletons || []).length + " skeleton(s)"
+        );
         for (const ag of animationGroups) {
             try {
                 ag.start(true);  // true = loop
@@ -161,6 +171,14 @@
                 "avatar.loader: started " + animationGroups.length
                 + " animation group(s): "
                 + animationGroups.map((a) => a && a.name).join(", ")
+            );
+        } else {
+            console.warn(
+                "avatar.loader: GLB has NO embedded animation clips — "
+                + "avatar will sit in its rest pose (T-pose for most "
+                + "Mixamo exports). Drop in an idle.glb or pick a "
+                + "different test asset via "
+                + "scripts/vendor_test_avatar.bat soldier"
             );
         }
 
