@@ -1,0 +1,183 @@
+/*
+ * Avatar World — Frontend stylesheet.
+ *
+ * Phase 0 layout: a small floating "picture-in-picture" window in the
+ * bottom-right corner. Later phases will add a fullscreen / ambient
+ * view-mode that resizes the host container.
+ */
+
+.lexy-avatar-pip {
+    position: fixed;
+    right: 16px;
+    bottom: 16px;
+    width: 360px;
+    height: 240px;
+    z-index: 60;
+    background: rgba(8, 10, 16, 0.85);
+    border: 1px solid var(--accent, #4aa3df);
+    border-radius: 10px;
+    box-shadow:
+        0 4px 24px rgba(0, 0, 0, 0.6),
+        inset 0 0 8px rgba(74, 163, 223, 0.15);
+    overflow: hidden;
+    backdrop-filter: blur(8px);
+    transition: width 220ms ease, height 220ms ease, right 220ms ease, bottom 220ms ease;
+}
+
+.lexy-avatar-pip[data-view-mode="ambient"] {
+    width: 50vw;
+    height: 60vh;
+    right: 24px;
+    bottom: 24px;
+}
+
+.lexy-avatar-pip[data-view-mode="conversation"] {
+    width: 70vw;
+    height: 70vh;
+    right: 50%;
+    bottom: 15vh;
+    transform: translateX(50%);
+}
+
+.lexy-avatar-pip[hidden] {
+    display: none !important;
+}
+
+.lexy-avatar-pip canvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+    touch-action: none;
+    outline: none;
+}
+
+.lexy-avatar-header {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 8px;
+    font-family: ui-monospace, monospace;
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.7);
+    background: linear-gradient(180deg, rgba(0, 0, 0, 0.55) 0%, rgba(0, 0, 0, 0) 100%);
+    pointer-events: none;
+}
+
+.lexy-avatar-header .lexy-avatar-title {
+    letter-spacing: 0.05em;
+}
+
+.lexy-avatar-header .lexy-avatar-controls {
+    display: flex;
+    gap: 4px;
+    pointer-events: auto;
+}
+
+.lexy-avatar-header button {
+    background: rgba(0, 0, 0, 0.4);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: rgba(255, 255, 255, 0.8);
+    width: 18px;
+    height: 18px;
+    line-height: 16px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 11px;
+    padding: 0;
+}
+
+.lexy-avatar-header button:hover {
+    background: rgba(74, 163, 223, 0.25);
+    color: #fff;
+}
+
+#lexy-avatar-outfit-btn {
+    width: auto;
+    padding: 0 6px;
+}
+
+.lexy-avatar-outfit-menu {
+    position: absolute;
+    top: 28px;
+    right: 8px;
+    min-width: 200px;
+    max-width: 280px;
+    background: rgba(8, 10, 16, 0.95);
+    border: 1px solid var(--accent, #4aa3df);
+    border-radius: 6px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+    padding: 8px 0;
+    z-index: 70;
+    font-family: ui-monospace, monospace;
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.85);
+}
+
+.lexy-avatar-outfit-menu[hidden] {
+    display: none;
+}
+
+.lexy-avatar-outfit-title {
+    padding: 0 12px 6px;
+    font-weight: bold;
+    color: var(--accent, #4aa3df);
+    letter-spacing: 0.06em;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    margin-bottom: 4px;
+}
+
+.lexy-avatar-outfit-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 12px;
+    cursor: pointer;
+    user-select: none;
+}
+
+.lexy-avatar-outfit-row:hover {
+    background: rgba(74, 163, 223, 0.15);
+}
+
+.lexy-avatar-outfit-row input {
+    margin: 0;
+    accent-color: var(--accent, #4aa3df);
+}
+
+.lexy-avatar-outfit-row span {
+    flex: 1;
+}
+
+.lexy-avatar-outfit-count {
+    flex: 0;
+    font-size: 10px;
+    color: rgba(255, 255, 255, 0.45);
+}
+
+.lexy-avatar-outfit-empty {
+    padding: 12px;
+    color: rgba(255, 255, 255, 0.55);
+    font-style: italic;
+}
+
+.lexy-avatar-outfit-actions {
+    display: flex;
+    gap: 6px;
+    padding: 6px 12px 2px;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    margin-top: 4px;
+}
+
+.lexy-avatar-outfit-actions button {
+    flex: 1;
+    height: 22px;
+    line-height: 20px;
+    width: auto;
+    padding: 0 8px;
+    font-size: 10px;
+}

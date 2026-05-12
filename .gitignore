@@ -64,6 +64,14 @@ llama.cpp/
 # not be dereferenced into this repo.
 /docs/
 /lexy_v1/
+# Avatar GLB/glTF assets live in G:\AI\LexyAI\assets\models\ on the
+# local machine; the frontend folder is a junction so Babylon can
+# fetch them at runtime. Never index that target into git.
+/frontend/static/avatar-world/assets/models/
+/frontend/static/avatar-world/assets/backgrounds/
+/frontend/static/avatar-world/assets/animations/
+/frontend/static/avatar-world/assets/apartment/
+/frontend/static/vendor/babylon/
 
 # === Reference programs (third-party, out of scope for this repo) ===
 /referenz/

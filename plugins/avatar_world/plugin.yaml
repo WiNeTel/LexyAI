@@ -1,0 +1,52 @@
+name: avatar_world
+version: 0.1.0
+description: >-
+  Lexy als 3D-Avatar in lebendigem Apartment. Spiegelt Backend-Aktivitaet
+  (Agent denkt, Lexy spricht, User spricht, Idle) auf Emotion + Pose +
+  Outfit + Tageszeit. Frontend rendert via BabylonJS; Backend pusht
+  ``avatar.*``-Events an alle WS-Clients.
+entry: plugin.AvatarWorldPlugin
+requires: []
+optional: []
+capabilities: [event, ws_handler]
+
+config_defaults:
+  # Default outfit on startup. The OutfitRouter may switch this based on
+  # mood / time-of-day / explicit user request.
+  default_outfit: casual
+  available_outfits:
+    - casual
+    - sport
+    - business
+    - pyjama
+
+  # Backplate library — the frontend cycles through these as the day
+  # progresses. ``city_*`` slots map roughly to morning/day/evening/night.
+  available_backgrounds:
+    - city_morning
+    - city_day
+    - city_evening
+    - city_night
+    - forest
+    - mountain
+    - rain
+
+  # Idle thresholds (seconds since last user interaction). Lexy slowly
+  # transitions: active → tired → sleep. Reset on every ``core.user_message``.
+  idle_tired_after_s: 600
+  idle_sleep_after_s: 1800
+
+  # Emotion decay — every state fades back toward neutral over this many
+  # seconds when no further trigger arrives. Higher = emotions linger.
+  emotion_decay_s: 30
+
+  # How often the background sweeper polls idle + time-of-day (seconds).
+  # 5 s is fine — neither dimension needs sub-second resolution.
+  tick_interval_s: 5.0
+
+  # Initial activity slot the avatar is rendered in (Phase A: stationary).
+  default_activity: sit_desk
+
+  # When True the plugin starts in 'ambient' view-mode hint; the frontend
+  # may switch to 'conversation' the moment the user types or speaks.
+  default_view_mode: ambient

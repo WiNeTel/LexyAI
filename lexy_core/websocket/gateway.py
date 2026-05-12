@@ -2269,6 +2269,44 @@ def build_app(lexy: "LexyApp") -> FastAPI:
     # Serve frontend/static at /static and redirect / → /static/index.html
     static_dir = Path("frontend/static")
     if static_dir.is_dir():
+        # Avatar assets (GLB/glTF + textures + backgrounds + animations)
+        # live OUTSIDE the repo on Mike's machine and are exposed via
+        # Windows junctions under frontend/static/avatar-world/assets/.
+        # Starlette's StaticFiles refuses to serve files whose realpath
+        # lives outside the configured directory (it does a `realpath`
+        # + `commonpath` containment check), so a junction-pointed file
+        # would 404 even though it exists.
+        #
+        # Workaround: mount each potentially-junctioned asset folder
+        # directly at its own URL prefix, BEFORE the broader /static
+        # mount. Starlette matches routes first-hit-wins, so the more
+        # specific mount catches the request and serves the resolved
+        # realpath. When the folder is a real directory (no junction),
+        # realpath equals the original path and this mount is a no-op
+        # duplicate of the /static route — also fine.
+        avatar_asset_dirs = (
+            "frontend/static/avatar-world/assets/models",
+            "frontend/static/avatar-world/assets/backgrounds",
+            "frontend/static/avatar-world/assets/animations",
+            "frontend/static/avatar-world/assets/apartment",
+        )
+        for rel in avatar_asset_dirs:
+            asset_path = Path(rel)
+            if not asset_path.exists():
+                continue
+            real_path = asset_path.resolve()
+            url_prefix = "/" + rel.replace("\\", "/")
+            api.mount(
+                url_prefix,
+                StaticFiles(directory=str(real_path)),
+                name="avatar_assets_" + asset_path.name,
+            )
+            log.info(
+                "static.avatar_assets_mounted",
+                url=url_prefix,
+                real_path=str(real_path),
+            )
+
         api.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
         index_file = static_dir / "index.html"
 
