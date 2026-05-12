@@ -63,6 +63,9 @@ _MIGRATIONS: tuple[tuple[str, str], ...] = (
     # (column, ALTER statement)
     ("voice", "ALTER TABLE characters ADD COLUMN voice TEXT DEFAULT ''"),
     ("state", "ALTER TABLE characters ADD COLUMN state TEXT NOT NULL DEFAULT '{}'"),
+    # Phase 13.3 — natural-order speaker selection weight (0.0-1.0).
+    # 0.5 default matches the pydantic default in CharacterCard.
+    ("talkativeness", "ALTER TABLE characters ADD COLUMN talkativeness REAL NOT NULL DEFAULT 0.5"),
 )
 
 
@@ -86,6 +89,7 @@ _UPDATABLE_COLUMNS: frozenset[str] = frozenset(
         "state",
         "proactive_pulse_pattern",
         "proactive_pulse_prompt",
+        "talkativeness",  # Phase 13.3
         "archived",
     }
 )

@@ -799,7 +799,15 @@ class AutonomousThinkingPlugin(BasePlugin):
         # Persist the thought as an assistant message so it shows up in the
         # chat history. The user reported that thoughts only flash as toasts
         # and then vanish — this makes them part of the conversation.
+        #
+        # Phase 13.5 hotfix v3: SKIP persistence + broadcast for RP
+        # sessions (kind="rp"). Mike's RP-window was getting polluted
+        # with autonomous_thinking thoughts ('Die anfängliche Verwirrung
+        # muss nun in einen klaren Plan übergehen…') that have nothing
+        # to do with the in-character chat. Thoughts are global agent
+        # meta-state; they belong in the regular chat tab only.
         thought_session_id = ""
+        is_rp_session = False
         try:
             app = getattr(self.api, "_app", None)
             if app is not None:
@@ -809,7 +817,28 @@ class AutonomousThinkingPlugin(BasePlugin):
                         getattr(signals, "active_session_id", "") or ""
                     )
                 store = getattr(app, "session_store", None)
-                if store is not None and thought_session_id and text:
+                # Detect RP session by its meta kind. If we can't tell,
+                # default to "not RP" — better to render an extra thought
+                # than to silently drop a useful one.
+                if store is not None and thought_session_id:
+                    try:
+                        meta = (
+                            store.get_meta(thought_session_id)
+                            if hasattr(store, "get_meta") else {}
+                        )
+                        if (
+                            isinstance(meta, dict)
+                            and str(meta.get("kind", "")) == "rp"
+                        ):
+                            is_rp_session = True
+                    except Exception:  # noqa: BLE001
+                        pass
+                if (
+                    store is not None
+                    and thought_session_id
+                    and text
+                    and not is_rp_session
+                ):
                     # Use a 💭 prefix + italic so the UI can style it
                     # differently from normal assistant messages.
                     store.append_assistant(
@@ -819,13 +848,19 @@ class AutonomousThinkingPlugin(BasePlugin):
         except Exception as exc:  # noqa: BLE001
             log.debug("thinking.session_persist_failed", error=str(exc))
 
+        # Phase 13.5 hotfix v3: broadcast the thought with an empty
+        # session_id when the active session is an RP session. The
+        # frontend's autonomous_thought handler keys on session_id ===
+        # state.sessionId for the bubble render; an empty session_id
+        # makes that condition false so the thought doesn't render
+        # in the active RP tab. Toast still fires (separate path).
         await self.api.ws_broadcast(
             {
                 "type": "autonomous_thought",
                 "mode": mode,
                 "text": text,
                 "actions": actions,
-                "session_id": thought_session_id,
+                "session_id": "" if is_rp_session else thought_session_id,
                 "at": datetime.now().strftime("%H:%M:%S"),
             }
         )

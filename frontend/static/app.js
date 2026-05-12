@@ -528,9 +528,20 @@
         // user just clicked Send there. Cross-tab notifications
         // (character_pulse from a stale RP-session while the user is
         // in chat) are routed separately by their explicit session_id.
-        const targetWindow = (state.activeTab === "rp" && rpChatWindow)
+        //
+        // Phase 13.5 hotfix v3 — RP tab is for character RP only.
+        // Lexy's assistant streams and autonomous_thinking thoughts
+        // belong in the regular chat tab regardless of which tab the
+        // user happens to be looking at; they pollute the in-character
+        // narrative when mixed in. Mike's report: 'thought' bubbles
+        // and Lexy 'assistant' replies kept landing in the RP window.
+        const isRpTab = state.activeTab === "rp" && rpChatWindow;
+        const isAgentRole = role === "assistant" || role === "thought" || role === "tool";
+        const targetWindow = (isRpTab && !isAgentRole)
             ? rpChatWindow
-            : chatWindow;
+            : (isRpTab && isAgentRole)
+                ? chatWindow  // route Lexy/thought to chat tab even when RP is active
+                : chatWindow;
         targetWindow.appendChild(wrapper);
         targetWindow.scrollTop = targetWindow.scrollHeight;
         return wrapper.querySelector(".bubble");
@@ -1818,11 +1829,96 @@
     if (newSessionBtn) {
         newSessionBtn.addEventListener("click", newSession);
     }
-    // Phase 9.12: RP-Tab hat seinen eigenen "Neue Session"-Button.
-    // Beide rufen ``newSession()`` — die Funktion liest ``state.activeTab``
-    // und legt eine Chat- bzw. RP-Session an.
+    // Phase 13: RP-Tab opens the create-modal first so the user can
+    // pick a name + stats. Chat-Tab still creates inline.
     if (rpNewSessionBtn) {
-        rpNewSessionBtn.addEventListener("click", newSession);
+        rpNewSessionBtn.addEventListener("click", openRPCreateModal);
+    }
+
+    // ─── RP-Session create modal (Phase 13) ──────────────────────
+    const rpCreateModal = $("rp-create-modal");
+    const rpCreateClose = $("rp-create-close");
+    const rpCreateCancel = $("rp-create-cancel");
+    const rpCreateSubmit = $("rp-create-submit");
+    const rpCreateTitle = $("rp-create-title");
+    const rpCreateScene = $("rp-create-scene");
+    const rpCreateStats = $("rp-create-stats");
+
+    function openRPCreateModal() {
+        if (state.sending) {
+            toast("Busy", "Warte bis die aktuelle Antwort fertig ist");
+            return;
+        }
+        if (!rpCreateModal) {
+            // Fallback to inline path if modal markup is missing.
+            return newSession();
+        }
+        if (rpCreateTitle) rpCreateTitle.value = "";
+        if (rpCreateScene) rpCreateScene.value = "";
+        if (rpCreateStats) {
+            // Sensible default — Mike's most-common case.
+            rpCreateStats.value = "clothing; posture; mood";
+        }
+        rpCreateModal.hidden = false;
+        if (rpCreateTitle) rpCreateTitle.focus();
+    }
+    function closeRPCreateModal() {
+        if (rpCreateModal) rpCreateModal.hidden = true;
+    }
+    if (rpCreateClose) rpCreateClose.addEventListener("click", closeRPCreateModal);
+    if (rpCreateCancel) rpCreateCancel.addEventListener("click", closeRPCreateModal);
+    if (rpCreateModal) {
+        rpCreateModal.addEventListener("click", (e) => {
+            if (e.target === rpCreateModal) closeRPCreateModal();
+        });
+    }
+    if (rpCreateSubmit) {
+        rpCreateSubmit.addEventListener("click", async () => {
+            const title = rpCreateTitle ? rpCreateTitle.value.trim() : "";
+            const scene = rpCreateScene ? rpCreateScene.value.trim() : "";
+            const stats = rpCreateStats ? rpCreateStats.value.trim() : "";
+            const sid = generateSessionId();
+            const payload = {
+                session_id: sid,
+                title: title,
+                scene: scene,
+                tracked_stats: stats || "",
+            };
+            if (state.activeProjectId) {
+                payload.project_id = state.activeProjectId;
+            }
+            try {
+                const resp = await fetch("/api/v1/rp_sessions/register", {
+                    method: "POST",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify(payload),
+                });
+                if (!resp.ok) {
+                    const text = await resp.text().catch(() => "");
+                    throw new Error(`HTTP ${resp.status} ${text}`);
+                }
+                await resp.json();
+            } catch (err) {
+                toast("RP-Session anlegen fehlgeschlagen", String(err && err.message ? err.message : err));
+                return;
+            }
+            // Switch the RP-tab to the freshly-created session.
+            state.audio.stop();
+            state.sessionId = sid;
+            state.rpSessionId = sid;
+            state.currentAssistantBubble = null;
+            state.currentReasoningBubble = null;
+            state.currentAssistantText = "";
+            if (rpChatWindow) rpChatWindow.innerHTML = "";
+            try { localStorage.setItem("lexy_last_rp_session", sid); } catch (_e) {}
+            updateSessionPill();
+            _syncSessionUI("rp");
+            const label = title ? `"${title}"` : `#${sid.slice(0, 6)}`;
+            systemNote(`Neue RP-Session ${label} angelegt — eigener Memory-Container, getrackte Stats: ${stats || "(keine)"}.`);
+            closeRPCreateModal();
+            // Refresh the session sidebar so the new entry appears.
+            try { await loadSessions(); } catch (_e) {}
+        });
     }
 
     function _copySessionToClipboard() {
@@ -2747,6 +2843,12 @@
                     ? `<div class="sid sid-title">${escapeHtml(s.title)}</div>
                        <div class="sid-sub mono">${escapeHtml(s.id)}${isActive ? ' · active' : ''}</div>`
                     : `<div class="sid">${escapeHtml(s.id)}${isActive ? ' <span class="sid-active">· active</span>' : ''}</div>`;
+                // Phase 13: rename button beside the title for RP
+                // sessions — Mike asked for naming so he can tell
+                // sessions apart in the list.
+                const renameBtn = s.kind === "rp"
+                    ? `<button class="msg-action session-rename-btn" title="Session umbenennen">✏</button>`
+                    : "";
                 div.innerHTML = `
                     ${headline}
                     <div class="smeta">${kindBadge} ${s.messages} messages ${roleBadge}${inProgressBadge}</div>
@@ -2754,6 +2856,7 @@
                     ${userHint}
                     <div class="session-actions">
                         <button class="msg-action primary session-resume-btn">↻ Resume</button>
+                        ${renameBtn}
                         <button class="msg-action danger session-delete-btn">🗑 Delete</button>
                     </div>
                 `;
@@ -2784,6 +2887,34 @@
                         toast("Error", err.message);
                     }
                 });
+                const renameNode = div.querySelector(".session-rename-btn");
+                if (renameNode) {
+                    renameNode.addEventListener("click", async (ev) => {
+                        ev.stopPropagation();
+                        const current = s.title || "";
+                        const next = prompt(
+                            "Neuer Name für diese RP-Session:",
+                            current,
+                        );
+                        if (next === null) return;  // user pressed Cancel
+                        const trimmed = next.trim();
+                        try {
+                            const resp = await fetch(
+                                `/api/v1/sessions/${encodeURIComponent(s.id)}`,
+                                {
+                                    method: "PATCH",
+                                    headers: { "content-type": "application/json" },
+                                    body: JSON.stringify({ title: trimmed }),
+                                },
+                            );
+                            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                            await loadSessions();
+                            toast("Session umbenannt", trimmed || "(ohne Titel)");
+                        } catch (err) {
+                            toast("Umbenennen fehlgeschlagen", String(err && err.message ? err.message : err));
+                        }
+                    });
+                }
                 sessionsList.appendChild(div);
             }
         } catch (err) {
@@ -5036,6 +5167,27 @@
     const charFormTags = $("char-form-tags");
     const charFormPulsePattern = $("char-form-pulse-pattern");
     const charFormPulsePrompt = $("char-form-pulse-prompt");
+    // Phase 13 — character-level state fields are gone; state lives in
+    // the RP session container. The DOM nodes are absent in markup but
+    // we keep harmless null lookups to avoid breaking older saved
+    // sessions whose code paths we haven't fully cleaned up yet.
+    const charFormStateClothing = null;
+    const charFormStatePosture = null;
+    const charFormStateCondition = null;
+    const charFormStateMood = null;
+    const charFormStateLocation = null;
+    const charFormStateReset = null;
+    // Prompt-Vorschau (Hotfix Phase 12) — debug helper that shows
+    // the rendered system prompt + flags any clothing words still
+    // hiding in persona/scenario/greeting/example_dialog. Mike's
+    // RP characters kept referencing clothes their state didn't
+    // match; this gives him a one-click way to find the source.
+    const charFormPreviewBtn = $("char-form-preview-prompt");
+    const charPromptPreviewModal = $("char-prompt-preview-modal");
+    const charPromptPreviewClose = $("char-prompt-preview-close");
+    const charPromptPreviewTitle = $("char-prompt-preview-title");
+    const charPromptPreviewSummary = $("char-prompt-preview-summary");
+    const charPromptPreviewPre = $("char-prompt-preview-pre");
     const charFormAvatarImg = $("char-form-avatar-img");
     const charFormAvatarBtn = $("char-form-avatar-btn");
     const charFormAvatarFile = $("char-form-avatar-file");
@@ -5179,6 +5331,14 @@
         charFormTags.value = (c.tags || []).join(", ");
         charFormPulsePattern.value = c.proactive_pulse_pattern || "";
         charFormPulsePrompt.value = c.proactive_pulse_prompt || "";
+        // Live-state anchor keys. The card's ``state`` is a dict;
+        // unset keys → empty input.
+        const cstate = (c && typeof c.state === "object" && c.state) || {};
+        if (charFormStateClothing) charFormStateClothing.value = cstate.clothing || "";
+        if (charFormStatePosture) charFormStatePosture.value = cstate.posture || "";
+        if (charFormStateCondition) charFormStateCondition.value = cstate.condition || "";
+        if (charFormStateMood) charFormStateMood.value = cstate.mood || "";
+        if (charFormStateLocation) charFormStateLocation.value = cstate.location || "";
         if (c.avatar) {
             charFormAvatarImg.src = c.avatar;
             charFormAvatarImg.style.display = "";
@@ -5193,6 +5353,9 @@
         charFormArchive.hidden = c.archived;
         charFormUnarchive.hidden = !c.archived;
         charFormDelete.hidden = false;
+        // Prompt-preview is meaningful only for an existing (saved)
+        // character. resetCharacterForm() hides it again.
+        if (charFormPreviewBtn) charFormPreviewBtn.hidden = false;
         renderCharactersList();
     }
 
@@ -5211,6 +5374,11 @@
         charFormTags.value = "";
         charFormPulsePattern.value = "";
         charFormPulsePrompt.value = "";
+        if (charFormStateClothing) charFormStateClothing.value = "";
+        if (charFormStatePosture) charFormStatePosture.value = "";
+        if (charFormStateCondition) charFormStateCondition.value = "";
+        if (charFormStateMood) charFormStateMood.value = "";
+        if (charFormStateLocation) charFormStateLocation.value = "";
         charFormAvatarImg.removeAttribute("src");
         charFormAvatarImg.style.display = "none";
         charFormAttach.hidden = true;
@@ -5218,12 +5386,31 @@
         charFormArchive.hidden = true;
         charFormUnarchive.hidden = true;
         charFormDelete.hidden = true;
+        if (charFormPreviewBtn) charFormPreviewBtn.hidden = true;
         renderCharactersList();
     }
 
     async function submitCharacterForm(e) {
         e.preventDefault();
         const id = charFormId.value.trim();
+
+        // Build live-state from the anchor inputs. Empty values are
+        // intentionally dropped — that's how Mike removes a stuck
+        // "clothing: Shirt" entry without having to write JSON.
+        const state = {};
+        const _stateInputs = [
+            ["clothing", charFormStateClothing],
+            ["posture", charFormStatePosture],
+            ["condition", charFormStateCondition],
+            ["mood", charFormStateMood],
+            ["location", charFormStateLocation],
+        ];
+        for (const [key, el] of _stateInputs) {
+            if (el && el.value && el.value.trim()) {
+                state[key] = el.value.trim();
+            }
+        }
+
         const payload = {
             name: charFormName.value.trim(),
             persona: charFormPersona.value,
@@ -5236,6 +5423,9 @@
             tags: charFormTags.value.split(",").map((t) => t.trim()).filter(Boolean),
             proactive_pulse_pattern: charFormPulsePattern.value.trim(),
             proactive_pulse_prompt: charFormPulsePrompt.value.trim(),
+            // Pass the cleaned state dict — backend Stores it on the
+            // characters row as JSON (state field).
+            state,
         };
         if (!payload.name) { charsHint("Name fehlt", "error"); return; }
         if (id) {
@@ -5246,6 +5436,18 @@
             charsHint("Erstellt ✓", "ok");
         }
     }
+
+    // 🧹 Reset state — wipe all anchor fields so the next save
+    // produces an empty state dict. The user still has to click
+    // "Speichern" — this just clears the inputs.
+    if (charFormStateReset) charFormStateReset.addEventListener("click", () => {
+        if (charFormStateClothing) charFormStateClothing.value = "";
+        if (charFormStatePosture) charFormStatePosture.value = "";
+        if (charFormStateCondition) charFormStateCondition.value = "";
+        if (charFormStateMood) charFormStateMood.value = "";
+        if (charFormStateLocation) charFormStateLocation.value = "";
+        charsHint("State-Felder geleert — Speichern klicken um zu übernehmen.", "ok");
+    });
 
     if (charsForm) charsForm.addEventListener("submit", submitCharacterForm);
     if (charsNewBtn) charsNewBtn.addEventListener("click", resetCharacterForm);
@@ -5284,6 +5486,142 @@
         wsSend({ type: "character_delete", id });
         resetCharacterForm();
     });
+
+    // ─── Prompt-Vorschau (Phase 12 Hotfix) ──────────────────────────
+    // Mike's RP characters kept emitting clothing references that
+    // contradicted ``state.clothing``. The state-block authority fix
+    // alone wasn't enough — the actual clothing words still hide
+    // somewhere in persona/scenario/greeting/example_dialog. This
+    // modal fetches the rendered system prompt from the debug REST
+    // endpoint and highlights every clothing-watchword hit so Mike
+    // can find the offending field in seconds.
+    const _CLOTHING_WATCHWORDS = [
+        "shirt", "t-shirt", "tshirt", "hemd", "bluse", "top",
+        "slip", "höschen", "hoeschen", "unterwäsche", "unterwaesche", "string", "tanga",
+        "hose", "rock", "kleid", "pyjama", "schlafanzug",
+        "pulli", "pullover", "jacke", "mantel", "schuhe", "socken", "strümpfe", "struempfe",
+        "bh", "büstenhalter", "buestenhalter", "panties", "leggings", "jeans",
+    ];
+    const _CLOTHING_RE = new RegExp(
+        "\\b(" + _CLOTHING_WATCHWORDS.map((w) => w.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&")).join("|") + ")\\b",
+        "gi",
+    );
+
+    function _scanClothingHits(text) {
+        if (!text) return [];
+        const hits = new Set();
+        let m;
+        _CLOTHING_RE.lastIndex = 0;
+        while ((m = _CLOTHING_RE.exec(text)) !== null) {
+            hits.add(m[1].toLowerCase());
+        }
+        return [...hits];
+    }
+
+    function _highlightClothing(escapedText) {
+        // Operate on already-HTML-escaped text so we can wrap matches
+        // in <mark>…</mark> safely.
+        return escapedText.replace(_CLOTHING_RE, (m) => `<mark>${m}</mark>`);
+    }
+
+    function renderPromptPreview(body) {
+        if (!charPromptPreviewModal) return;
+        const name = body.character_name || "Charakter";
+        if (charPromptPreviewTitle) {
+            charPromptPreviewTitle.textContent = `Prompt-Vorschau · ${name}`;
+        }
+
+        // Per-source quick-scan.
+        const sources = [
+            ["persona", body.persona || ""],
+            ["scenario", body.scenario || ""],
+            ["greeting", body.greeting || ""],
+            ["example_dialog", body.example_dialog || ""],
+        ];
+        const rows = [];
+        const stateClothing = (body.state && body.state.clothing) ? String(body.state.clothing) : "";
+        if (stateClothing) {
+            rows.push(`<div class="row ok">🧷 <strong>state.clothing</strong> = "${escapeHtml(stateClothing)}" (Wahrheit für die LLM)</div>`);
+        } else {
+            rows.push(`<div class="row">🧷 state.clothing nicht gesetzt</div>`);
+        }
+        for (const [label, val] of sources) {
+            if (!val) {
+                rows.push(`<div class="row ok">✓ <strong>${label}</strong> leer</div>`);
+                continue;
+            }
+            const hits = _scanClothingHits(val);
+            if (hits.length === 0) {
+                rows.push(`<div class="row ok">✓ <strong>${label}</strong> keine Klamotten-Wörter</div>`);
+            } else {
+                rows.push(
+                    `<div class="row warn">⚠ <strong>${label}</strong> enthält: ${
+                        hits.map((h) => `<code>${escapeHtml(h)}</code>`).join(", ")
+                    }</div>`,
+                );
+            }
+        }
+        // Length info.
+        const len = body.prompt_length || (body.prompt ? body.prompt.length : 0);
+        rows.push(`<div class="row">📏 Prompt-Länge: ${len} Zeichen</div>`);
+        if (charPromptPreviewSummary) {
+            charPromptPreviewSummary.innerHTML = rows.join("");
+        }
+
+        // Full prompt with clothing words highlighted.
+        if (charPromptPreviewPre) {
+            const escaped = escapeHtml(body.prompt || "");
+            charPromptPreviewPre.innerHTML = _highlightClothing(escaped);
+        }
+
+        charPromptPreviewModal.hidden = false;
+    }
+
+    async function openPromptPreview() {
+        const id = charFormId.value.trim();
+        if (!id) {
+            if (typeof toast === "function") {
+                toast("Vorschau", "Bitte erst Charakter speichern.");
+            }
+            return;
+        }
+        const sessionId = (state && (state.rpSessionId || state.sessionId)) || "";
+        let url = `/api/v1/plugins/character_chat/characters/${encodeURIComponent(id)}/prompt`;
+        if (sessionId) {
+            url += `?session_id=${encodeURIComponent(sessionId)}`;
+        }
+        try {
+            const resp = await fetch(url);
+            if (!resp.ok) {
+                if (typeof toast === "function") {
+                    toast("Vorschau fehlgeschlagen", `HTTP ${resp.status}`);
+                }
+                return;
+            }
+            const body = await resp.json();
+            renderPromptPreview(body);
+        } catch (err) {
+            if (typeof toast === "function") {
+                toast("Vorschau fehlgeschlagen", String(err && err.message ? err.message : err));
+            }
+        }
+    }
+
+    if (charFormPreviewBtn) charFormPreviewBtn.addEventListener("click", openPromptPreview);
+    if (charPromptPreviewClose) {
+        charPromptPreviewClose.addEventListener("click", () => {
+            if (charPromptPreviewModal) charPromptPreviewModal.hidden = true;
+        });
+    }
+    if (charPromptPreviewModal) {
+        charPromptPreviewModal.addEventListener("click", (e) => {
+            // Click outside .modal closes the wrapper — same pattern
+            // as the other modals in this file.
+            if (e.target === charPromptPreviewModal) {
+                charPromptPreviewModal.hidden = true;
+            }
+        });
+    }
 
     // Avatar upload
     if (charFormAvatarBtn) {

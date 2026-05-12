@@ -172,6 +172,22 @@ class SessionPatchRequest(BaseModel):
     kind: str | None = None  # "chat" | "rp"
 
 
+class RPSessionCreateRequest(BaseModel):
+    """Phase 13 — create an RP session with its own container.
+
+    The session_id is generated client-side (UUID hex). ``tracked_stats``
+    is what Mike types in the session modal as semicolon-separated
+    ``key=value`` pairs — we accept either the parsed dict or the raw
+    string. ``scene`` is optional and seeds the container's session.json.
+    """
+
+    session_id: str
+    title: str = ""
+    scene: str = ""
+    tracked_stats: dict[str, str] | str | None = None
+    project_id: str | None = None
+
+
 class ProjectCreateRequest(BaseModel):
     """Create a new project from the sidebar."""
 
@@ -771,6 +787,85 @@ def build_app(lexy: "LexyApp") -> FastAPI:
             raise HTTPException(404, "entry not found")
         return {"id": entry_id}
 
+    @api.get("/api/v1/plugins/character_chat/characters/{char_id}/prompt")
+    async def get_character_prompt_preview(
+        char_id: str, request: Request, session_id: str = "",
+    ) -> dict[str, Any]:
+        """Render the system prompt that would be sent to the LLM for
+        this character — useful for debugging "why does Sandra still
+        think she's wearing a Shirt".
+
+        Mike's report: characters keep referring to clothes that
+        aren't in their state anymore. The cause is usually one of:
+          * persona text still mentions the clothes
+          * example_dialog has stale clothing references (and the
+            LLM uses the example as a few-shot anchor)
+          * state.clothing wasn't actually saved
+          * scenario text describes the wrong outfit
+        This endpoint dumps the rendered prompt so we can see at a
+        glance which source contains the stale text.
+
+        Query param ``session_id`` (optional) — if given, the prompt
+        includes the session's other characters under "## Andere
+        Anwesende".
+        """
+        app = _app(request)
+        plugin = _character_chat_plugin(app)
+        store = getattr(plugin, "_store", None)
+        if store is None:
+            raise HTTPException(503, "character store not ready")
+        card = await store.get(char_id)
+        if card is None:
+            raise HTTPException(404, f"character not found: {char_id}")
+
+        other_characters = []
+        if session_id:
+            try:
+                bound = await store.list_in_session(session_id)
+                other_characters = [c for c in bound if c.id != char_id]
+            except Exception:  # noqa: BLE001
+                other_characters = []
+
+        # Phase 13: when the session is an RP session with a container,
+        # pull the live state for THIS character (overrides card.state)
+        # and the session's tracked_stats list (drives the rules block).
+        live_state: dict[str, str] | None = None
+        tracked_stats: dict[str, str] | None = None
+        scene_text = ""
+        rp_registry = getattr(plugin, "_rp_registry", None)
+        if session_id and rp_registry is not None and rp_registry.is_rp_session(
+            session_id,
+        ):
+            try:
+                container = await rp_registry.get(session_id)
+                if container is not None:
+                    live_state = await container.get_char_state(char_id)
+                    tracked_stats = await container.get_tracked_stats()
+                    meta = await container.get_meta()
+                    scene_text = str(meta.get("scene", "") or "")
+            except Exception:  # noqa: BLE001
+                pass
+
+        prompt = card.build_system_prompt(
+            other_characters=other_characters,
+            scene=scene_text,
+            live_state=live_state,
+            tracked_stats=tracked_stats,
+        )
+        return {
+            "character_id": card.id,
+            "character_name": card.name,
+            "session_id": session_id,
+            "prompt": prompt,
+            "prompt_length": len(prompt),
+            # Phase 13: session-live state if available, else legacy.
+            "state": (live_state if live_state is not None else dict(card.state)),
+            "tracked_stats": tracked_stats or {},
+            "persona": card.persona,
+            "scenario": card.scenario,
+            "example_dialog": card.example_dialog,
+        }
+
     @api.get(
         "/api/v1/plugins/character_chat/sessions/{session_id}/turns"
     )
@@ -792,9 +887,37 @@ def build_app(lexy: "LexyApp") -> FastAPI:
         """
         app = _app(request)
         plugin = _character_chat_plugin(app)
-        # Use the plugin's own DB connection (same one persisting
-        # the rows in ``_persist_and_broadcast_turns``) — no chance
-        # of read-write desync between ack and SELECT.
+        capped = max(1, min(2000, int(limit)))
+
+        # Phase 13: RP sessions store their turns in a per-session
+        # SQLite under ``data/rp_sessions/<id>/turns.db``. Try that
+        # first; fall back to the legacy global ``character_turns``
+        # table for any non-RP / pre-Phase-13 session.
+        rp_registry = getattr(plugin, "_rp_registry", None)
+        if rp_registry is not None and rp_registry.is_rp_session(session_id):
+            container = await rp_registry.get(session_id)
+            if container is not None:
+                rows = await container.list_turns(limit=capped)
+                return {
+                    "session_id": session_id,
+                    "turns": [
+                        {
+                            "turn_id": t.id,
+                            "character_id": t.character_id,
+                            "character_name": t.character_name,
+                            "round_id": t.round_id,
+                            "order": t.order_num,
+                            "content": t.content,
+                            "skipped": t.skipped,
+                            "trigger_kind": t.trigger_kind,
+                            "trigger_text": t.trigger_text,
+                            "created_at": t.created_at,
+                        }
+                        for t in rows
+                    ],
+                }
+
+        # Legacy / non-RP fallback.
         db = await plugin.api.get_db()
         cursor = await db.execute(
             "SELECT id, character_id, character_name, round_id, "
@@ -802,7 +925,7 @@ def build_app(lexy: "LexyApp") -> FastAPI:
             "created_at FROM character_turns "
             "WHERE session_id = ? "
             "ORDER BY created_at ASC, order_num ASC LIMIT ?",
-            (session_id, max(1, min(2000, int(limit)))),
+            (session_id, capped),
         )
         rows = await cursor.fetchall()
         await cursor.close()
@@ -1440,6 +1563,68 @@ def build_app(lexy: "LexyApp") -> FastAPI:
         )
         return {"sessions": out}
 
+    @api.post("/api/v1/rp_sessions/register")
+    async def register_rp_session(
+        req: RPSessionCreateRequest, request: Request,
+    ) -> dict[str, Any]:
+        """Phase 13 entry point — create an RP session in one shot.
+
+        Atomically:
+          1. Registers the session with kind="rp" + optional title
+             in the core session_store.
+          2. Materialises the per-session container (folder +
+             dedicated Chroma collection ``rp__<id>``) seeded with
+             the user-defined ``tracked_stats``.
+
+        After this returns, the session is ready to attach characters
+        to and start chatting — the container guarantees a fresh,
+        empty memory namespace.
+        """
+        app = _app(request)
+
+        # Parse tracked_stats: accept dict or "key=val; key" string.
+        if isinstance(req.tracked_stats, str):
+            from plugins.character_chat.rp_session_store import (
+                parse_stats_input,
+            )
+            stats = parse_stats_input(req.tracked_stats)
+        elif isinstance(req.tracked_stats, dict):
+            stats = {str(k): str(v) for k, v in req.tracked_stats.items()}
+        else:
+            stats = {}
+
+        # Register the core session row.
+        app.session_store.register_empty(
+            session_id=req.session_id,
+            project_id=req.project_id,
+            title=req.title or None,
+        )
+        try:
+            app.session_store.set_kind(req.session_id, "rp")
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Materialise the container.
+        plugin = _character_chat_plugin(app)
+        registry = getattr(plugin, "_rp_registry", None)
+        if registry is None:
+            raise HTTPException(
+                503, "RP session registry not initialised (plugin not loaded?)",
+            )
+        container = await registry.get_or_create(
+            req.session_id,
+            title=req.title,
+            scene=req.scene,
+            tracked_stats=stats,
+        )
+        return {
+            "status": "ok",
+            "session_id": req.session_id,
+            "kind": "rp",
+            "tracked_stats": stats,
+            "collection": container.collection,
+        }
+
     @api.post("/api/v1/sessions/register")
     async def register_session(
         req: SessionRegisterRequest, request: Request
@@ -1492,6 +1677,21 @@ def build_app(lexy: "LexyApp") -> FastAPI:
         if req.title is not None:
             if app.session_store.set_title(session_id, req.title):
                 changes["title"] = req.title
+                # Phase 13: keep the RP container's session.json in
+                # sync with the SessionStore title so the right name
+                # shows up in the prompt-preview / sidebar regardless
+                # of which surface the user edits.
+                try:
+                    plugin = _character_chat_plugin(app)
+                    registry = getattr(plugin, "_rp_registry", None)
+                    if registry is not None and registry.is_rp_session(
+                        session_id,
+                    ):
+                        container = await registry.get(session_id)
+                        if container is not None:
+                            await container.update_meta(title=req.title)
+                except Exception:  # noqa: BLE001
+                    pass
         if req.kind is not None:
             try:
                 if app.session_store.set_kind(session_id, req.kind):
@@ -1564,8 +1764,34 @@ def build_app(lexy: "LexyApp") -> FastAPI:
     @api.delete("/api/v1/sessions/{session_id}")
     async def clear_session(session_id: str, request: Request) -> dict[str, Any]:
         app = _app(request)
+        # Phase 13: if this is an RP session, also destroy the
+        # per-session container (folder + Chroma collection). This
+        # is what makes "delete session = nothing left" actually true
+        # — Mike's whole reason for the per-session-folder design.
+        rp_destroyed = False
+        try:
+            plugin = _character_chat_plugin(app) if hasattr(
+                app, "plugin_loader",
+            ) else None
+        except Exception:  # noqa: BLE001
+            plugin = None
+        if plugin is not None:
+            registry = getattr(plugin, "_rp_registry", None)
+            if registry is not None and registry.is_rp_session(session_id):
+                try:
+                    rp_destroyed = await registry.destroy(session_id)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "session.rp_container_destroy_failed",
+                        session_id=session_id,
+                        error=str(exc),
+                    )
         dropped = app.session_store.clear(session_id)
-        return {"status": "cleared", "dropped": dropped}
+        return {
+            "status": "cleared",
+            "dropped": dropped,
+            "rp_container_destroyed": rp_destroyed,
+        }
 
     @api.patch("/api/v1/sessions/{session_id}/messages/{index}")
     async def edit_session_message(

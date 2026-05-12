@@ -67,9 +67,20 @@ echo Vision:   yes
 echo Audio:    yes  (STT via voice_gemma4 plugin)
 echo.
 
+:: Custom Heretic-variant Jinja template (shared E4B + 26B-A4B family).
+:: The root models\chat_template.jinja is the slightly newer revision
+:: (adds filter_keys param) used by the E4B model. Without --jinja,
+:: llama.cpp's C++ legacy parser misses the non-standard tokens
+:: (<|turn>, <|channel>, <|think|>) and applies a compatibility
+:: workaround that re-renders to <start_of_turn>/<end_of_turn> — not
+:: what this model was trained with.
+set CHAT_TEMPLATE=%MODEL_DIR%\chat_template.jinja
+
 "%LLAMA_DIR%\llama-server.exe" ^
     --model "%MODEL%" ^
     %MMPROJ_ARG% ^
+    --jinja ^
+    --chat-template-file "%CHAT_TEMPLATE%" ^
     --host 127.0.0.1 ^
     --port 5006 ^
     --ctx-size 16384 ^

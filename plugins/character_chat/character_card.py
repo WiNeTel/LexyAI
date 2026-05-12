@@ -82,9 +82,38 @@ class CharacterCard(BaseModel):
     # — e.g. "*weint laut und sucht nach Mama*". Empty = orchestrator picks a
     # default based on age_stage.
     proactive_pulse_prompt: str = ""
+    # Phase 13.3 — talkativeness weight (0.0-1.0) used by the natural-order
+    # speaker selector. Modelled after SillyTavern's ``talkativeness`` field
+    # (group-chats.js): each round, every eligible character rolls
+    # ``random()`` and is activated if ``talkativeness >= roll``. 0.0 = stays
+    # silent unless name-mentioned, 1.0 = always speaks. 0.5 is the default
+    # — feels balanced for a 3-4-character group.
+    talkativeness: float = 0.5
     archived: bool = False
     created_at: float = Field(default_factory=time.time)
     updated_at: float = Field(default_factory=time.time)
+
+    @field_validator("talkativeness", mode="before")
+    @classmethod
+    def _clamp_talkativeness(cls, v: Any) -> float:
+        """Clamp talkativeness to [0.0, 1.0] so a malformed import or a
+        runaway update can't break the natural-order roll. Runs in
+        ``before`` mode so non-numeric inputs (e.g. legacy DB rows
+        that wrote a string by accident) fall back to 0.5 instead of
+        raising a Pydantic error."""
+        if v is None:
+            return 0.5
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return 0.5
+        if f != f:  # NaN check
+            return 0.5
+        if f < 0.0:
+            return 0.0
+        if f > 1.0:
+            return 1.0
+        return f
 
     @field_validator("age_stage")
     @classmethod
@@ -126,6 +155,8 @@ class CharacterCard(BaseModel):
         scene: str = "",
         other_characters: list["CharacterCard"] | None = None,
         extra_instructions: str = "",
+        live_state: dict[str, str] | None = None,
+        tracked_stats: dict[str, str] | None = None,
     ) -> str:
         """Render this card as an LLM system prompt.
 
@@ -133,6 +164,15 @@ class CharacterCard(BaseModel):
         includes persona, scenario, age-stage guidance, relationship hints
         for any ``other_characters`` currently in the scene, and finally the
         example dialog as a few-shot anchor.
+
+        Phase 13:
+        * ``live_state`` — when set, OVERRIDES ``self.state`` for the
+          state block. The plugin passes the live RP-session state here
+          so the prompt reflects the truth of the current session, not
+          the legacy per-character state column.
+        * ``tracked_stats`` — when set, the rules block tells the LLM
+          which keys are valid in its ``<state>`` output, instead of the
+          generic anchor-key list.
         """
         parts: list[str] = []
         parts.append(f"Du bist {self.name}.")
@@ -164,12 +204,54 @@ class CharacterCard(BaseModel):
             if lines:
                 parts.append("\n## Andere Anwesende\n" + "\n".join(lines))
 
-        state_block = _format_state_block(self.state)
+        # Phase 13: live_state (from the RP session container) wins
+        # over the legacy character.state column. Passing a non-None
+        # empty dict means "no state right now" — different from None
+        # which means "use the card's default".
+        effective_state = live_state if live_state is not None else self.state
+        state_block = _format_state_block(effective_state)
         if state_block:
-            parts.append(f"\n## Dein Zustand\n{state_block}")
+            # The state block is the SINGLE SOURCE OF TRUTH for the
+            # character's current physical/emotional reality. We
+            # call it out aggressively because the example_dialog
+            # below may contain stale references (clothes, postures,
+            # locations) from when the card was first written —
+            # without an explicit "this is current, that is style"
+            # signal Mike's chars kept hallucinating Shirts after
+            # he set state.clothing="nackt".
+            parts.append(
+                "\n## Dein Zustand (AKTUELL — das ist die Wahrheit)\n"
+                f"{state_block}\n\n"
+                "**WICHTIG**: Diese Werte beschreiben DEINE JETZIGE "
+                "Realität — Kleidung, Haltung, Stimmung, Ort. Wenn der "
+                "Beispiel-Dialog unten andere Klamotten / Haltung / Ort "
+                "erwähnt, ist DAS NUR STILREFERENZ. Beziehe dich nie "
+                "auf alte Klamotten oder Posen aus dem Beispiel-Dialog. "
+                "Was hier oben steht, gilt — Punkt."
+            )
 
         if self.example_dialog.strip():
-            parts.append(f"\n## Beispiel-Dialog\n{self.example_dialog.strip()}")
+            parts.append(
+                "\n## Beispiel-Dialog (NUR Stilreferenz, NICHT aktuell!)\n"
+                f"{self.example_dialog.strip()}\n\n"
+                "*Der Beispiel-Dialog zeigt nur WIE du sprichst — Tonfall, "
+                "Wortwahl, typische *Sternchen-Gesten*. Er sagt NICHTS "
+                "über deine aktuellen Klamotten, deinen aktuellen Ort "
+                "oder das aktuelle Geschehen. Dafür gilt der Zustand "
+                "oben.*"
+            )
+
+        # Build the allowed-keys hint for the <state> rule. Phase 13:
+        # the session's tracked_stats wins; otherwise the legacy
+        # anchor list serves as a sane default for non-RP usage.
+        if tracked_stats:
+            stats_keys = list(tracked_stats.keys())
+        else:
+            stats_keys = [
+                "location", "mood", "last_action",
+                "clothing", "posture", "condition",
+            ]
+        stats_str = ", ".join(f"**{k}**" for k in stats_keys) if stats_keys else "(keine konfiguriert)"
 
         parts.append(
             "\n## Regeln (RP-Disziplin)\n"
@@ -184,6 +266,10 @@ class CharacterCard(BaseModel):
             "führt die Handlung. Du reagierst auf das, was passiert ist — "
             "du erfindest keine neuen Plot-Punkte, keine plötzlichen "
             "Ereignisse, keine Zeitsprünge.\n"
+            "- **Klamotten + Körper:** Erwähne NUR was unter '## Dein "
+            "Zustand' steht. Wenn dort 'Kleidung: nackt' steht, dann "
+            "trägst du NICHTS — auch wenn der Beispiel-Dialog ein Shirt "
+            "oder einen Slip erwähnt. KEINE Halluzinationen.\n"
             "- **Gefühle und Handlungen detailreich in *Sternchen*.** "
             "Inneres Erleben, Körpersprache, kleine Handlungen — "
             "ausführlich, gerne mehrsätzig wenn die Szene es trägt. "
@@ -193,9 +279,9 @@ class CharacterCard(BaseModel):
             "Satz bis Absätzen. Lieber lebendig + detailliert als "
             "künstlich kurz.\n"
             "- Du DARFST am Ende deiner Antwort optional einen "
-            "<state>location=...; mood=...; last_action=...</state> "
-            "Block setzen, wenn sich dein Zustand geändert hat. Nur diese "
-            "drei Keys. Wird nicht angezeigt, dient als dein Gedächtnis."
+            "<state>key=value; key=value</state> Block setzen, wenn "
+            "sich dein Zustand geändert hat. Erlaubte Keys für DIESE "
+            f"Session: {stats_str}. Andere Keys werden ignoriert."
         )
 
         if extra_instructions.strip():
@@ -224,6 +310,7 @@ class CharacterCard(BaseModel):
             "state": json.dumps(self.state),
             "proactive_pulse_pattern": self.proactive_pulse_pattern,
             "proactive_pulse_prompt": self.proactive_pulse_prompt,
+            "talkativeness": float(self.talkativeness),
             "archived": 1 if self.archived else 0,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -249,6 +336,11 @@ class CharacterCard(BaseModel):
             state=_json_loads_dict(row.get("state")),
             proactive_pulse_pattern=row.get("proactive_pulse_pattern", "") or "",
             proactive_pulse_prompt=row.get("proactive_pulse_prompt", "") or "",
+            talkativeness=(
+                float(row["talkativeness"])
+                if row.get("talkativeness") is not None
+                else 0.5
+            ),
             archived=bool(row.get("archived", 0)),
             created_at=float(row.get("created_at") or time.time()),
             updated_at=float(row.get("updated_at") or time.time()),

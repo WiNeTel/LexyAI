@@ -712,11 +712,27 @@ class LexyAgent:
         ]
         ctx["messages"] = messages
         ctx["history_length"] = len(history)
+        # Per-section char-counts so we can diagnose "Prompt zu lang"
+        # without guessing which section is bloating. Only emitted at
+        # DEBUG level so the normal INFO console stays calm.
+        system_chars = sum(len(p) for p in system_parts)
+        history_chars = sum(len(m.get("content", "")) for m in history)
+        recalled_chars = sum(
+            len(item.get("content", "")) for item in recalled
+        )
         log.debug(
             "agent.plan",
             session=ctx.get("session_id"),
             history_msgs=len(history),
             brain=brain,
+            system_parts=len(system_parts),
+            system_chars=system_chars,
+            history_chars=history_chars,
+            user_text_chars=len(user_text),
+            attachment_chars=len(attachment_text),
+            recalled_count=len(recalled),
+            recalled_chars=recalled_chars,
+            total_chars=system_chars + history_chars + len(user_text),
         )
         return messages
 

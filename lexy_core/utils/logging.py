@@ -45,6 +45,13 @@ def configure_logging(level: str = "INFO", *, json_output: bool = False) -> None
         force=True,
     )
 
+    # Silence noisy library loggers. They emit one INFO line per HTTP
+    # request — and we have channel-poll loops + chromadb count probes
+    # firing every 1-2 s, which buries Lexy's own structlog output.
+    # Errors still surface (WARNING/ERROR pass through).
+    for _noisy in ("httpx", "httpcore", "chromadb", "urllib3"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
+
     processors: list[Any] = [
         structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,

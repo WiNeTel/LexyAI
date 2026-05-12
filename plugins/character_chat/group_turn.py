@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -100,6 +101,27 @@ class GroupTurnRequest:
     #     speaker's persona + state).
     # An empty dict (or missing key) means "no lore for this speaker".
     lore_by_speaker: dict[str, "ActivationResult"] = field(default_factory=dict)
+    # Phase 13 — per-character live state from the RP session container,
+    # keyed by character_id. Overrides ``card.state`` when building the
+    # prompt's state-block. Empty dict / missing key falls back to the
+    # legacy ``card.state`` so non-RP code paths keep working.
+    live_state_by_char: dict[str, dict[str, str]] = field(default_factory=dict)
+    # Phase 13.2 — speakers to exclude from selection this round (skip-
+    # cooldown). The plugin populates this with chars that returned
+    # empty/pass turns recently. Speaker selection filters these out;
+    # if filtering would empty the candidate list, the orchestrator
+    # falls back to the unfiltered set so the round isn't completely
+    # silent.
+    excluded_speaker_ids: set[str] = field(default_factory=set)
+    # Phase 13.5 (B+D) — cross-round repetition memory. Last N turns of
+    # each character keyed by character_id, oldest first. The plugin
+    # populates this from the per-session turns store (RP container or
+    # legacy character_turns table). The repetition guard compares the
+    # new generation against BOTH this char's own past turns AND the
+    # other speakers' current-round turns. Without this, Mira repeats
+    # 'wische mir den Salzfilm von der Stirn' across three rounds
+    # because the 13.2 guard only saw within-round predecessors.
+    prior_turns_by_char: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -112,6 +134,114 @@ class GroupTurnResult:
     user_message: str = ""
     pulse_from_id: str = ""
     pulse_text: str = ""
+
+
+# ─── Repetition guard (Phase 13.2) ───────────────────────────────────
+
+
+# German stopwords — cheap n-gram comparison ignores these so we
+# don't flag two turns as similar just because both contain "der die
+# das mit von ich". Kept intentionally short — we want enough signal
+# left in the comparison set that real similarity (clothing/sand/
+# salt) lights up Jaccard.
+_REPETITION_STOPWORDS: frozenset[str] = frozenset({
+    "der", "die", "das", "den", "dem", "des",
+    "ein", "eine", "einer", "eines", "einem", "einen",
+    "ich", "du", "er", "sie", "es", "wir", "ihr",
+    "mich", "dich", "ihn", "uns", "euch",
+    "mein", "dein", "sein", "ihr", "unser", "euer",
+    "und", "oder", "aber", "doch", "denn",
+    "in", "im", "auf", "an", "am", "zu", "zum", "zur",
+    "von", "mit", "bei", "nach", "über", "unter", "vor",
+    "ist", "sind", "war", "waren", "wird", "werden", "hat",
+    "haben", "hatte", "kann", "könnte", "muss", "soll",
+    "nicht", "kein", "keine", "schon", "noch", "auch",
+    "wenn", "als", "wie", "was", "wer", "warum", "weil",
+    "sich", "selbst", "nur", "fast",
+})
+
+
+_NGRAM_TOKEN_RE = re.compile(r"[a-zäöüß]{3,}", re.IGNORECASE)
+
+
+def _last_history_user_text(history: list[dict[str, Any]] | None) -> str:
+    """Phase 13.3 helper: pull the most recent USER message from a
+    session history list. Used by the natural-order activator when no
+    explicit ``user_message`` is set this round (pulse turns)."""
+    if not history:
+        return ""
+    for msg in reversed(history):
+        if (msg.get("role") or "").lower() == "user":
+            return str(msg.get("content") or "")
+    return ""
+
+
+def _ngrams(text: str, n: int = 3) -> set[tuple[str, ...]]:
+    """Tokenise + lowercase + drop stopwords + emit n-gram tuples.
+
+    Default ``n=3`` (trigram) — German narrative RP tends to insert
+    enough variation between adjacent content words that 4-grams miss
+    real repetition. Trigrams strike the right balance between false
+    positives (single-word matches) and false negatives (entirely
+    re-worded sand-staring).
+    """
+    tokens = [
+        t.lower() for t in _NGRAM_TOKEN_RE.findall(text or "")
+        if t.lower() not in _REPETITION_STOPWORDS
+    ]
+    if len(tokens) < n:
+        # For very short turns, fall back to bigrams so we still have
+        # SOME signal. A 3-word sentence vs another 3-word sentence
+        # would otherwise always be "no match".
+        n = max(2, min(n, len(tokens)))
+    if len(tokens) < n or n < 2:
+        return set()
+    return {tuple(tokens[i:i + n]) for i in range(len(tokens) - n + 1)}
+
+
+def _jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return inter / union if union else 0.0
+
+
+def detect_repetition(
+    new_text: str,
+    previous_texts: list[str],
+    threshold: float = 0.4,
+) -> tuple[bool, float, list[str]]:
+    """Return (is_repetitive, max_jaccard, sample_repeated_phrases).
+
+    Phase 13.2 helper. The orchestrator calls this AFTER the LLM
+    returns to check whether the new turn re-mixes phrases its
+    same-round predecessors already used. ``threshold=0.4`` was
+    picked from Mike's Castaway log — two turns with "Sand starren /
+    Schläfen reiben / Salz brennt" share roughly 40-50% of their
+    (stopword-stripped) 4-grams.
+
+    Returns the sample phrases so the re-prompt can name them.
+    """
+    if not new_text or not previous_texts:
+        return False, 0.0, []
+    new_grams = _ngrams(new_text)
+    if not new_grams:
+        return False, 0.0, []
+    max_jac = 0.0
+    overlapping_grams: set[tuple[str, ...]] = set()
+    for prev in previous_texts:
+        prev_grams = _ngrams(prev)
+        if not prev_grams:
+            continue
+        jac = _jaccard(new_grams, prev_grams)
+        if jac > max_jac:
+            max_jac = jac
+            overlapping_grams = new_grams & prev_grams
+    if max_jac < threshold:
+        return False, max_jac, []
+    samples = [" ".join(g) for g in list(overlapping_grams)[:5]]
+    return True, max_jac, samples
 
 
 # ─── Typing helpers ──────────────────────────────────────────────────────────
@@ -212,6 +342,27 @@ class GroupTurnOrchestrator:
                 pulse_text=req.pulse_text,
             )
 
+        # Phase 13.2: skip-cooldown filter. Chars that returned an
+        # empty turn last round are excluded for this round so the
+        # LLM-orchestrator doesn't pick them silent again. If filtering
+        # would empty the candidate list, ignore the cooldown — better
+        # one repeat skip than a totally silent round.
+        if req.excluded_speaker_ids:
+            filtered = [
+                c for c in eligible
+                if c.id not in req.excluded_speaker_ids
+            ]
+            if filtered:
+                if len(filtered) < len(eligible):
+                    log.info(
+                        "character_chat.skip_cooldown_filtered "
+                        "session=%s excluded=%s remaining=%d",
+                        req.session_id,
+                        sorted(req.excluded_speaker_ids),
+                        len(filtered),
+                    )
+                eligible = filtered
+
         # Speaker selection priority:
         #   1. @-mentions (explicit user intent)
         #   2. natural-language name mentions (e.g. "Mara, schau mal...")
@@ -235,7 +386,21 @@ class GroupTurnOrchestrator:
         speaker_order = await self._pick_speakers(
             req=req, eligible=eligible, forced=forced + extras
         )
-        speaker_order = speaker_order[: self._max_speakers]
+        # Phase 13.5 hotfix v3 — when the user explicitly @-mentions or
+        # NL-names character(s), DON'T auto-fill to max_speakers. Mike's
+        # gripe: he writes '@Sandra hilf mir' and Lena also chimes in
+        # because slot 2 of max_speakers=2 gets filled by the LLM/round-
+        # robin path. Plus when both chars share identical tracked_stats
+        # (arousal=extrem_notgeil etc.) the second answer mirrors the
+        # first emotionally even though sequential prompting differs.
+        # When user names someone, only the named char(s) speak.
+        # ``extras`` (pulse-mention-propagation) ALSO counts as 'user-
+        # like intent' from a pulse — keep it in the cap too.
+        explicit_count = len(forced) + len(extras)
+        if explicit_count > 0:
+            speaker_order = speaker_order[: explicit_count]
+        else:
+            speaker_order = speaker_order[: self._max_speakers]
         if at_mentions or nl_mentions or extras:
             log.info(
                 "character_chat.mentions_parsed at=%s nl=%s extras=%s order=%s",
@@ -247,13 +412,32 @@ class GroupTurnOrchestrator:
 
         by_id = {c.id: c for c in req.characters}
         turns: list[CharacterTurn] = []
+
+        # Phase 13.5 (A): if a pulse fired, synthesise a visible turn for
+        # the pulse-from character containing the pulse_text. Without this
+        # the trigger char never appears in the chat — only the OTHERS
+        # who reacted to her pulse get persisted, and the user can't see
+        # what she actually did. Mike's diagnosis: "Yara taucht nie auf"
+        # despite firing pulses every 10 min. The pulse_text is already
+        # her "voice"; we just persist it under her name so it's visible.
+        if req.pulse_from_id and req.pulse_text:
+            pulse_card = by_id.get(req.pulse_from_id)
+            if pulse_card is not None:
+                turns.append(CharacterTurn(
+                    character_id=pulse_card.id,
+                    character_name=pulse_card.name,
+                    content=req.pulse_text,
+                    skipped=False,
+                    order=0,
+                ))
+
         for idx, char_id in enumerate(speaker_order):
             card = by_id.get(char_id)
             if card is None:
                 continue
             turn = await self._run_single_turn(
                 card=card,
-                order=idx,
+                order=idx + (1 if turns else 0),
                 previous_turns=turns,
                 req=req,
                 all_cards=req.characters,
@@ -269,6 +453,73 @@ class GroupTurnOrchestrator:
         )
 
     # ─── Speaker selection ───────────────────────────────────────────────
+
+    def _activate_natural_order(
+        self,
+        *,
+        req: GroupTurnRequest,
+        eligible: list[CharacterCard],
+    ) -> list[str]:
+        """Phase 13.3 — SillyTavern-style deterministic speaker pick.
+
+        Mirrors ``activateNaturalOrder`` in
+        ``SillyTavern/public/scripts/group-chats.js``. Three signals,
+        in priority order:
+
+        1. **Name-mention** in the most recent input — that character
+           is activated immediately and gets pole position.
+        2. **Talkativeness roll** — for every other character a single
+           ``random()`` is compared against ``card.talkativeness``;
+           below threshold = silent this round. With Mike's 4-char
+           Castaway group at default 0.5, the expected speaker count
+           per round is ~2 — exactly what ``max_speakers_per_round``
+           caps anyway.
+        3. **Recency / chattiness fallback** — if no character was
+           activated by either rule, pick the eligibly-chattiest one
+           so the round isn't completely silent.
+
+        No LLM call, no async I/O. Returns an ordered list of
+        ``character_id``. Empty list = "couldn't decide cleanly,
+        the caller should fall back to the LLM-based picker".
+        """
+        if not eligible:
+            return []
+        haystack = (
+            req.user_message
+            or req.pulse_text
+            or _last_history_user_text(req.history)
+            or ""
+        ).lower()
+
+        activated: list[str] = []
+        seen: set[str] = set()
+
+        # Pass 1: name mentions go first, in name-order.
+        for card in eligible:
+            name = (card.name or "").strip().lower()
+            if not name:
+                continue
+            # Word-boundary-ish match — avoids "Lena" inside "Galena".
+            pattern = r"\b" + re.escape(name) + r"\b"
+            if re.search(pattern, haystack):
+                if card.id not in seen:
+                    activated.append(card.id)
+                    seen.add(card.id)
+
+        # Pass 2: talkativeness roll for everyone not already activated.
+        for card in eligible:
+            if card.id in seen:
+                continue
+            roll = random.random()
+            if float(card.talkativeness) >= roll:
+                activated.append(card.id)
+                seen.add(card.id)
+
+        # If the rolls left us empty, return [] so the caller can fall
+        # back to the LLM picker. We DON'T blindly pick the chattiest
+        # — that would mask a "nobody really fits" signal that the LLM
+        # might handle better.
+        return activated
 
     async def _pick_speakers(
         self,
@@ -322,6 +573,14 @@ class GroupTurnOrchestrator:
         # autonomous: LLM picks order over the remaining candidates.
         remaining = [c for c in eligible if c.id not in seen]
 
+        # Phase 13.3b — UPDATED HIERARCHY (Mike's choice):
+        #   1. Name-mention (handled above, in ``forced``)
+        #   2. LLM story-match — picks the *contextually right* speaker
+        #      with full persona + relationships + last-turn context
+        #      (e.g. "Sandra is the nurse → answers when Lena is hurt")
+        #   3. Talkativeness roll as last-resort for idle phases when
+        #      the LLM also can't decide cleanly.
+        #
         # always_call_orchestrator path: LLM gets *all* eligibles and the
         # mention-derived order as a preferred hint. We use this to
         # catch cases where the user named a char that shouldn't
@@ -347,19 +606,44 @@ class GroupTurnOrchestrator:
             )
             return order
 
+        # Phase 13.3b: PRIMARY autonomous path — story-match LLM call.
+        # The selector now sees personas + relationships + last turn
+        # so it can answer "who would naturally react RIGHT NOW".
         llm_order = await self._ask_llm_for_order(req=req, candidates=remaining)
-        order.extend(llm_order)
-        # Safety net: if LLM picked nothing, fall back to round-robin.
-        if not llm_order and not order:
+        if llm_order:
+            order.extend(llm_order)
+            self._log_speakers_picked(
+                method=(method or "llm_story_match"),
+                order=order, brain_called=True, req=req,
+            )
+            return order
+
+        # LAST RESORT: LLM had no clear pick — roll talkativeness so
+        # idle group chat (everyone equally likely) still produces a
+        # speaker instead of silence.
+        natural_order = self._activate_natural_order(
+            req=req, eligible=remaining,
+        )
+        if natural_order:
+            order.extend(natural_order)
+            self._log_speakers_picked(
+                method=(method or "talkativeness_fallback"),
+                order=order, brain_called=True, req=req,
+            )
+            return order
+
+        # Absolute last resort — neither LLM nor talkativeness picked
+        # anyone. Fall back to round-robin so the round isn't silent.
+        if not order:
             order = [c.id for c in remaining]
             self._log_speakers_picked(
-                method="llm_failed_round_robin", order=order,
-                brain_called=True, req=req,
+                method="round_robin_safety",
+                order=order, brain_called=True, req=req,
             )
             return order
 
         self._log_speakers_picked(
-            method=method or "llm" if llm_order else "mention",
+            method=method or "mention",
             order=order, brain_called=True, req=req,
         )
         return order
@@ -397,9 +681,34 @@ class GroupTurnOrchestrator:
         candidates: list[CharacterCard],
         preferred_order: list[str] | None = None,
     ) -> list[str]:
-        roster = "\n".join(
-            f"- {c.name} (id={c.id}): {_brief_persona(c)}" for c in candidates
-        )
+        # Phase 13.3b: build a richer roster so the selector can reason
+        # about expertise + relationships ("Sandra ist Krankenschwester
+        # → reagiert auf Verletzungen", "Mira kann tauchen → reagiert
+        # wenn jemand was im Wasser sieht"). Mike's brief: characters
+        # should ASK each other based on who can do what.
+        roster_blocks: list[str] = []
+        char_by_id = {c.id: c for c in candidates}
+        for c in candidates:
+            persona_brief = _brief_persona(c)
+            chat_score = (
+                f"talkativeness={float(c.talkativeness):.1f}"
+            )
+            # Resolve relationships against THIS roster only — labels
+            # for non-eligible chars don't help the picker decide.
+            rel_lines: list[str] = []
+            for other_id, label in (c.relationships or {}).items():
+                other = char_by_id.get(other_id)
+                if other is not None and label:
+                    rel_lines.append(f"  · {other.name}: {label}")
+            block = (
+                f"- **{c.name}** (id={c.id}, {chat_score})\n"
+                f"  Profil: {persona_brief}"
+            )
+            if rel_lines:
+                block += "\n  Beziehungen:\n" + "\n".join(rel_lines)
+            roster_blocks.append(block)
+        roster = "\n\n".join(roster_blocks)
+
         trigger = req.user_message.strip() or (
             f"*{req.pulse_text}*" if req.pulse_text else ""
         )
@@ -423,19 +732,32 @@ class GroupTurnOrchestrator:
 
         system = (
             "Du bist der Turn-Orchestrator einer RP-Gruppe. Deine Aufgabe: "
-            "entscheiden, welche Charaktere auf den aktuellen Impuls reagieren "
-            "und in welcher Reihenfolge. Keine Erfindungen — nur IDs aus der "
-            "Liste. Antworte AUSSCHLIESSLICH mit IDs, komma-separiert, in der "
-            "Reihenfolge in der sie sprechen sollen. Wenn jemand schweigen "
-            "würde, lass sie/ihn einfach weg. Maximal "
-            f"{self._max_speakers} Charaktere."
+            "entscheiden, **welcher Charakter** kontextuell am besten geeignet "
+            "ist auf den Impuls zu reagieren — und ob noch ein zweiter "
+            "naheliegend ist.\n\n"
+            "Heuristik:\n"
+            "1. **Expertise-Match** wiegt am höchsten. Wenn jemand "
+            "verletzt ist → Krankenschwester reagiert. Wenn was im Wasser "
+            "treibt → die Surfer/Taucherin. Wenn Lager gebaut werden muss "
+            "→ Architektin. Lies die Profile.\n"
+            "2. **Beziehungs-Bezug**: wer wurde direkt angesprochen oder "
+            "im letzten Turn erwähnt?\n"
+            "3. **Relevanz**: kann dieser Charakter etwas konkret zur "
+            "Situation BEITRAGEN — oder würde er nur 'mhm' sagen?\n"
+            "4. **Talkativeness** ist ein Bias, kein Muss — niedrige Werte "
+            "(z.B. 0.3) sprechen weniger oft, aber wenn ihre Expertise "
+            "gefragt ist, spricht sie trotzdem.\n\n"
+            "Antworte AUSSCHLIESSLICH mit IDs, komma-separiert, in der "
+            "Reihenfolge in der sie sprechen sollen. Maximal "
+            f"{self._max_speakers} Charaktere. Wenn niemand klar passt, "
+            "gib eine leere Liste zurück (ein Wort: NONE)."
         )
         user = (
-            f"## Roster\n{roster}\n\n"
-            f"## Letzte Zeilen\n{history_blurb}\n\n"
+            f"## Charaktere\n{roster}\n\n"
+            f"## Letzte Zeilen aus dem Chat\n{history_blurb}\n\n"
             f"## Aktueller Impuls\n{trigger}"
             f"{hint_block}\n\n"
-            "## Deine Antwort (IDs komma-separiert, keine Erklärung):"
+            "## Deine Antwort (IDs komma-separiert, oder NONE):"
         )
 
         try:
@@ -456,6 +778,15 @@ class GroupTurnOrchestrator:
         except Exception as exc:  # noqa: BLE001
             log.warning("character_chat.order_llm_failed: %s", exc)
             return [c.id for c in candidates]
+
+        # Phase 13.3b: explicit "no clear match" signal. If the LLM
+        # answers ``NONE`` (we ask for it in the system prompt), we
+        # return [] so the caller can fall through to the
+        # talkativeness-roll last-resort. Stripped of the usual
+        # punctuation cosmetic.
+        cleaned_raw = (raw or "").strip().strip("[]()<>\"' \t`.,;:!\n")
+        if cleaned_raw.upper() == "NONE":
+            return []
 
         valid_ids = {c.id: c.id for c in candidates}
         # Also map name→id so the LLM can reply with names if it can't keep
@@ -501,11 +832,30 @@ class GroupTurnOrchestrator:
                 or card.name
             )
             try:
+                # Phase 13: pass the session_id so the recall function
+                # can route to the per-RP-session collection. Plugins
+                # implementing the legacy 3-arg signature still work
+                # because we pass session_id as a keyword.
                 own_memories = await self._recall_fn(
                     character_id=card.id,
                     query=query,
                     limit=self._recall_limit,
+                    session_id=req.session_id,
                 )
+            except TypeError:
+                # Fallback for older recall_fn signatures without session_id.
+                try:
+                    own_memories = await self._recall_fn(
+                        character_id=card.id,
+                        query=query,
+                        limit=self._recall_limit,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "character_chat.recall_failed_legacy: %s (char=%s)",
+                        exc,
+                        card.name,
+                    )
             except Exception as exc:  # noqa: BLE001
                 log.warning(
                     "character_chat.recall_failed: %s (char=%s)",
@@ -576,6 +926,73 @@ class GroupTurnOrchestrator:
             skipped = True
             content = ""
 
+        # Phase 13.2 + 13.5 (B+D): repetition guard. Compares the new
+        # turn against TWO pools:
+        #   * same-round others (13.2 — who else just spoke this round)
+        #   * THIS char's own recent turns from prior rounds (13.5 —
+        #     stops Mira repeating 'wische mir den Salzfilm von der
+        #     Stirn' three rounds in a row)
+        # If overlap above threshold, re-prompt ONCE with an anti-rep
+        # hint. Only one retry — a second loop doubles the token cost
+        # and rarely helps.
+        own_prior = req.prior_turns_by_char.get(card.id, [])
+        if (
+            content
+            and not skipped
+            and (previous_turns or own_prior)
+        ):
+            prev_texts = [
+                pt.content for pt in previous_turns
+                if pt.content and not pt.skipped
+            ]
+            # Add this char's own prior turns so self-repetition across
+            # rounds also triggers the guard. Keep a small window —
+            # comparing against 50 ancient turns is wasted work.
+            prev_texts.extend(own_prior[-5:])
+            is_rep, jac, samples = detect_repetition(
+                content, prev_texts, threshold=0.4,
+            )
+            if is_rep:
+                log.info(
+                    "character_chat.repetition_detected character=%s "
+                    "jaccard=%.2f samples=%s",
+                    card.name, jac, samples[:3],
+                )
+                anti_rep_hint = (
+                    "\n\n## WICHTIG (Anti-Wiederholung)\n"
+                    "Folgende Phrasen wurden bereits verwendet (von dir "
+                    "selbst in einer vorherigen Runde oder von "
+                    "Mit-Charakteren in dieser Runde). Vermeide sie und "
+                    "schreib KEINE Variation davon — beschreibe etwas "
+                    "ANDERES (ein neuer Geruch, ein neues Geräusch, "
+                    "eine spezifische Aktion, eine andere Körpergeste, "
+                    "eine konkrete Beobachtung). "
+                    f"Vermeiden: {', '.join(samples[:5])}."
+                )
+                retry_messages = [
+                    {"role": "system",
+                     "content": system_prompt + anti_rep_hint},
+                    {"role": "user", "content": user_content},
+                ]
+                try:
+                    retry_raw = await self._llm_chat(
+                        messages=retry_messages,
+                        brain=self._brain,
+                        max_tokens=self._max_tokens,
+                        temperature=min(
+                            1.0, self._temperature + 0.1,
+                        ),  # nudge up for variety
+                        thinking=False,
+                    )
+                    retry_content = (retry_raw or "").strip()
+                    if retry_content and not self._is_pass(retry_content):
+                        content = retry_content
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "character_chat.repetition_retry_failed "
+                        "character=%s error=%s", card.name, exc,
+                    )
+
         return CharacterTurn(
             character_id=card.id,
             character_name=card.name,
@@ -601,16 +1018,19 @@ class GroupTurnOrchestrator:
         "example_dialog",
         "global_style",
         "rules",
+        "impersonation_guard",       # NEW Phase 13.3 — last system word
     )
     # User section order (fed as the user message for the turn).
     _USER_SECTION_ORDER: tuple[str, ...] = (
-        "lorebook_before_history",   # NEW
+        "group_roster",              # NEW Phase 13.3 — pre-history
+        "lorebook_before_history",
         "history",
         "memory",
         "pulse",
-        "lorebook_before_user_message",  # NEW
+        "lorebook_before_user_message",
         "user_message",
         "prev_turns",
+        "group_nudge",               # NEW Phase 13.3 — post-history
         "instruction",
     )
 
@@ -695,7 +1115,14 @@ class GroupTurnOrchestrator:
                 )
             )
 
-        state_text = _format_state_block(card.state or {})
+        # Phase 13: live session state takes precedence over the
+        # legacy character-scoped ``state`` column. The plugin pre-
+        # populates ``live_state_by_char`` from the RP container; any
+        # other code path (chat-tab character mode, tests) still falls
+        # back to ``card.state`` so this is backward compatible.
+        live_state = (req.live_state_by_char or {}).get(card.id)
+        effective_state = live_state if live_state else (card.state or {})
+        state_text = _format_state_block(effective_state)
         if state_text:
             sections.append(
                 PromptSection(
@@ -720,15 +1147,25 @@ class GroupTurnOrchestrator:
                 )
             )
 
-        others_text = _format_others_block(card, all_cards)
+        others_text = _format_others_block(
+            card, all_cards,
+            live_state_by_char=req.live_state_by_char,
+        )
         if others_text:
             sections.append(
                 PromptSection(
                     name="others",
-                    priority=Priority.LOW,
+                    # Phase 13.5 (C): bumped LOW → MEDIUM so peer states
+                    # survive context-trimming. With LOW the section was
+                    # often dropped under tight budgets, leaving the LLM
+                    # blind to peer locations and free to hallucinate.
+                    priority=Priority.MEDIUM,
                     text=others_text,
                     role="system",
-                    max_tokens=200,
+                    # Higher cap because each peer now carries state
+                    # bits, not just a name. ~50 tokens per peer × 5
+                    # peers = 250 ceiling with headroom.
+                    max_tokens=350,
                 )
             )
 
@@ -808,7 +1245,47 @@ class GroupTurnOrchestrator:
             )
         )
 
+        # Phase 13.3 — impersonation-guard (system, very last). Mirrors
+        # SillyTavern's "[Don't write as {{user}}…]" canned line. Lands
+        # AFTER ``rules`` so it's the last thing in the system block.
+        sections.append(
+            PromptSection(
+                name="impersonation_guard",
+                priority=Priority.MUST,
+                text=(
+                    f"## Du bist NICHT der User\n"
+                    f"Du bist ausschließlich {card.name}. Schreibe nicht "
+                    f"aus der Sicht des Users (Mike). Beschreibe keine "
+                    f"Worte, Gedanken oder Handlungen des Users — der "
+                    f"spricht für sich selbst, in einem eigenen Turn. "
+                    f"Auch keine Worte oder Handlungen anderer "
+                    f"Charaktere — die haben ihre eigenen Turns."
+                ),
+                role="system",
+                max_tokens=120,
+            )
+        )
+
         # ─── USER sections ────────────────────────────────────────────
+        # Phase 13.3 — group roster: pre-history "[Gruppenchat. Anwesend: …]"
+        # marker, modeled after SillyTavern's ``default_new_group_chat_prompt``.
+        # Goes at the very top of the user content so the LLM enters
+        # the chat context with a clear "this is a group" framing.
+        peer_names = [c.name for c in (all_cards or []) if c.name]
+        if peer_names:
+            roster_line = (
+                f"[Gruppenchat. Anwesend: {', '.join(peer_names)}.]"
+            )
+            sections.append(
+                PromptSection(
+                    name="group_roster",
+                    priority=Priority.HIGH,
+                    text=roster_line,
+                    role="user",
+                    max_tokens=80,
+                )
+            )
+
         # Lore that should land in the user-content area (before history
         # or right before the user message).
         if "lorebook_before_history" in lore_sections:
@@ -927,6 +1404,51 @@ class GroupTurnOrchestrator:
                 if not t.skipped and t.content and t.character_id != card.id:
                     last_speaker_name = t.character_name
                     break
+
+        # Phase 13.3 — group nudge (post-history). The single biggest
+        # behavioural lever from the SillyTavern research: stamping
+        # "[Schreibe als <char> + reagiere auf das Letzte + verteilt
+        # die Aufgaben]" right before the LLM generates breaks the
+        # parallel-monologue loop. Lands AFTER prev_turns and before
+        # the final ``instruction`` so the LLM sees it last.
+        if last_speaker_name:
+            nudge_text = (
+                f"[Schreibe die nächste Antwort ausschließlich als "
+                f"{card.name}. Reagiere konkret auf das, was "
+                f"{last_speaker_name} gerade gesagt oder getan hat — "
+                f"keine parallele Wiederholung. **Erfinde KEINE "
+                f"Aktionen oder Aufenthaltsorte für andere Charaktere** "
+                f"— ihr aktueller Zustand steht oben unter 'Andere "
+                f"Anwesende'; nimm den als Fakt. Wenn die Gruppe gerade "
+                f"diskutiert was zu tun ist, übernimm eine konkrete, "
+                f"andere Aufgabe als die anderen — einer sammelt Holz, "
+                f"ein anderer Wasser, ein dritter Essen. Nicht alle "
+                f"das Gleiche.]"
+            )
+        else:
+            nudge_text = (
+                f"[Schreibe die nächste Antwort ausschließlich als "
+                f"{card.name}. Reagiere konkret auf das, was zuletzt "
+                f"passiert ist. **Erfinde KEINE Aktionen oder "
+                f"Aufenthaltsorte für andere Charaktere** — ihr "
+                f"aktueller Zustand steht oben unter 'Andere "
+                f"Anwesende'; nimm den als Fakt. Wenn die Gruppe gerade "
+                f"diskutiert was zu tun ist, übernimm eine konkrete "
+                f"Aufgabe — einer sammelt Holz, ein anderer Wasser, "
+                f"ein dritter Essen. Nicht alle das Gleiche.]"
+            )
+        sections.append(
+            PromptSection(
+                name="group_nudge",
+                # MUST so it survives any token trimming. This is the
+                # last thing the LLM reads before generating, and it's
+                # the spine of the group dynamic.
+                priority=Priority.MUST,
+                text=nudge_text,
+                role="user",
+                max_tokens=200,
+            )
+        )
 
         instruction_text = _build_instruction(
             card_name=card.name,
@@ -1115,9 +1637,20 @@ def _format_history_tail(
 
 
 def _format_others_block(
-    card: CharacterCard, all_cards: list[CharacterCard]
+    card: CharacterCard,
+    all_cards: list[CharacterCard],
+    live_state_by_char: dict[str, dict[str, str]] | None = None,
 ) -> str:
-    """Render the '## Andere Anwesende' block with relationship hints."""
+    """Render the '## Andere Anwesende' block with relationship hints.
+
+    Phase 13.5 (C): when ``live_state_by_char`` is provided, each peer
+    line ALSO carries their current ``location`` / ``last_action`` so
+    this char can react truthfully instead of inventing scenes for
+    others. Mike's Castaway log: Sandra hallucinated 'Mira tritt aus
+    den Palmen mit einem Becher' while Mira was in the lagoon — the
+    LLM had no way to know Mira's actual location was 'lagune'.
+    """
+    state_by_id = live_state_by_char or {}
     lines: list[str] = []
     for other in all_cards or []:
         if other.id == card.id:
@@ -1125,13 +1658,34 @@ def _format_others_block(
         rel = card.relationships.get(other.id) or other.relationships.get(
             card.id
         )
+        # Build a "currently" suffix from the most truth-y state keys.
+        st = state_by_id.get(other.id) or {}
+        bits: list[str] = []
+        loc = st.get("location") or ""
+        if loc:
+            bits.append(f"Ort: {loc}")
+        last_act = st.get("last_action") or ""
+        if last_act:
+            bits.append(f"macht: {last_act}")
+        mood = st.get("mood") or ""
+        if mood:
+            bits.append(f"Stimmung: {mood}")
+        currently = (" — " + "; ".join(bits)) if bits else ""
+
+        head = f"- {other.name}"
         if rel:
-            lines.append(f"- {other.name}: {rel}")
-        else:
-            lines.append(f"- {other.name}")
+            head += f" ({rel})"
+        lines.append(f"{head}{currently}")
     if not lines:
         return ""
-    return "## Andere Anwesende\n" + "\n".join(lines)
+    return (
+        "## Andere Anwesende — was sie GERADE tun (Wahrheit für deinen Turn)\n"
+        + "\n".join(lines)
+        + "\n\n**Wichtig**: Erfinde KEINE Aktionen oder Aufenthaltsorte für "
+        "diese Charaktere. Nimm die hier genannte Realität als Fakt — "
+        "wenn du nicht weisst was sie tun, frag oder reagier nur auf "
+        "das, was du in den letzten Reaktionen liest."
+    )
 
 
 def _assemble_sections(

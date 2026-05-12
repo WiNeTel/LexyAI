@@ -11,13 +11,13 @@
       JSON.parse a PNG and failed with "unexpected character at line 1
       column 1". Bump the date string when shipping a frontend change.
     -->
-    <link rel="stylesheet" href="/static/style.css?v=20260506g" />
-    <link rel="stylesheet" href="/static/holo.css?v=20260506g" />
+    <link rel="stylesheet" href="/static/style.css?v=20260507a" />
+    <link rel="stylesheet" href="/static/holo.css?v=20260507a" />
     <!-- Three.js for 3D Avatar Stage. Bundled locally so Lexy works
          offline / on air-gapped LANs (cdnjs blocked or unreachable).
          Falls back gracefully — holo.js uses ``typeof THREE === 'undefined'``
          to skip the avatar stage when the script didn't load. -->
-    <script src="/static/vendor/three.min.js?v=20260506g" defer></script>
+    <script src="/static/vendor/three.min.js?v=20260507a" defer></script>
 </head>
 <body>
 
@@ -489,11 +489,21 @@
                             <input type="text" id="char-form-tags" placeholder="rp, family, baby (komma-separiert)" />
                         </div>
 
+                        <!-- Phase 13: per-character state-fields are gone.
+                             State now lives in the RP-Session — Mike
+                             configures the tracked stats per session
+                             (e.g. "clothing=nackt; mood; hunger") in
+                             the session modal. -->
+
                         <div class="setting-row">
                             <label>&nbsp;</label>
                             <div class="characters-form-buttons">
                                 <button type="submit" class="btn primary" id="char-form-save">Speichern</button>
                                 <button type="button" class="btn" id="char-form-reset">Neuer Charakter</button>
+                                <button type="button" class="btn" id="char-form-preview-prompt" hidden
+                                        title="Zeigt den System-Prompt der an die LLM gehen würde — perfekt zum debuggen wenn ein Charakter Sachen erwähnt die er nicht tragen sollte.">
+                                    👁 Prompt-Vorschau
+                                </button>
                                 <button type="button" class="btn" id="char-form-attach" hidden>An aktive Session</button>
                                 <button type="button" class="btn" id="char-form-detach" hidden>Aus Session entfernen</button>
                                 <button type="button" class="btn" id="char-form-archive" hidden>Archivieren</button>
@@ -505,6 +515,27 @@
                     </form>
                 </div>
             </section>
+
+            <!-- ─── Prompt-Preview Modal (Hotfix Phase 12) ─────────────
+                 Lets the user see exactly what's sent to the LLM for
+                 a character — quick way to find which input field
+                 (persona / scenario / greeting / example_dialog)
+                 contains stale clothing / posture text. -->
+            <div id="char-prompt-preview-modal" class="modal-wrap" hidden>
+                <div class="modal char-prompt-preview-modal">
+                    <header class="modal-head">
+                        <h3 id="char-prompt-preview-title">Prompt-Vorschau</h3>
+                        <button class="btn icon" id="char-prompt-preview-close" title="Schließen">✕</button>
+                    </header>
+                    <div class="modal-body">
+                        <div id="char-prompt-preview-summary" class="prompt-preview-summary"></div>
+                        <details open>
+                            <summary>Vollständiger Prompt</summary>
+                            <pre id="char-prompt-preview-pre" class="prompt-preview-pre"></pre>
+                        </details>
+                    </div>
+                </div>
+            </div>
 
             <!-- ─── Roleplay tab (Phase 9.12) ──────────────────────────
                  Eigener Chat-Bereich für Charakter-Sessions. Dasselbe
@@ -1103,12 +1134,15 @@
                         </div>
                     </label>
                     <label class="wipe-option">
-                        <input type="checkbox" id="wipe-opt-sessions" checked />
+                        <input type="checkbox" id="wipe-opt-sessions" />
                         <div>
                             <strong>Conversation History</strong>
                             <div class="muted">
-                                Alle Session-Histories (die letzten 20 Messages pro
-                                Session) werden geleert. Live-Chats werden nicht abgebrochen.
+                                ⚠ <strong>Auch alle Sessions</strong> (Chat + RP) werden
+                                gelöscht — inklusive Charakter-Turns + Session-Lorebooks.
+                                Standardmäßig <strong>aus</strong>: ein Memory-Wipe soll
+                                nur die Vector-DB leeren, nicht deine Conversation-History.
+                                Nur ankreuzen wenn du wirklich ALLES löschen willst.
                             </div>
                         </div>
                     </label>
@@ -1198,6 +1232,47 @@
     <div id="session-context-menu" class="session-context-menu" hidden>
         <div class="scm-header muted">In Projekt verschieben…</div>
         <div id="scm-list"></div>
+    </div>
+
+    <!-- ─── RP-Session Create Modal (Phase 13) ───────────────────────
+         Opens when the user clicks "Neue RP-Session". Lets them give
+         the session a name and configure which stats to track per
+         character (e.g. "clothing=nackt; posture; mood; hunger").
+         Stats are session-scoped — characters no longer carry their
+         own state defaults. -->
+    <div id="rp-create-modal" class="modal-wrap" hidden>
+        <div class="modal rp-create-modal">
+            <header class="modal-head">
+                <h3>🆕 Neue Rollenspiel-Session</h3>
+                <button class="btn icon" id="rp-create-close" title="Abbrechen">✕</button>
+            </header>
+            <div class="modal-body">
+                <div class="setting-row">
+                    <label for="rp-create-title">Name <span class="muted">(optional)</span></label>
+                    <input type="text" id="rp-create-title"
+                           placeholder="z.B. Insel-Szenario, Schule, Familie…" />
+                </div>
+                <div class="setting-row">
+                    <label for="rp-create-scene">Szene <span class="muted">(optional)</span></label>
+                    <textarea id="rp-create-scene" rows="2"
+                              placeholder="Wo seid ihr, wie ist die Stimmung?"></textarea>
+                </div>
+                <div class="setting-row">
+                    <label for="rp-create-stats">State-Tracking</label>
+                    <input type="text" id="rp-create-stats"
+                           placeholder="Clothing=nackt; Posture=stehend; Mood; Hunger" />
+                </div>
+                <div class="muted rp-create-hint">
+                    Semicolon-getrennte <code>key=wert</code>-Liste. <code>=wert</code> ist optional —
+                    es setzt einen Default. Diese Stats werden für ALLE Charaktere in dieser
+                    Session getrackt. Beispiele: <code>clothing=nackt; mood; hunger</code>.
+                </div>
+            </div>
+            <footer class="modal-footer">
+                <button class="btn" id="rp-create-cancel">Abbrechen</button>
+                <button class="btn primary" id="rp-create-submit">Anlegen</button>
+            </footer>
+        </div>
     </div>
 
     <!-- ─── Character session modal (chat-toolbar popout) ────────── -->
@@ -1321,7 +1396,7 @@
     <!-- HoloMat layer loads BEFORE app.js so window.LexyHolo is available.
          ``?v=…`` matches the head-tag version so the bundle stays
          consistent across cache layers. -->
-    <script src="/static/holo.js?v=20260506g"></script>
-    <script src="/static/app.js?v=20260506g"></script>
+    <script src="/static/holo.js?v=20260507a"></script>
+    <script src="/static/app.js?v=20260507a"></script>
 </body>
 </html>

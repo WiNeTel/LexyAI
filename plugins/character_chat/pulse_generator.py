@@ -56,12 +56,23 @@ class PulseGenerator:
         others_in_session: list[CharacterCard],
         recent_history: list[dict[str, Any]],
         scene: str = "",
+        style_guidance: str = "",
     ) -> str:
         """Return a single-sentence-or-two pulse text for ``character``.
 
         Returns ``""`` if the LLM call fails or produces nothing usable —
         the caller falls back to ``character.proactive_pulse_prompt`` or
         the static age-stage default in that case.
+
+        ``style_guidance`` (Phase 13.5 — bugfix to 13.5 A): when the
+        card has a hand-written ``proactive_pulse_prompt`` this is now
+        injected here as INSTRUCTION for the LLM, not used as the pulse
+        text directly. The Castaway scenario's prompts are imperative
+        templates ("Lena REAGIERT auf einen anderen Charakter
+        NAMENTLICH. Wähle EINS: ..."); using them verbatim as visible
+        chat content (Phase 13.5 A regression) leaked the templates
+        into the chat. Now the generator reads them as guidance and
+        produces narrative output that *follows* them.
         """
         history_blurb = _format_history_tail(
             recent_history, limit=self._history_window
@@ -92,12 +103,22 @@ class PulseGenerator:
             user_parts.append(f"## Szene\n{scene.strip()}")
         if history_blurb:
             user_parts.append(f"## Letzte Chat-Zeilen\n{history_blurb}")
+        if style_guidance.strip():
+            user_parts.append(
+                "## Aktions-Vorgabe für DIESEN Pulse (Anweisung, "
+                "nicht Text — folge ihr inhaltlich, schreib aber "
+                "NARRATIV in *Sternchen* + Dialog)\n"
+                f"{style_guidance.strip()}"
+            )
         user_parts.append(
             "## Was tust du jetzt?\n"
             "Eine plausible Folgeaktion oder eine Frage an genau eine der "
             "anderen Personen. Sei konkret (z.B. 'geht zur Kaffeemaschine', "
             "'fragt Drell ob er den Antrieb gecheckt hat'). KEINE inneren "
-            "Monologe, KEINE Sätze die mit 'Ich denke' beginnen."
+            "Monologe, KEINE Sätze die mit 'Ich denke' beginnen. "
+            "WICHTIG: schreib NARRATIV (Aktion in *Sternchen* + Dialog) — "
+            "NICHT die Anweisung selbst zurückgeben, sondern eine "
+            "konkrete Handlung die ihr entspricht."
         )
 
         try:
