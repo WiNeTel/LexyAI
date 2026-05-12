@@ -154,11 +154,25 @@
         );
         console.info(
             "avatar.loader: asset contains "
-            + animationGroups.length + " animation group(s), "
+            + animationGroups.length + " animation group(s) ("
+            + animationGroups.map((a) => a && a.name).join(", ")
+            + "), "
             + skeletonRanges.length + " skeleton range(s), "
             + (result.skeletons || []).length + " skeleton(s)"
         );
-        for (const ag of animationGroups) {
+        // Skip reference / bind-pose clips — many Mixamo exports ship a
+        // "TPose" clip that snaps every bone to T-pose every frame. If
+        // we start it alongside the actual idle, last-write-wins and
+        // the avatar gets stuck in T-pose. Same for "rest" / "bind"
+        // named clips. We loop the rest.
+        const REF_POSE_RE = /^(tpose|t.?pose|rest|bind|reference)/i;
+        const startable = animationGroups.filter(
+            (a) => a && a.name && !REF_POSE_RE.test(a.name)
+        );
+        const skipped = animationGroups.filter(
+            (a) => a && a.name && REF_POSE_RE.test(a.name)
+        );
+        for (const ag of startable) {
             try {
                 ag.start(true);  // true = loop
             } catch (err) {
@@ -166,19 +180,25 @@
                     ag && ag.name, err);
             }
         }
-        if (animationGroups.length > 0) {
+        if (startable.length > 0) {
             console.info(
-                "avatar.loader: started " + animationGroups.length
+                "avatar.loader: started " + startable.length
                 + " animation group(s): "
-                + animationGroups.map((a) => a && a.name).join(", ")
+                + startable.map((a) => a && a.name).join(", ")
             );
-        } else {
+        }
+        if (skipped.length > 0) {
+            console.info(
+                "avatar.loader: skipped " + skipped.length
+                + " reference-pose clip(s): "
+                + skipped.map((a) => a && a.name).join(", ")
+            );
+        }
+        if (animationGroups.length === 0) {
             console.warn(
                 "avatar.loader: GLB has NO embedded animation clips — "
-                + "avatar will sit in its rest pose (T-pose for most "
-                + "Mixamo exports). Drop in an idle.glb or pick a "
-                + "different test asset via "
-                + "scripts/vendor_test_avatar.bat soldier"
+                + "avatar will sit in its rest pose. Pick a different "
+                + "test asset via scripts/vendor_test_avatar.bat soldier"
             );
         }
 
