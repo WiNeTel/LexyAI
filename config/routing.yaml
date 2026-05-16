@@ -2,7 +2,10 @@
 # Two-Brain Architecture: E4B (fast) ↔ A4B (deep)
 
 routing:
-  default_brain: "e4b"
+  # Qwen3.6 (a4b-slot) ist jetzt der einzige Brain. E4B-Regeln unten
+  # bleiben drin — der LLM-Client routet sie via _resolve()-Fallback
+  # auf den default_brain um, wenn :5006 nicht erreichbar ist.
+  default_brain: "a4b"
 
   # Pattern-Matches gegen Klassifikations-Output (z.B. "code", "simple_chat")
   rules:

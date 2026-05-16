@@ -13,6 +13,6 @@ def test_load_default_config() -> None:
     assert "a4b" in cfg.brains
     assert cfg.e4b.endpoint.startswith("http://")
     assert cfg.memory.chroma_port == 8000
-    assert cfg.voice.stt.primary == "voice_gemma4"
+    assert cfg.voice.stt.primary == "voice_canary"
     assert cfg.routing.default_brain == "a4b"
     assert cfg.system.profile in {"chat", "voice", "full"}
