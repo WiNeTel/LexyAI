@@ -148,6 +148,22 @@ class LexyLLM:
     def _resolve(self, brain: str) -> tuple[str, BrainConfig, httpx.AsyncClient]:
         if brain == "auto":
             brain = self._default_brain
+        # Wenn connect() schon lief und das angefragte Brain damals als
+        # unreachable markiert wurde (kein Eintrag in self._clients),
+        # routen wir auf den default_brain um. So koennen E4B-Requests
+        # weiterlaufen, wenn nur das Hauptmodell auf :5005 lebt.
+        if (
+            self._connected
+            and brain not in self._clients
+            and brain != self._default_brain
+            and self._default_brain in self._clients
+        ):
+            log.info(
+                "llm.brain_fallback",
+                requested=brain,
+                fallback=self._default_brain,
+            )
+            brain = self._default_brain
         cfg = self._config.get_brain(brain)
         client = self._clients.get(brain)
         if client is None:

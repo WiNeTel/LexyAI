@@ -59,13 +59,17 @@ server:
 # server handles text and audio requests side by side.
 brains:
   a4b:
-    model: "gemma-4-26b-a4b-it"
+    # Qwen3.6-35B-A3B MoE (3 B aktive Params) auf der P40. Belegt den
+    # A4B-Slot und uebernimmt sowohl fast-chat als auch deep-reasoning,
+    # weil der E4B-Server nicht mehr laeuft. Modell-Datei waehlt der
+    # Launcher (scripts/start_llm_qwen.bat) interaktiv. Alias-Wert muss
+    # zum --alias-Flag im Launcher passen.
+    model: "qwen3.6-35b-a3b"
     endpoint: "http://127.0.0.1:5005/v1"
     api_key: "sk-lexy-local"
-    # MUSS zur --ctx-size in scripts/start_llm_main.bat passen. Der Server
-    # läuft mit 32768; stand hier 16384 → Context-Budget-Manager hat Prompts
-    # unnötig auf die Hälfte getrimmt. Tesla P40 mit 24 GB VRAM trägt 32k
-    # problemlos (mit swa-full und mlock).
+    # MUSS zur --ctx-size in scripts/start_llm_qwen.bat passen.
+    # 32k als sicherer Startwert; Qwen3.6 kann bis 128k, aber dann wird
+    # die P40 mit Canary parallel zu eng.
     context_size: 32768
     max_tokens: 4096
     temperature: 0.7
@@ -73,9 +77,10 @@ brains:
     top_k: 40
     repeat_penalty: 1.1
     timeout: 180.0
-    # A4B is the reasoning brain — always think before answering.
-    thinking: true
-    reasoning_budget: 2048
+    # Qwen3 nutzt KEIN <|think|>-Token wie Gemma. Native <thinking>-Tags
+    # werden erst spaeter unterstuetzt (eigener Inject-Pfad). Bis dahin
+    # ohne Thinking-Mode laufen lassen.
+    thinking: false
 
   e4b:
     model: "gemma-4-e4b-it"
@@ -114,11 +119,11 @@ voice:
   sample_rate: 24000
 
   stt:
-    primary: "voice_gemma4"
-    fallback: "voice_canary"
-    # The E4B multimodal server on :5006 handles vision AND audio in
-    # one process — voice_gemma4 plugin points at this endpoint too.
-    # Only override this if you run a separate STT-only server.
+    # Canary primary, weil E4B-Server (:5006) im Qwen-Setup nicht mehr
+    # laeuft. voice_gemma4 bleibt als Fallback registriert — no-op
+    # solange :5006 down ist.
+    primary: "voice_canary"
+    fallback: "voice_gemma4"
     endpoint: "http://127.0.0.1:5006/v1"
 
   tts:

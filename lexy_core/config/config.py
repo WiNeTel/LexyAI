@@ -94,9 +94,9 @@ class BrainConfig(BaseModel):
 
 
 class STTConfig(BaseModel):
-    primary: str = "voice_gemma4"
-    fallback: str = "voice_canary"
-    endpoint: str = "http://127.0.0.1:5007/v1"
+    primary: str = "voice_canary"
+    fallback: str = "voice_gemma4"
+    endpoint: str = "http://127.0.0.1:5006/v1"
 
 
 class TTSConfig(BaseModel):

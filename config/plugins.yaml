@@ -83,7 +83,10 @@ spotify:
   client_secret: ''
   market: DE
 voice_canary:
-  device: cuda:0
+  # cuda:1 = Tesla P40. Laeuft neben Qwen3.6 auf der P40, weil die
+  # 3060 Ti durch User-Apps voll ist. Canary 1B braucht ~2-3 GB, plus
+  # Qwen ~16 GB = ~19 GB von 24 GB auf der P40.
+  device: cuda:1
   language: de
 voice_cosyvoice:
   emotion_pipeline: true
