@@ -106,7 +106,6 @@ class LexyLLM:
                     "Content-Type": "application/json",
                 },
             )
-            self._clients[brain_name] = client
 
             try:
                 # /health lives at the root, not under /v1
@@ -122,6 +121,11 @@ class LexyLLM:
                 )
                 healthy = False
             if healthy:
+                # Nur healthy Brains in self._clients halten — sonst
+                # greift der _resolve()-Fallback nicht und Requests an
+                # ein totes Brain (z.B. e4b im Qwen-Setup) crashen mit
+                # "All connection attempts failed".
+                self._clients[brain_name] = client
                 ok_any = True
                 log.info(
                     "llm.brain_ready",
@@ -130,6 +134,10 @@ class LexyLLM:
                     model=brain_cfg.model,
                     thinking=brain_cfg.thinking,
                 )
+            else:
+                # Client wird nicht gespeichert -> sauber schliessen,
+                # damit kein Socket-Leak entsteht.
+                await client.aclose()
         self._connected = ok_any
         return ok_any
 
