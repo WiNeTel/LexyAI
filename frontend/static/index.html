@@ -2,7 +2,8 @@
 <html lang="de" data-theme="cyber-blue">
 <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#0b0e14" />
     <title>Lexy AI</title>
     <!--
       Cache-bust: every Lexy update bumps ?v=... here so browsers pick
@@ -11,9 +12,9 @@
       JSON.parse a PNG and failed with "unexpected character at line 1
       column 1". Bump the date string when shipping a frontend change.
     -->
-    <link rel="stylesheet" href="/static/style.css?v=20260507a" />
+    <link rel="stylesheet" href="/static/style.css?v=20260601a" />
     <link rel="stylesheet" href="/static/holo.css?v=20260507a" />
-    <link rel="stylesheet" href="/static/avatar-world/avatar-world.css?v=20260512b" />
+    <link rel="stylesheet" href="/static/avatar-world/avatar-world.css?v=20260601a" />
     <!-- Three.js for 3D Avatar Stage. Bundled locally so Lexy works
          offline / on air-gapped LANs (cdnjs blocked or unreachable).
          Falls back gracefully — holo.js uses ``typeof THREE === 'undefined'``
@@ -73,6 +74,21 @@
 
     <!-- ═══ MAIN APPLICATION ════════════════════════════════════════ -->
     <div id="app">
+        <!-- ─── Mobile top bar (nur ≤820px sichtbar, siehe style.css) ─
+             Gibt auf dem Handy Zugriff auf die Sidebar-Navigation, die
+             sonst bei schmalen Screens als Drawer weggeschoben wird. -->
+        <div id="mobile-topbar">
+            <button id="nav-hamburger" class="nav-hamburger" aria-label="Navigation öffnen" aria-expanded="false" aria-controls="sidebar">
+                <span></span><span></span><span></span>
+            </button>
+            <div class="mobile-topbar-brand">
+                <span class="mobile-topbar-logo">L</span>
+                <span class="mobile-topbar-name">Lexy AI</span>
+            </div>
+        </div>
+        <!-- Abdunkelnder Hintergrund hinter dem offenen Nav-Drawer -->
+        <div id="nav-backdrop" hidden></div>
+
         <!-- ─── Sidebar ────────────────────────────────────────────── -->
         <aside id="sidebar">
             <div class="brand">
@@ -1424,6 +1440,7 @@
          consistent across cache layers. -->
     <script src="/static/holo.js?v=20260507a"></script>
     <script src="/static/app.js?v=20260507a"></script>
+    <script src="/static/mobile-nav.js?v=20260601a"></script>
 
     <!-- Avatar World — order matters: net first (registers handlers),
          then shared constants (morph_map), then scene + loader, then

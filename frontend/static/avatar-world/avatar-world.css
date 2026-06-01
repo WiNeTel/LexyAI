@@ -43,6 +43,22 @@
     display: none !important;
 }
 
+/* ── Mobile: PiP verkleinern und nach oben holen ──────────────────
+   Mit 360px fixer Breite würde die PiP auf einem ~390px-Handy fast
+   den ganzen Screen einnehmen und den Composer unten überdecken.
+   Auf schmalen Screens daher ein kleines Thumbnail oben rechts,
+   unterhalb der Mobile-Topbar. Ambient/Conversation-Modi (vom User
+   bewusst gewählt) bleiben groß. */
+@media (max-width: 600px) {
+    .lexy-avatar-pip {
+        width: 132px;
+        height: 88px;
+        right: 8px;
+        bottom: auto;
+        top: calc(58px + env(safe-area-inset-top));
+    }
+}
+
 .lexy-avatar-pip canvas {
     width: 100%;
     height: 100%;
