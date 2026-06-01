@@ -147,6 +147,13 @@ def test_advance_on_empty_world_is_safe() -> None:
     assert rwt.snapshot(world) == {}
 
 
+def test_open_demands_reads_without_advancing() -> None:
+    world = _baby_world(72.0)            # already above the 70 threshold
+    demands = rwt.open_demands(world)
+    assert any(d.need == "feed_baby" for d in demands)
+    assert rwt.snapshot(world) == {"baby": {"hunger": 72.0}}   # NOT advanced
+
+
 # ─── caregiver + shared awareness (multi-chat) ────────────────────────
 
 
