@@ -1929,21 +1929,130 @@ textarea:focus, select:focus {
     border-radius: 3px;
 }
 
+/* ═══ Mobile nav (Hamburger + Drawer) ════════════════════════════
+   Auf dem Desktop sind Topbar + Backdrop unsichtbar; die Sidebar ist
+   die normale Grid-Spalte. Ab ≤820px (siehe Media-Query unten) wird
+   die Sidebar zu einem von links einschiebbaren Drawer und die Topbar
+   mit dem Hamburger-Button erscheint. */
+#mobile-topbar { display: none; }
+#nav-backdrop { display: none; }
+
+.nav-hamburger {
+    display: inline-flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 5px;
+    width: 42px; height: 42px;
+    padding: 0 9px;
+    background: var(--bg-3);
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+.nav-hamburger span {
+    display: block; height: 2px; width: 100%;
+    background: var(--text);
+    border-radius: 2px;
+    transition: 0.2s transform, 0.2s opacity;
+}
+body.nav-open .nav-hamburger span:nth-child(1) { transform: translateY(7px) rotate(45deg); }
+body.nav-open .nav-hamburger span:nth-child(2) { opacity: 0; }
+body.nav-open .nav-hamburger span:nth-child(3) { transform: translateY(-7px) rotate(-45deg); }
+
+.mobile-topbar-brand { display: flex; align-items: center; gap: 9px; }
+.mobile-topbar-logo {
+    width: 30px; height: 30px; border-radius: 8px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-dim));
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 17px; color: #fff;
+}
+.mobile-topbar-name { font-size: 15px; font-weight: 600; }
+
 /* Dashboard Responsive */
 @media (max-width: 1200px) {
     .dashboard-grid { grid-template-columns: repeat(3, 1fr); }
 }
 
 @media (max-width: 820px) {
-    #app { grid-template-columns: 1fr; }
-    #sidebar { display: none; }
+    /* App wird zur vertikalen Spalte: [Topbar][Main] — die Sidebar
+       liegt als fixed Drawer darüber (außerhalb des Flow). */
+    #app {
+        display: flex;
+        flex-direction: column;
+    }
+    #mobile-topbar {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        flex: 0 0 auto;
+        padding: 8px 12px;
+        padding-top: max(8px, env(safe-area-inset-top));
+        background: var(--bg-2);
+        border-bottom: 1px solid var(--border);
+    }
+    #main { flex: 1 1 auto; min-height: 0; }
+
+    /* Sidebar → Slide-in-Drawer */
+    #sidebar {
+        position: fixed;
+        top: 0; left: 0; bottom: 0;
+        width: min(284px, 84vw);
+        z-index: 200;
+        transform: translateX(-100%);
+        transition: transform 0.25s ease;
+        box-shadow: 4px 0 24px rgba(0, 0, 0, 0.5);
+        border-right: 1px solid var(--border-2);
+    }
+    body.nav-open #sidebar { transform: translateX(0); }
+
+    /* Backdrop hinter dem offenen Drawer */
+    #nav-backdrop {
+        display: block;
+        position: fixed; inset: 0;
+        z-index: 150;
+        background: rgba(0, 0, 0, 0.55);
+        opacity: 0;
+        visibility: hidden;
+        transition: opacity 0.2s ease, visibility 0.2s ease;
+    }
+    body.nav-open #nav-backdrop { opacity: 1; visibility: visible; }
+    #nav-backdrop[hidden] { display: block; }  /* via JS gesteuert, hidden ignorieren */
+
+    /* Tab-Header: Controls dürfen umbrechen statt zu überlaufen */
+    .tab-header {
+        flex-wrap: wrap;
+        gap: 8px 10px;
+        padding: 10px 14px;
+    }
+    .tab-header .controls { flex-wrap: wrap; gap: 8px; }
+
+    /* Layouts einspaltig */
     .session-layout { grid-template-columns: 1fr; }
     .sched-layout { grid-template-columns: 1fr; }
     .dashboard-grid { grid-template-columns: repeat(2, 1fr); }
+
+    /* Chat: mehr Platz für Text, weniger Rand */
+    #chat-window, #rp-chat-window { padding: 14px; }
+    .msg { max-width: 94%; }
+    #composer, #rp-composer { padding: 10px 12px; gap: 8px; }
+    #composer { padding-bottom: max(10px, env(safe-area-inset-bottom)); }
 }
 
 @media (max-width: 500px) {
     .dashboard-grid { grid-template-columns: 1fr; }
+    .tab-header .title { font-size: 14px; }
+    /* Bubble-Varianten: volle Breite ausnutzen */
+    .msg, .tool-bubble-wrap, .reasoning-wrap, .brain-badge-wrap { max-width: 100%; }
+}
+
+/* ── Touch-Feedback ───────────────────────────────────────────────
+   Auf Touch-Geräten gibt es kein :hover → ein gedrücktes :active
+   liefert sichtbares Feedback beim Antippen. */
+@media (hover: none) {
+    .btn:active { background: var(--bg-4); transform: translateY(1px); }
+    .tab-btn:active { background: rgba(255,255,255,0.06); }
+    .char-card:active { border-color: var(--accent); }
 }
 
 /* ─── Character Chat ──────────────────────────────────────────────── */
