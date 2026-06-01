@@ -55,6 +55,7 @@ from .lorebook_store import (
 )
 from .mention_parser import parse_nl_mentions
 from .pulse_generator import PulseGenerator
+from . import rp_world_tools
 from .rp_session_registry import RPSessionRegistry
 from .rp_session_store import (
     MemoryBackend,
@@ -971,6 +972,9 @@ class CharacterChatPlugin(BasePlugin):
             )
         except (TypeError, ValueError):
             self._lexy_turn_probability = 0.3
+        # Coordination kernel: brain used by the Referee when adjudicating
+        # whether a narrated action satisfied a demand (B4c sim-loop).
+        self._referee_brain = str(cfg.get("referee_brain", "e4b") or "e4b")
 
         # Context window overrides. Positive = force this size; 0 = auto
         # from brain. Safety margin reserves room for tokenizer overhead
@@ -1054,6 +1058,29 @@ class CharacterChatPlugin(BasePlugin):
                 "in welcher Reihenfolge (sequentielles Prompting)."
             ),
             schema=RUN_ROUND_SCHEMA,
+        )
+        # Coordination kernel: per-scene world-state authoring. Defining a
+        # need turns a scene into a simulation (a value that drifts and, on
+        # crossing a threshold, demands a character actually act — not just
+        # comment). See docs/architecture/agent-coordination.md.
+        self.api.register_tool(
+            name="rp_define_need",
+            handler=self._tool_rp_define_need,
+            description=(
+                "Definiere/ersetze ein numerisches Beduerfnis einer Scene-"
+                "Entity (z.B. baby.hunger, +2.5/min, ab 70 'feed_baby', ab "
+                "100 'baby_sick'). Macht die Scene zur Simulation mit Konsequenz."
+            ),
+            schema=rp_world_tools.DEFINE_NEED_SCHEMA,
+        )
+        self.api.register_tool(
+            name="rp_world_snapshot",
+            handler=self._tool_rp_world_snapshot,
+            description=(
+                "Zeige den aktuellen Welt-Zustand einer RP-Session (Werte je "
+                "Entity/Attribut + definierte Beduerfnisse)."
+            ),
+            schema=rp_world_tools.WORLD_SNAPSHOT_SCHEMA,
         )
 
         self.api.register_tool(
@@ -2080,6 +2107,63 @@ class CharacterChatPlugin(BasePlugin):
         }
 
     # ─── Tool handlers ───────────────────────────────────────────────────
+
+    async def _tool_rp_define_need(self, **kwargs: Any) -> dict[str, Any]:
+        """Define/replace a numeric need on a scene entity (per-scene authoring).
+
+        A scene with at least one need becomes a simulation: the value drifts
+        at ``rate_per_minute`` and crossing a threshold raises a demand the
+        sim-loop drives a character to act on. Re-defining the same
+        ``(entity, attribute)`` replaces it.
+        """
+        session_id = str(kwargs.get("session_id", "") or "")
+        container = await self._get_rp_container(session_id)
+        if container is None:
+            return {"ok": False, "error": "no_rp_session"}
+        entity = str(kwargs.get("entity", "") or "").strip()
+        attribute = str(kwargs.get("attribute", "") or "").strip()
+        if not entity or not attribute:
+            return {"ok": False, "error": "entity_and_attribute_required"}
+        try:
+            world = await container.get_world()
+            world = rp_world_tools.define_need(
+                world,
+                entity=entity,
+                attribute=attribute,
+                value=float(kwargs.get("value", 0.0) or 0.0),
+                minimum=float(kwargs.get("minimum", 0.0) or 0.0),
+                maximum=float(kwargs.get("maximum", 100.0) or 100.0),
+                rate_per_minute=float(kwargs.get("rate_per_minute", 0.0) or 0.0),
+                thresholds=list(kwargs.get("thresholds") or []),
+                minutes_per_tick=float(self._simulation_default_interval),
+            )
+            await container.set_world(world)
+        except (ValidationError, ValueError, TypeError) as exc:
+            return {"ok": False, "error": str(exc)}
+        log.info(
+            "character_chat.rp_need_defined",
+            session_id=session_id,
+            entity=entity,
+            attribute=attribute,
+        )
+        return {
+            "ok": True,
+            "snapshot": rp_world_tools.snapshot(world),
+            "needs": rp_world_tools.list_needs(world),
+        }
+
+    async def _tool_rp_world_snapshot(self, **kwargs: Any) -> dict[str, Any]:
+        """Return the scene's current world-state values + defined needs."""
+        session_id = str(kwargs.get("session_id", "") or "")
+        container = await self._get_rp_container(session_id)
+        if container is None:
+            return {"ok": False, "error": "no_rp_session"}
+        world = await container.get_world()
+        return {
+            "ok": True,
+            "snapshot": rp_world_tools.snapshot(world),
+            "needs": rp_world_tools.list_needs(world),
+        }
 
     async def _tool_spawn_character(self, **kwargs: Any) -> dict[str, Any]:
         """Create a character, optionally auto-attach + register pulses.
