@@ -1996,53 +1996,56 @@ class CharacterChatPlugin(BasePlugin):
 
     # ─── Coordination kernel: world-state demand handling ────────────
 
-    async def _maybe_run_world_demand(
-        self,
-        session_id: str,
-        scene: str,
-        characters: list[CharacterCard],
-    ) -> bool:
-        """Advance the scene's world-state and drive one open demand.
+    async def _build_scene_awareness(
+        self, session_id: str, characters: list[CharacterCard]
+    ) -> tuple[str, dict[str, Any], list[Any]]:
+        """Shared awareness + caregiver obligations for the current round.
 
-        Returns ``True`` when the scene HAS a defined world-state (so the
-        caller skips the generic topic round), ``False`` when there is no
-        simulation configured for this session (→ fall back to topic).
-
-        Flow per tick: advance numbers → pick the most urgent open demand →
-        run a demand-aware round so a present character narrates an action →
-        the :class:`Referee` rules whether that narration actually resolved
-        it → satisfied lowers the value, unmet leaves it open to escalate.
+        Read-only — returns ``(scene_awareness, obligations_by_char,
+        open_demands)`` from the session world-state WITHOUT advancing time
+        (time passes only on the sim tick). Empty/no-op when the scene has no
+        simulation defined.
         """
         container = await self._get_rp_container(session_id)
         if container is None:
-            return False
+            return "", {}, []
         world = await container.get_world()
         if not (isinstance(world, dict) and world.get("specs")):
-            return False  # no simulation defined → caller uses topic round
-
-        world, demands = rp_world_tools.advance(world)
+            return "", {}, []
+        demands = rp_world_tools.open_demands(world)
         if not demands:
-            await container.set_world(world)  # persist drift; nothing to act on
-            return True
+            return "", {}, []
+        present = [
+            {"id": c.id, "name": c.name, "age_stage": c.age_stage}
+            for c in characters
+        ]
+        awareness, obligations = rp_world_tools.build_awareness(
+            world, demands, present
+        )
+        return awareness, obligations, demands
 
+    async def _resolve_open_demands(
+        self, session_id: str, demands: list[Any], turns: list[Any]
+    ) -> None:
+        """Let the Referee judge whether this round's narration met a demand.
+
+        Adjudicates the single most-urgent open demand against the round's
+        collected narration. Satisfied → lower the value (resolve)+persist;
+        unmet → leave it open (the sim tick escalates). Broadcasts the world
+        update so the UI reflects the current state.
+        """
+        if not demands:
+            return
+        narration = self._collect_narration(
+            {"turns": [_turn_to_public(t) for t in turns]}
+        )
+        if not narration:
+            return  # nobody acted this round → demand stays open
+        container = await self._get_rp_container(session_id)
+        if container is None:
+            return
+        world = await container.get_world()
         demand = max(demands, key=lambda d: d.urgency)
-
-        narration = ""
-        if self._orchestrator is not None:
-            pulse_text = self._demand_prompt(demand)
-            original_max = self._orchestrator._max_speakers  # type: ignore[attr-defined]
-            try:
-                self._orchestrator._max_speakers = 2  # type: ignore[attr-defined]
-                result = await self._tool_run_round(
-                    session_id=session_id,
-                    user_message="",
-                    pulse_text=pulse_text,
-                    scene=scene,
-                )
-            finally:
-                self._orchestrator._max_speakers = original_max  # type: ignore[attr-defined]
-            narration = self._collect_narration(result)
-
         verdict = await Referee().adjudicate(
             demand, narration, self.api.llm_chat, brain=self._referee_brain
         )
@@ -2050,16 +2053,16 @@ class CharacterChatPlugin(BasePlugin):
             world = rp_world_tools.resolve(
                 world, demand.entity, demand.attribute, verdict.magnitude
             )
+            await container.set_world(world)
             log.info(
-                "character_chat.world_demand_satisfied session=%s need=%s mag=%.2f",
+                "character_chat.demand_satisfied session=%s need=%s mag=%.2f",
                 session_id, demand.need, verdict.magnitude,
             )
         else:
             log.info(
-                "character_chat.world_demand_unmet session=%s need=%s value=%.0f",
+                "character_chat.demand_unmet session=%s need=%s value=%.0f",
                 session_id, demand.need, demand.value,
             )
-        await container.set_world(world)
         try:
             await self.api.ws_broadcast({
                 "type": "rp_world_update",
@@ -2068,11 +2071,51 @@ class CharacterChatPlugin(BasePlugin):
                 "demand": {
                     "entity": demand.entity,
                     "need": demand.need,
-                    "satisfied": verdict.satisfied,
+                    "satisfied": bool(verdict.satisfied),
                 },
             })
         except Exception:  # noqa: BLE001
             pass
+
+    async def _maybe_run_world_demand(
+        self,
+        session_id: str,
+        scene: str,
+        characters: list[CharacterCard],
+    ) -> bool:
+        """Advance the scene's world-state one sim tick, then run a round.
+
+        Returns ``True`` when the scene HAS a defined world-state (so the
+        autonomous tick skips the generic topic round), ``False`` otherwise.
+
+        Time passes ONLY here (the sim tick). The round itself — via
+        ``_tool_run_round`` — injects the shared awareness + caregiver
+        obligation AND runs the Referee resolution, so the identical code
+        path handles both sim ticks and normal user chat (the baby gets fed
+        in ordinary play too, not only on ticks).
+        """
+        container = await self._get_rp_container(session_id)
+        if container is None:
+            return False
+        world = await container.get_world()
+        if not (isinstance(world, dict) and world.get("specs")):
+            return False
+        world, demands = rp_world_tools.advance(world)
+        await container.set_world(world)  # persist drift + newly raised demands
+        if not demands or self._orchestrator is None:
+            return True
+        demand = max(demands, key=lambda d: d.urgency)
+        original_max = self._orchestrator._max_speakers  # type: ignore[attr-defined]
+        try:
+            self._orchestrator._max_speakers = 2  # type: ignore[attr-defined]
+            await self._tool_run_round(
+                session_id=session_id,
+                user_message="",
+                pulse_text=self._demand_prompt(demand),
+                scene=scene,
+            )
+        finally:
+            self._orchestrator._max_speakers = original_max  # type: ignore[attr-defined]
         return True
 
     @staticmethod
@@ -2808,6 +2851,16 @@ class CharacterChatPlugin(BasePlugin):
                 limit=5,
             )
 
+            # RP-v2 — shared scene awareness + caregiver obligations from the
+            # session world-state. Read-only here (time advances on the sim
+            # tick, not on every round). Surfaces open demands to ALL present
+            # speakers so anyone can react/prod; the caregiver gets the strong
+            # "act now" obligation. ``_world_open`` is reused after the round
+            # to let the Referee check whether someone actually acted.
+            scene_awareness, obligations_by_char, _world_open = (
+                await self._build_scene_awareness(session_id, characters)
+            )
+
             req = GroupTurnRequest(
                 session_id=session_id,
                 history=history,
@@ -2821,6 +2874,8 @@ class CharacterChatPlugin(BasePlugin):
                 live_state_by_char=live_state_by_char,
                 excluded_speaker_ids=excluded,
                 prior_turns_by_char=prior_turns_by_char,
+                scene_awareness=scene_awareness,
+                obligations_by_char=obligations_by_char,
             )
 
             round_id = uuid.uuid4().hex[:12]
@@ -2861,6 +2916,16 @@ class CharacterChatPlugin(BasePlugin):
                     "turns": [_turn_to_public(t) for t in result.turns],
                 }
             )
+
+            # RP-v2 — close the loop on EVERY round: if there were open demands,
+            # let the Referee judge whether this round's narration actually
+            # resolved one (mother fed the baby → value drops) or not (stays
+            # open → sim tick escalates). This is what makes the baby get fed
+            # during normal chat, not only on sim ticks.
+            if _world_open:
+                await self._resolve_open_demands(
+                    session_id, _world_open, result.turns
+                )
 
             return {
                 "ok": True,

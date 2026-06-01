@@ -177,6 +177,15 @@ def resolve(
     return _repack(world, ws)
 
 
+def open_demands(world: dict[str, Any]) -> list[Demand]:
+    """Currently-crossed demands WITHOUT advancing time.
+
+    Used on every round to surface shared awareness + obligations (reading,
+    not advancing — time only passes on the sim tick via :func:`advance`).
+    """
+    return _state_world(world).evaluate(_SCOPE)
+
+
 # ─── Shared scene awareness (multi-chat) ─────────────────────────────
 
 # Human-readable phrase per need label — what everyone in the scene notices.
