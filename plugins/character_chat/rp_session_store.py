@@ -214,6 +214,8 @@ class RPSessionContainer:
     STATE_FILE = "state.json"
     MESSAGES_FILE = "messages.json"
     TURNS_FILE = "turns.db"
+    # Coordination-kernel scene world-state (numeric needs + live values).
+    WORLD_FILE = "world.json"
 
     def __init__(
         self,
@@ -276,6 +278,7 @@ class RPSessionContainer:
         await ct._write_json_async(cls.SESSION_FILE, meta)
         await ct._write_json_async(cls.STATE_FILE, {})
         await ct._write_json_async(cls.MESSAGES_FILE, [])
+        await ct._write_json_async(cls.WORLD_FILE, {})
         await ct._init_db()
         await memory.ensure_collection(ct.collection)
         log.info(
@@ -309,6 +312,7 @@ class RPSessionContainer:
         for fn, default in (
             (cls.STATE_FILE, {}),
             (cls.MESSAGES_FILE, []),
+            (cls.WORLD_FILE, {}),
         ):
             if not (ct.folder / fn).exists():
                 await ct._write_json_async(fn, default)
@@ -414,6 +418,23 @@ class RPSessionContainer:
             else:
                 all_states.pop(character_id, None)
             await self._write_json_sync_locked(self.STATE_FILE, all_states)
+
+    # ─── Scene world-state (coordination kernel) ─────────────────────
+
+    async def get_world(self) -> dict[str, Any]:
+        """Return the scene's persisted world-state.
+
+        Shape: ``{"specs": [...NeedSpec...], "state": {entity: {...}}}``.
+        Empty dict when the scene has no simulation defined (opt-in by
+        construction — see ``lexy_core.coordination.scene_spec``).
+        """
+        world = await self._read_json_async(self.WORLD_FILE, {})
+        return world if isinstance(world, dict) else {}
+
+    async def set_world(self, world: dict[str, Any]) -> None:
+        """Persist the scene's world-state (replaces ``world.json``)."""
+        async with self._lock:
+            await self._write_json_sync_locked(self.WORLD_FILE, world or {})
 
     async def update_char_state(
         self, character_id: str, partial: dict[str, str]
