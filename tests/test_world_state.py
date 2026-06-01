@@ -142,3 +142,22 @@ def test_to_dict_from_dict_roundtrip() -> None:
     # thresholds survived → ticking still raises the demand
     demands = restored.tick("scene")   # 65 -> 70
     assert demands[0].need == "feed_baby"
+
+
+def test_relieve_rising_attribute_lowers_value() -> None:
+    ws = _baby_world()              # hunger 60, rises
+    ws.set("scene", "baby", "hunger", 70.0)
+    # magnitude 0.3 → move 30% of span (100) toward safety = -30
+    assert ws.relieve("scene", "baby", "hunger", 0.3) == 40.0
+    # full relief clamps at minimum
+    assert ws.relieve("scene", "baby", "hunger", 1.0) == 0.0
+
+
+def test_relieve_falling_attribute_raises_value() -> None:
+    ws = WorldState()
+    ws.add_attribute(
+        "s", "hero",
+        Attribute(name="energy", value=20.0, rate_per_tick=-5.0),
+    )
+    # energy falls into trouble → relieving RAISES it
+    assert ws.relieve("s", "hero", "energy", 0.5) == 70.0
