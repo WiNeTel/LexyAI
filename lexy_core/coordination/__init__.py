@@ -19,9 +19,12 @@ This package provides the reusable primitives, decoupled from any plugin:
   thresholds that raise :class:`Demand` obligations. The "Zustand mit
   Konsequenz" that every previous simulation attempt lacked.
 
-Later phases add ``Referee`` (adjudicates whether a narrated action
-satisfied a demand) and ``CoordinationLoop`` (ties them to the scheduler
-tick).
+* :class:`Referee` — the game master: reads a character's narration against
+  an open demand and rules whether it was actually satisfied (concrete
+  action vs. mere commenting). The loop applies the verdict to the world.
+
+A later phase adds ``CoordinationLoop`` (ties world-state + referee +
+blackboard to the scheduler tick).
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ from lexy_core.coordination.convergence import (
     ConvergenceDetector,
     ConvergenceResult,
 )
+from lexy_core.coordination.referee import Referee, Verdict
 from lexy_core.coordination.world_state import (
     Attribute,
     Demand,
@@ -50,4 +54,6 @@ __all__ = [
     "Threshold",
     "Entity",
     "Demand",
+    "Referee",
+    "Verdict",
 ]
