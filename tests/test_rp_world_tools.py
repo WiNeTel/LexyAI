@@ -101,3 +101,47 @@ def test_snapshot_and_list_on_empty_world() -> None:
     assert rwt.snapshot({}) == {}
     assert rwt.list_needs({}) == []
     assert rwt.snapshot({"garbage": 1}) == {}
+
+
+# ─── advance / resolve (the sim-loop step) ────────────────────────────
+
+
+def _baby_world(value: float = 65.0) -> dict:
+    return rwt.define_need(
+        {},
+        entity="baby",
+        attribute="hunger",
+        value=value,
+        rate_per_minute=5.0,
+        thresholds=_THRESHOLDS,
+        minutes_per_tick=1.0,
+    )
+
+
+def test_advance_drifts_and_raises_demand() -> None:
+    world, demands = rwt.advance(_baby_world(65.0))   # 65 -> 70
+    assert rwt.snapshot(world) == {"baby": {"hunger": 70.0}}
+    assert any(d.need == "feed_baby" for d in demands)
+
+
+def test_advance_no_demand_below_threshold() -> None:
+    world, demands = rwt.advance(_baby_world(40.0))   # 40 -> 45
+    assert demands == []
+    assert rwt.snapshot(world) == {"baby": {"hunger": 45.0}}
+
+
+def test_advance_escalates_when_ignored() -> None:
+    world, demands = rwt.advance(_baby_world(96.0))   # 96 -> 100 (clamped)
+    assert {d.need for d in demands} == {"feed_baby", "baby_sick"}
+
+
+def test_resolve_lowers_value() -> None:
+    world = _baby_world(70.0)
+    world = rwt.resolve(world, "baby", "hunger", 0.9)   # -0.9*100 → clamp 0
+    assert rwt.snapshot(world) == {"baby": {"hunger": 0.0}}
+
+
+def test_advance_on_empty_world_is_safe() -> None:
+    world, demands = rwt.advance({})
+    assert demands == []
+    assert rwt.snapshot(world) == {}

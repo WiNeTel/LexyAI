@@ -24,6 +24,7 @@ from __future__ import annotations
 from typing import Any
 
 from lexy_core.coordination import (
+    Demand,
     NeedSpec,
     Threshold,
     WorldState,
@@ -114,6 +115,54 @@ def snapshot(world: dict[str, Any]) -> dict[str, dict[str, float]]:
 def list_needs(world: dict[str, Any]) -> list[dict[str, Any]]:
     """Return the authored need specs as plain dicts."""
     return specs_to_list(_load_specs(world))
+
+
+# ─── Sim-loop step (advance + resolve) ───────────────────────────────
+
+
+def _state_world(world: dict[str, Any]) -> WorldState:
+    ws = WorldState()
+    state = world.get("state") if isinstance(world, dict) else None
+    if isinstance(state, dict) and state:
+        ws.from_dict(_SCOPE, state)
+    return ws
+
+
+def _repack(world: dict[str, Any], ws: WorldState) -> dict[str, Any]:
+    specs = world.get("specs") if isinstance(world, dict) else None
+    return {
+        "specs": specs if isinstance(specs, list) else [],
+        "state": ws.to_dict(_SCOPE),
+    }
+
+
+def advance(world: dict[str, Any]) -> tuple[dict[str, Any], list[Demand]]:
+    """Advance the world one tick and return (updated_world, open_demands).
+
+    Open demands = **all currently-crossed thresholds** (via
+    ``WorldState.evaluate``), not just freshly crossed ones — so an unmet
+    need keeps re-driving a character (and a higher threshold escalates)
+    each tick. This is the stateless equivalent of the kernel
+    ``CoordinationLoop``'s open-set, suited to the scheduler-driven sim
+    tick (no in-memory state between fires).
+    """
+    ws = _state_world(world)
+    ws.tick(_SCOPE)                      # drift values one tick
+    demands = ws.evaluate(_SCOPE)        # every threshold currently crossed
+    return _repack(world, ws), demands
+
+
+def resolve(
+    world: dict[str, Any], entity: str, attribute: str, magnitude: float
+) -> dict[str, Any]:
+    """Apply a satisfied verdict: move the attribute toward safety.
+
+    ``magnitude`` is the referee's 0..1 ruling; :meth:`WorldState.relieve`
+    turns it into a signed delta in the right direction.
+    """
+    ws = _state_world(world)
+    ws.relieve(_SCOPE, entity, attribute, magnitude)
+    return _repack(world, ws)
 
 
 # ─── LLM tool schemas ────────────────────────────────────────────────

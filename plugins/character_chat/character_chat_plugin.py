@@ -34,6 +34,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from lexy_core.coordination import Referee
 from lexy_core.plugin_system import BasePlugin
 from lexy_core.utils.logging import get_logger
 
@@ -1881,6 +1882,21 @@ class CharacterChatPlugin(BasePlugin):
                 )
             return
 
+        # ── Coordination kernel: world-state demands ─────────────────
+        # If this scene defines a numeric world-state (via rp_define_need),
+        # advance it and let any OPEN demand drive a concrete, referee-checked
+        # action instead of a generic topic round. Pure narration that does
+        # NOT actually resolve the demand leaves it open → it escalates next
+        # tick. See docs/architecture/agent-coordination.md.
+        try:
+            if await self._maybe_run_world_demand(session_id, scene, characters):
+                return
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "character_chat.world_demand_failed session=%s error=%s",
+                session_id, exc,
+            )
+
         # Phase 13.7c — Discussion-Mode: 2 speakers per sim-tick (was 1)
         # with a topic anchor that makes the round feel like an actual
         # exchange instead of a solo monologue. The topic surrogates a
@@ -1977,6 +1993,109 @@ class CharacterChatPlugin(BasePlugin):
         # inventory, food, fire — universal survival topics.
         import random as _random
         return _random.choice(_SIM_TOPIC_BACKLOG)
+
+    # ─── Coordination kernel: world-state demand handling ────────────
+
+    async def _maybe_run_world_demand(
+        self,
+        session_id: str,
+        scene: str,
+        characters: list[CharacterCard],
+    ) -> bool:
+        """Advance the scene's world-state and drive one open demand.
+
+        Returns ``True`` when the scene HAS a defined world-state (so the
+        caller skips the generic topic round), ``False`` when there is no
+        simulation configured for this session (→ fall back to topic).
+
+        Flow per tick: advance numbers → pick the most urgent open demand →
+        run a demand-aware round so a present character narrates an action →
+        the :class:`Referee` rules whether that narration actually resolved
+        it → satisfied lowers the value, unmet leaves it open to escalate.
+        """
+        container = await self._get_rp_container(session_id)
+        if container is None:
+            return False
+        world = await container.get_world()
+        if not (isinstance(world, dict) and world.get("specs")):
+            return False  # no simulation defined → caller uses topic round
+
+        world, demands = rp_world_tools.advance(world)
+        if not demands:
+            await container.set_world(world)  # persist drift; nothing to act on
+            return True
+
+        demand = max(demands, key=lambda d: d.urgency)
+
+        narration = ""
+        if self._orchestrator is not None:
+            pulse_text = self._demand_prompt(demand)
+            original_max = self._orchestrator._max_speakers  # type: ignore[attr-defined]
+            try:
+                self._orchestrator._max_speakers = 2  # type: ignore[attr-defined]
+                result = await self._tool_run_round(
+                    session_id=session_id,
+                    user_message="",
+                    pulse_text=pulse_text,
+                    scene=scene,
+                )
+            finally:
+                self._orchestrator._max_speakers = original_max  # type: ignore[attr-defined]
+            narration = self._collect_narration(result)
+
+        verdict = await Referee().adjudicate(
+            demand, narration, self.api.llm_chat, brain=self._referee_brain
+        )
+        if verdict.satisfied:
+            world = rp_world_tools.resolve(
+                world, demand.entity, demand.attribute, verdict.magnitude
+            )
+            log.info(
+                "character_chat.world_demand_satisfied session=%s need=%s mag=%.2f",
+                session_id, demand.need, verdict.magnitude,
+            )
+        else:
+            log.info(
+                "character_chat.world_demand_unmet session=%s need=%s value=%.0f",
+                session_id, demand.need, demand.value,
+            )
+        await container.set_world(world)
+        try:
+            await self.api.ws_broadcast({
+                "type": "rp_world_update",
+                "session_id": session_id,
+                "snapshot": rp_world_tools.snapshot(world),
+                "demand": {
+                    "entity": demand.entity,
+                    "need": demand.need,
+                    "satisfied": verdict.satisfied,
+                },
+            })
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+    @staticmethod
+    def _demand_prompt(demand: Any) -> str:
+        """Build a demand-aware situational prompt (dynamic, no tool syntax)."""
+        return (
+            f"In der Szene ist Zeit vergangen. {demand.entity} braucht jetzt "
+            f"dringend Aufmerksamkeit (Beduerfnis: {demand.need}, Stand "
+            f"{round(demand.value)}/100). Reagiere als anwesende Figur und "
+            "HANDLE konkret — nicht nur kommentieren oder zur Kenntnis nehmen, "
+            "sondern wirklich etwas tun (1-3 Saetze, in der Szene)."
+        )
+
+    @staticmethod
+    def _collect_narration(result: dict[str, Any] | None) -> str:
+        """Join the non-skipped turn contents from a round result."""
+        turns = (result or {}).get("turns") or []
+        parts = [
+            (t.get("content") or "").strip()
+            for t in turns
+            if not t.get("skipped") and t.get("content")
+        ]
+        return " ".join(parts).strip()
 
     async def _on_session_project_changed(self, event: Any) -> None:
         """React when a session is moved to a different project.
