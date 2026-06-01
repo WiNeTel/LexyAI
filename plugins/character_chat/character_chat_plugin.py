@@ -2097,6 +2097,37 @@ class CharacterChatPlugin(BasePlugin):
         ]
         return " ".join(parts).strip()
 
+    async def force_world_tick(self, session_id: str) -> dict[str, Any]:
+        """Run ONE world-sim step immediately and return the snapshot.
+
+        REST/test hook (``POST …/sessions/{id}/simulation/tick``). Unlike
+        ``_run_autonomous_tick`` this bypasses the pulse cooldown and the
+        Lexy-probability roll so a caller can deterministically advance the
+        scene's world-state and drive any open demand, then inspect the
+        result — no waiting on the scheduler interval.
+        """
+        if not session_id:
+            return {"ok": False, "error": "no_session"}
+        state = await self._get_session_state(session_id)
+        scene = str(state.get("scene") or "")
+        try:
+            characters = (
+                await self._store.list_in_session(session_id)
+                if self._store is not None
+                else []
+            )
+        except Exception:  # noqa: BLE001
+            characters = []
+        ran = await self._maybe_run_world_demand(session_id, scene, characters)
+        container = await self._get_rp_container(session_id)
+        snapshot: dict[str, Any] = {}
+        needs: list[dict[str, Any]] = []
+        if container is not None:
+            world = await container.get_world()
+            snapshot = rp_world_tools.snapshot(world)
+            needs = rp_world_tools.list_needs(world)
+        return {"ok": True, "simulated": ran, "snapshot": snapshot, "needs": needs}
+
     async def _on_session_project_changed(self, event: Any) -> None:
         """React when a session is moved to a different project.
 

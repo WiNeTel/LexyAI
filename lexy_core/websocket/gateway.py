@@ -436,6 +436,32 @@ def build_app(lexy: "LexyApp") -> FastAPI:
             **custom,
         }
 
+    @api.post("/api/v1/plugins/{name}/tools/{tool_name}")
+    async def invoke_plugin_tool(
+        name: str, tool_name: str, request: Request
+    ) -> dict[str, Any]:
+        """Invoke a registered tool directly, bypassing the LLM tool-call path.
+
+        Body = the tool's argument object (JSON). Returns ``{ok, data, error}``.
+        Tools share one global registry; ``name`` is the owning plugin (must be
+        loaded) and scopes the call for clarity / future namespacing. Lets the
+        UI and scripts drive tools deterministically instead of coaxing the LLM.
+        """
+        app = _app(request)
+        if app.plugin_loader is None or app.tool_registry is None:
+            raise HTTPException(503, "Plugin system not initialised")
+        if app.plugin_loader.get_plugin(name) is None:
+            raise HTTPException(404, f"Plugin '{name}' not loaded")
+        if app.tool_registry.get_tool(tool_name) is None:
+            raise HTTPException(404, f"Tool '{tool_name}' not registered")
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            body = {}
+        args = body if isinstance(body, dict) else {}
+        result = await app.tool_registry.execute(tool_name, args)
+        return {"ok": result.success, "data": result.data, "error": result.error}
+
     @api.get("/api/v1/plugins/{name}/config")
     async def get_plugin_config(name: str, request: Request) -> dict[str, Any]:
         """
@@ -865,6 +891,27 @@ def build_app(lexy: "LexyApp") -> FastAPI:
             "scenario": card.scenario,
             "example_dialog": card.example_dialog,
         }
+
+    @api.post(
+        "/api/v1/plugins/character_chat/sessions/{session_id}/simulation/tick"
+    )
+    async def trigger_sim_tick(
+        session_id: str, request: Request
+    ) -> dict[str, Any]:
+        """Run ONE coordination sim-tick for an RP session immediately.
+
+        Advances the scene's world-state and drives any open demand (a present
+        character acts → the Referee rules → the value changes), then returns
+        ``{ok, simulated, snapshot, needs}``. For verifying the loop without
+        waiting on the scheduler interval.
+        """
+        app = _app(request)
+        if app.plugin_loader is None:
+            raise HTTPException(503, "Plugin loader not initialised")
+        plugin = app.plugin_loader.get_plugin("character_chat")
+        if plugin is None:
+            raise HTTPException(404, "character_chat plugin not loaded")
+        return await plugin.force_world_tick(session_id)
 
     @api.get(
         "/api/v1/plugins/character_chat/sessions/{session_id}/turns"
