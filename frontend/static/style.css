@@ -37,7 +37,13 @@ html, body {
 #app {
     display: grid;
     grid-template-columns: 260px 1fr;
+    /* 100vh ist auf Handys GRÖSSER als der sichtbare Bereich (die
+       Browser-Adressleiste zählt mit) → der Composer rutscht unten
+       aus dem Bild und body{overflow:hidden} verhindert Scrollen.
+       100dvh ("dynamic viewport height") entspricht immer der aktuell
+       sichtbaren Höhe; 100vh bleibt Fallback für ältere Browser. */
     height: 100vh;
+    height: 100dvh;
     width: 100vw;
 }
 
@@ -2037,6 +2043,12 @@ body.nav-open .nav-hamburger span:nth-child(3) { transform: translateY(-7px) rot
     .msg { max-width: 94%; }
     #composer, #rp-composer { padding: 10px 12px; gap: 8px; }
     #composer { padding-bottom: max(10px, env(safe-area-inset-bottom)); }
+
+    /* Der dekorative Visualizer fraß ~180px fixe Höhe direkt über dem
+       Composer — auf niedrigen Handy-Screens zu viel. Kleiner machen,
+       damit Chat + Composer sicher in den sichtbaren Bereich passen. */
+    #voice-visualizer-wrap { padding: 8px 14px 2px; }
+    #arc-reactor { height: 84px; }
 }
 
 @media (max-width: 500px) {
