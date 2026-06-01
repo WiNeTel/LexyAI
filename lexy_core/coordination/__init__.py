@@ -23,8 +23,9 @@ This package provides the reusable primitives, decoupled from any plugin:
   an open demand and rules whether it was actually satisfied (concrete
   action vs. mere commenting). The loop applies the verdict to the world.
 
-A later phase adds ``CoordinationLoop`` (ties world-state + referee +
-blackboard to the scheduler tick).
+* :class:`CoordinationLoop` — one :meth:`~CoordinationLoop.tick` ties
+  world-state + referee + blackboard into the read→act→verify→consequence
+  cycle. The RP plugin drives it from the scheduler tick.
 """
 
 from __future__ import annotations
@@ -33,6 +34,12 @@ from lexy_core.coordination.blackboard import POST_KINDS, Blackboard, Post
 from lexy_core.coordination.convergence import (
     ConvergenceDetector,
     ConvergenceResult,
+)
+from lexy_core.coordination.loop import (
+    CoordinationLoop,
+    LoopConfig,
+    Narrator,
+    TickReport,
 )
 from lexy_core.coordination.referee import Referee, Verdict
 from lexy_core.coordination.world_state import (
@@ -56,4 +63,8 @@ __all__ = [
     "Demand",
     "Referee",
     "Verdict",
+    "CoordinationLoop",
+    "LoopConfig",
+    "TickReport",
+    "Narrator",
 ]

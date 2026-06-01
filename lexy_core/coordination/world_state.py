@@ -138,6 +138,21 @@ class WorldState:
         attribute.value = attribute.clamped(attribute.value + delta)
         return attribute.value
 
+    def relieve(self, scope: str, entity_id: str, attr: str, fraction: float) -> float:
+        """Move an attribute toward safety by ``fraction`` of its span.
+
+        Direction is derived from the attribute's drift: a rising-into-trouble
+        attribute (hunger, ``rate >= 0``) is lowered, a falling-into-trouble
+        one (energy, ``rate < 0``) is raised. ``fraction`` is typically the
+        referee's ``magnitude`` (0..1). Returns the new value (clamped).
+        """
+        attribute = self._attr(scope, entity_id, attr)
+        if attribute is None:
+            return 0.0
+        span = attribute.maximum - attribute.minimum
+        direction = -1.0 if attribute.rate_per_tick >= 0.0 else 1.0
+        return self.apply(scope, entity_id, attr, direction * fraction * span)
+
     # ─── Simulation ──────────────────────────────────────────────────
 
     def tick(self, scope: str, ticks: int = 1) -> list[Demand]:
