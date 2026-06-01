@@ -249,12 +249,18 @@ class LexyLLM:
             "repeat_penalty": overrides.get("repeat_penalty", brain_cfg.repeat_penalty),
         }
 
-        # Extra hints llama.cpp understands when thinking mode is on. These
-        # are harmless if the server ignores them.
-        if thinking:
-            payload.setdefault("chat_template_kwargs", {"enable_thinking": True})
-            if brain_cfg.reasoning_budget is not None:
-                payload["reasoning_budget"] = brain_cfg.reasoning_budget
+        # Tell llama.cpp explicitly whether to use the model's reasoning
+        # channel — in BOTH directions. Qwen3 defaults to thinking ON unless
+        # told otherwise, so a ``thinking: false`` brain that sent nothing
+        # still burned its token budget inside ``<think>`` and, with a small
+        # ``max_tokens`` (e.g. a classifier call), returned EMPTY content
+        # (finish_reason=length, all tokens in reasoning_content). Sending
+        # ``enable_thinking: false`` makes ``thinking: false`` actually mean
+        # no reasoning. Harmless for templates that ignore the kwarg (Gemma
+        # uses the ``<|think|>`` system-token path above instead).
+        payload.setdefault("chat_template_kwargs", {"enable_thinking": thinking})
+        if thinking and brain_cfg.reasoning_budget is not None:
+            payload["reasoning_budget"] = brain_cfg.reasoning_budget
 
         return payload
 
