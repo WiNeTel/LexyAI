@@ -42,6 +42,12 @@ from lexy_core.coordination.loop import (
     TickReport,
 )
 from lexy_core.coordination.referee import Referee, Verdict
+from lexy_core.coordination.scene_spec import (
+    NeedSpec,
+    build_world_state,
+    specs_from_list,
+    specs_to_list,
+)
 from lexy_core.coordination.world_state import (
     Attribute,
     Demand,
@@ -67,4 +73,8 @@ __all__ = [
     "LoopConfig",
     "TickReport",
     "Narrator",
+    "NeedSpec",
+    "build_world_state",
+    "specs_to_list",
+    "specs_from_list",
 ]
