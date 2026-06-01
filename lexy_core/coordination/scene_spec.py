@@ -51,6 +51,11 @@ class NeedSpec(BaseModel):
     maximum: float = 100.0
     rate_per_minute: float = 0.0       # signed: +rises (hunger), -falls (energy)
     thresholds: list[Threshold] = Field(default_factory=list)
+    # Character (name or id) responsible for acting on this need — e.g. the
+    # mother for ``baby.hunger``. Drives the per-character "open obligation"
+    # prompt injection; everyone else only sees the shared awareness. Empty =
+    # no designated caregiver (every present adult shares the soft obligation).
+    caregiver: str = ""
 
 
 def build_world_state(

@@ -145,3 +145,62 @@ def test_advance_on_empty_world_is_safe() -> None:
     world, demands = rwt.advance({})
     assert demands == []
     assert rwt.snapshot(world) == {}
+
+
+# ─── caregiver + shared awareness (multi-chat) ────────────────────────
+
+
+_PRESENT = [
+    {"id": "c_shani", "name": "Shani", "age_stage": "adult"},
+    {"id": "c_mike", "name": "Mike", "age_stage": "adult"},
+    {"id": "c_baby", "name": "baby", "age_stage": "baby"},
+]
+
+
+def _hungry_world(caregiver: str = "Shani") -> dict:
+    # value already above threshold; rate 0 so advance() doesn't change it
+    return rwt.define_need(
+        {},
+        entity="baby",
+        attribute="hunger",
+        value=85.0,
+        rate_per_minute=0.0,
+        thresholds=[{"at": 70.0, "need": "feed_baby", "urgency": 1}],
+        caregiver=caregiver,
+        minutes_per_tick=1.0,
+    )
+
+
+def test_define_need_stores_caregiver() -> None:
+    world = _hungry_world("Shani")
+    assert rwt.caregiver_for(world, "baby", "hunger") == "Shani"
+    assert rwt.list_needs(world)[0]["caregiver"] == "Shani"
+
+
+def test_caregiver_for_unknown_returns_empty() -> None:
+    assert rwt.caregiver_for({}, "baby", "hunger") == ""
+
+
+def test_build_awareness_targets_caregiver() -> None:
+    world = _hungry_world("Shani")
+    _, demands = rwt.advance(world)
+    awareness, obligations = rwt.build_awareness(world, demands, _PRESENT)
+    # Shared awareness mentions the baby + a human phrase, shown to all
+    assert "baby" in awareness and "hungrig" in awareness
+    # Only Shani (the caregiver) gets the strong obligation
+    assert set(obligations.keys()) == {"c_shani"}
+    assert "HANDLE" in obligations["c_shani"]
+
+
+def test_build_awareness_fallback_shares_among_adults() -> None:
+    world = _hungry_world(caregiver="")   # no designated caregiver
+    _, demands = rwt.advance(world)
+    _, obligations = rwt.build_awareness(world, demands, _PRESENT)
+    # Both adults share the soft duty; the baby itself does not
+    assert set(obligations.keys()) == {"c_shani", "c_mike"}
+
+
+def test_build_awareness_empty_when_no_demands() -> None:
+    awareness, obligations = rwt.build_awareness({}, [], _PRESENT)
+    assert awareness == ""
+    assert obligations == {}
