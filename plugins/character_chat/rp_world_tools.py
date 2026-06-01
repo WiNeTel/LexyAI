@@ -63,13 +63,16 @@ def define_need(
     value: float = 0.0,
     minimum: float = 0.0,
     maximum: float = 100.0,
+    caregiver: str = "",
     minutes_per_tick: float,
 ) -> dict[str, Any]:
     """Add or replace one need on ``entity`` and return the updated blob.
 
     A need with the same ``(entity, attribute)`` is replaced (re-authoring).
-    Raises ``pydantic.ValidationError`` / ``ValueError`` on malformed
-    thresholds — the tool handler turns that into an error result.
+    ``caregiver`` is the character responsible for acting on it (drives the
+    per-character obligation prompt). Raises ``pydantic.ValidationError`` /
+    ``ValueError`` on malformed thresholds — the tool handler turns that into
+    an error result.
     """
     specs = [
         s
@@ -86,12 +89,21 @@ def define_need(
             maximum=maximum,
             rate_per_minute=rate_per_minute,
             thresholds=parsed_thresholds,
+            caregiver=caregiver,
         )
     )
     log.info(
         "rp_world.need_defined", entity=entity, attribute=attribute, needs=len(specs)
     )
     return _materialise(specs, minutes_per_tick)
+
+
+def caregiver_for(world: dict[str, Any], entity: str, attribute: str) -> str:
+    """Return the caregiver authored for a given ``(entity, attribute)`` need."""
+    for spec in _load_specs(world):
+        if spec.entity == entity and spec.attribute == attribute:
+            return spec.caregiver
+    return ""
 
 
 def remove_entity(
@@ -165,6 +177,76 @@ def resolve(
     return _repack(world, ws)
 
 
+# ─── Shared scene awareness (multi-chat) ─────────────────────────────
+
+# Human-readable phrase per need label — what everyone in the scene notices.
+DEMAND_AMBIENT: dict[str, str] = {
+    "feed_baby": "schreit hungrig",
+    "baby_sick": "wirkt kraenklich und schwach",
+    "change_diaper": "quengelt unruhig",
+    "comfort": "weint und sucht Naehe",
+    "rest": "wirkt erschoepft",
+}
+
+_INFANT_STAGES = frozenset({"baby", "toddler"})
+
+
+def ambient_phrase(need: str) -> str:
+    """Human-readable phrase for a need label (fallback if unmapped)."""
+    return DEMAND_AMBIENT.get(need, f"braucht Aufmerksamkeit ({need})")
+
+
+def build_awareness(
+    world: dict[str, Any],
+    demands: list[Demand],
+    present: list[dict[str, Any]],
+) -> tuple[str, dict[str, str]]:
+    """Build shared scene-awareness text + per-character obligations.
+
+    Returns ``(scene_awareness, obligations_by_char_id)``:
+
+    * ``scene_awareness`` — shown to EVERY present character so anyone can
+      react to (or prod about) the open demand. This is the multi-chat
+      propagation seam: a non-caregiver can say "Shani, schau nach dem Baby".
+    * ``obligations_by_char`` — a strong "you must act" line for the demand's
+      caregiver. If no caregiver is resolvable among the present cast, the soft
+      duty is shared by all present non-infant characters.
+
+    ``present`` is ``[{"id","name","age_stage"}, ...]``. Pure / no I/O.
+    """
+    if not demands:
+        return "", {}
+
+    by_name = {(c.get("name") or "").strip().lower(): c for c in present}
+    lines: list[str] = []
+    obligations: dict[str, list[str]] = {}
+
+    for demand in demands:
+        phrase = ambient_phrase(demand.need)
+        lines.append(f"- {demand.entity} {phrase} (Stand {round(demand.value)}/100).")
+        duty = (
+            f"{demand.entity} {phrase}. Du bist dafuer verantwortlich — HANDLE "
+            "jetzt konkret (versorgen, nicht nur kommentieren oder zur Kenntnis "
+            "nehmen)."
+        )
+        cg_name = caregiver_for(world, demand.entity, demand.attribute)
+        cg = by_name.get(cg_name.strip().lower()) if cg_name else None
+        if cg is not None:
+            obligations.setdefault(str(cg["id"]), []).append(duty)
+        else:
+            for c in present:
+                if str(c.get("age_stage") or "adult") not in _INFANT_STAGES:
+                    obligations.setdefault(str(c["id"]), []).append(duty)
+
+    awareness = (
+        "## Was gerade in der Szene passiert (alle bemerken es)\n"
+        + "\n".join(lines)
+        + "\nReagiere darauf, wenn es zu deiner Figur passt — du darfst eine "
+        "andere anwesende Figur darauf ansprechen."
+    )
+    return awareness, {cid: " ".join(p) for cid, p in obligations.items()}
+
+
 # ─── LLM tool schemas ────────────────────────────────────────────────
 
 DEFINE_NEED_SCHEMA: dict[str, Any] = {
@@ -187,6 +269,13 @@ DEFINE_NEED_SCHEMA: dict[str, Any] = {
             "description": (
                 "Drift pro Realminute. Positiv = steigt (Hunger), "
                 "negativ = faellt (Energie)."
+            ),
+        },
+        "caregiver": {
+            "type": "string",
+            "description": (
+                "Optional: Charakter (Name), der fuer dieses Beduerfnis "
+                "verantwortlich ist, z.B. die Mutter fuer baby.hunger."
             ),
         },
         "thresholds": {

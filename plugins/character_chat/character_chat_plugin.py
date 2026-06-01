@@ -2285,6 +2285,7 @@ class CharacterChatPlugin(BasePlugin):
                 maximum=float(kwargs.get("maximum", 100.0) or 100.0),
                 rate_per_minute=float(kwargs.get("rate_per_minute", 0.0) or 0.0),
                 thresholds=list(kwargs.get("thresholds") or []),
+                caregiver=str(kwargs.get("caregiver", "") or "").strip(),
                 minutes_per_tick=float(self._simulation_default_interval),
             )
             await container.set_world(world)

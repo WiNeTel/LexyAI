@@ -122,6 +122,13 @@ class GroupTurnRequest:
     # 'wische mir den Salzfilm von der Stirn' across three rounds
     # because the 13.2 guard only saw within-round predecessors.
     prior_turns_by_char: dict[str, list[str]] = field(default_factory=dict)
+    # RP-v2 — shared scene awareness from the world-state (open demands),
+    # shown to EVERY present speaker so anyone can react or prod the caregiver
+    # ("Shani, schau nach dem Baby"). Plus a per-character strong obligation
+    # keyed by character_id (the caregiver "du MUSST handeln"). Both populated
+    # by the plugin before run_round; empty = no open demands this round.
+    scene_awareness: str = ""
+    obligations_by_char: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -1014,6 +1021,7 @@ class GroupTurnOrchestrator:
         "scenario",
         "age_guidance",
         "char_state",
+        "open_obligations",          # RP-v2 — caregiver "act now" duty
         "others",
         "example_dialog",
         "global_style",
@@ -1023,6 +1031,7 @@ class GroupTurnOrchestrator:
     # User section order (fed as the user message for the turn).
     _USER_SECTION_ORDER: tuple[str, ...] = (
         "group_roster",              # NEW Phase 13.3 — pre-history
+        "scene_awareness",           # RP-v2 — shared open-demand awareness
         "lorebook_before_history",
         "history",
         "memory",
@@ -1142,6 +1151,22 @@ class GroupTurnOrchestrator:
                         "aktualisiert. Niemals einen Zustand erzählen der "
                         "deinem aktuellen Zustand widerspricht."
                     ),
+                    role="system",
+                    max_tokens=200,
+                )
+            )
+
+        # RP-v2 — strong "you are responsible, act now" obligation for the
+        # caregiver of an open demand (e.g. the mother for baby.hunger). Only
+        # the responsible character gets it; everyone else just sees the
+        # shared scene_awareness in their user content.
+        obligation = (req.obligations_by_char or {}).get(card.id)
+        if obligation:
+            sections.append(
+                PromptSection(
+                    name="open_obligations",
+                    priority=Priority.HIGH,
+                    text=f"## Offene Verpflichtung (jetzt handeln!)\n{obligation}",
                     role="system",
                     max_tokens=200,
                 )
@@ -1283,6 +1308,19 @@ class GroupTurnOrchestrator:
                     text=roster_line,
                     role="user",
                     max_tokens=80,
+                )
+            )
+
+        # RP-v2 — shared scene awareness: open world-state demands every
+        # present character notices, so anyone can react or prod the caregiver.
+        if (req.scene_awareness or "").strip():
+            sections.append(
+                PromptSection(
+                    name="scene_awareness",
+                    priority=Priority.HIGH,
+                    text=req.scene_awareness.strip(),
+                    role="user",
+                    max_tokens=300,
                 )
             )
 
