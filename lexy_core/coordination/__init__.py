@@ -15,10 +15,13 @@ This package provides the reusable primitives, decoupled from any plugin:
   for BOTH the simulation loop and the deliberation loop.
 * :class:`ConvergenceDetector` — generalised from ``expert_panel``: extracts
   agreement points across contributions so a discussion knows when to stop.
+* :class:`WorldState` — numeric, time-evolving entity attributes with
+  thresholds that raise :class:`Demand` obligations. The "Zustand mit
+  Konsequenz" that every previous simulation attempt lacked.
 
-Later phases add ``WorldState`` (numeric, time-evolving needs with
-thresholds), ``Referee`` (adjudicates whether a narrated action satisfied a
-demand), and ``CoordinationLoop`` (ties them to the scheduler tick).
+Later phases add ``Referee`` (adjudicates whether a narrated action
+satisfied a demand) and ``CoordinationLoop`` (ties them to the scheduler
+tick).
 """
 
 from __future__ import annotations
@@ -28,6 +31,13 @@ from lexy_core.coordination.convergence import (
     ConvergenceDetector,
     ConvergenceResult,
 )
+from lexy_core.coordination.world_state import (
+    Attribute,
+    Demand,
+    Entity,
+    Threshold,
+    WorldState,
+)
 
 __all__ = [
     "Blackboard",
@@ -35,4 +45,9 @@ __all__ = [
     "POST_KINDS",
     "ConvergenceDetector",
     "ConvergenceResult",
+    "WorldState",
+    "Attribute",
+    "Threshold",
+    "Entity",
+    "Demand",
 ]
