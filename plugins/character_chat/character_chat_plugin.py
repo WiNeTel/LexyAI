@@ -34,7 +34,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from lexy_core.coordination import Referee
+from lexy_core.coordination import FactExtractor, Referee
 from lexy_core.plugin_system import BasePlugin
 from lexy_core.utils.logging import get_logger
 
@@ -1998,31 +1998,84 @@ class CharacterChatPlugin(BasePlugin):
 
     async def _build_scene_awareness(
         self, session_id: str, characters: list[CharacterCard]
-    ) -> tuple[str, dict[str, Any], list[Any]]:
-        """Shared awareness + caregiver obligations for the current round.
+    ) -> tuple[str, dict[str, Any], str, list[Any]]:
+        """Round context from the session world-state (read-only).
 
-        Read-only — returns ``(scene_awareness, obligations_by_char,
-        open_demands)`` from the session world-state WITHOUT advancing time
-        (time passes only on the sim tick). Empty/no-op when the scene has no
-        simulation defined.
+        Returns ``(scene_awareness, obligations_by_char, physical_facts,
+        open_demands)`` WITHOUT advancing time (time passes only on the sim
+        tick). ``physical_facts`` is shown even with no open demand (the
+        baby's location matters regardless of hunger). Empty/no-op when the
+        scene has neither needs nor facts.
         """
         container = await self._get_rp_container(session_id)
         if container is None:
-            return "", {}, []
+            return "", {}, "", []
         world = await container.get_world()
-        if not (isinstance(world, dict) and world.get("specs")):
-            return "", {}, []
-        demands = rp_world_tools.open_demands(world)
-        if not demands:
-            return "", {}, []
-        present = [
-            {"id": c.id, "name": c.name, "age_stage": c.age_stage}
-            for c in characters
-        ]
-        awareness, obligations = rp_world_tools.build_awareness(
-            world, demands, present
+        if not isinstance(world, dict) or not (
+            world.get("specs") or world.get("facts")
+        ):
+            return "", {}, "", []
+        physical = rp_world_tools.format_physical_facts(
+            rp_world_tools.get_facts(world)
         )
-        return awareness, obligations, demands
+        demands = rp_world_tools.open_demands(world) if world.get("specs") else []
+        awareness, obligations = "", {}
+        if demands:
+            present = [
+                {"id": c.id, "name": c.name, "age_stage": c.age_stage}
+                for c in characters
+            ]
+            awareness, obligations = rp_world_tools.build_awareness(
+                world, demands, present
+            )
+        return awareness, obligations, physical, demands
+
+    async def _update_physical_facts(
+        self, session_id: str, turns: list[Any]
+    ) -> None:
+        """Extract the current physical reality from this round's narration.
+
+        Keeps shared facts (who holds the baby, where it is) in sync so the
+        next turn's prompt states the truth — stops the "puts baby down →
+        back on her arm" contradiction. One cheap LLM call, only for scenes
+        that actually track an entity; fail-safe (leaves facts unchanged).
+        """
+        container = await self._get_rp_container(session_id)
+        if container is None:
+            return
+        world = await container.get_world()
+        entities = rp_world_tools.physical_entities(world)
+        if not entities:
+            return
+        narration = self._collect_narration(
+            {"turns": [_turn_to_public(t) for t in turns]}
+        )
+        if not narration:
+            return
+        instruction = (
+            "Bestimme den aktuellen physischen Stand dieser Entitaeten: "
+            f"{', '.join(entities)}. Fuer jede, soweit der Text es klar sagt: "
+            "held_by (welche Figur sie haelt/traegt) und location (wo sie ist). "
+            'Format: {"<entity>": {"held_by": "...", "location": "..."}}. '
+            "Lass Felder weg, die der Text nicht eindeutig nennt."
+        )
+        extracted = await FactExtractor().extract(
+            narration, instruction, self.api.llm_chat, brain=self._referee_brain
+        )
+        # Keep only known entities; drop junk keys.
+        clean = {
+            e: v for e, v in (extracted or {}).items()
+            if e in entities and isinstance(v, dict)
+        }
+        if not clean:
+            return
+        world = rp_world_tools.merge_facts(world, clean)
+        await container.set_world(world)
+        log.info(
+            "character_chat.physical_facts_updated",
+            session_id=session_id,
+            facts=rp_world_tools.get_facts(world),
+        )
 
     async def _resolve_open_demands(
         self, session_id: str, demands: list[Any], turns: list[Any]
@@ -2857,7 +2910,7 @@ class CharacterChatPlugin(BasePlugin):
             # speakers so anyone can react/prod; the caregiver gets the strong
             # "act now" obligation. ``_world_open`` is reused after the round
             # to let the Referee check whether someone actually acted.
-            scene_awareness, obligations_by_char, _world_open = (
+            scene_awareness, obligations_by_char, physical_facts, _world_open = (
                 await self._build_scene_awareness(session_id, characters)
             )
 
@@ -2876,6 +2929,7 @@ class CharacterChatPlugin(BasePlugin):
                 prior_turns_by_char=prior_turns_by_char,
                 scene_awareness=scene_awareness,
                 obligations_by_char=obligations_by_char,
+                physical_facts=physical_facts,
             )
 
             round_id = uuid.uuid4().hex[:12]
@@ -2943,6 +2997,11 @@ class CharacterChatPlugin(BasePlugin):
                 await self._resolve_open_demands(
                     session_id, _world_open, result.turns
                 )
+
+            # RP-v2 Phase 2 — keep physical reality (who holds the baby, where
+            # it is) in sync with what was just narrated, so the next turn
+            # can't contradict it. No-op for scenes without tracked entities.
+            await self._update_physical_facts(session_id, result.turns)
 
             return {
                 "ok": True,

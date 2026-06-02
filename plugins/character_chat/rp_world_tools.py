@@ -256,6 +256,77 @@ def build_awareness(
     return awareness, {cid: " ".join(p) for cid, p in obligations.items()}
 
 
+# ─── Physical continuity facts ───────────────────────────────────────
+# Shared, object-centric scene facts (e.g. who holds the baby, where it is)
+# persisted in world.json under "facts": {entity: {key: value}}. Injected as
+# a MUST prompt section so every character respects the same physical reality.
+
+_CLEAR_VALUES = frozenset({"", "none", "null", "unknown", "unbekannt", "keiner"})
+
+
+def get_facts(world: dict[str, Any]) -> dict[str, Any]:
+    """Return the per-scene physical facts ``{entity: {key: value}}``."""
+    facts = world.get("facts") if isinstance(world, dict) else None
+    return facts if isinstance(facts, dict) else {}
+
+
+def merge_facts(world: dict[str, Any], new_facts: dict[str, Any]) -> dict[str, Any]:
+    """Merge ``new_facts`` into the world's facts; empty/none values clear a key."""
+    facts = {k: dict(v) for k, v in get_facts(world).items() if isinstance(v, dict)}
+    for entity, kv in (new_facts or {}).items():
+        if not isinstance(kv, dict):
+            continue
+        cur = dict(facts.get(entity) or {})
+        for key, value in kv.items():
+            sv = str(value).strip() if value is not None else ""
+            if sv.lower() in _CLEAR_VALUES:
+                cur.pop(key, None)
+            else:
+                cur[key] = sv
+        if cur:
+            facts[entity] = cur
+        else:
+            facts.pop(entity, None)
+    out = dict(world or {})
+    out["facts"] = facts
+    return out
+
+
+def format_physical_facts(facts: dict[str, Any]) -> str:
+    """Render facts as a MUST prompt section (empty string if no facts)."""
+    lines: list[str] = []
+    for entity, kv in (facts or {}).items():
+        if not isinstance(kv, dict) or not kv:
+            continue
+        parts: list[str] = []
+        if kv.get("held_by"):
+            parts.append(f"wird von {kv['held_by']} gehalten")
+        if kv.get("location"):
+            parts.append(f"Ort: {kv['location']}")
+        for key, value in kv.items():
+            if key in ("held_by", "location") or not value:
+                continue
+            parts.append(f"{key}: {value}")
+        if parts:
+            lines.append(f"- {entity}: {'; '.join(parts)}")
+    if not lines:
+        return ""
+    return (
+        "## Physische Realitaet (verbindlich!)\n"
+        + "\n".join(lines)
+        + "\nDas ist der aktuelle Stand der Szene. Widersprich ihm NICHT. Wenn "
+        "du etwas daran aenderst (Baby ablegen/uebergeben, Ort wechseln), "
+        "beschreibe die Aenderung ausdruecklich in deiner Antwort."
+    )
+
+
+def physical_entities(world: dict[str, Any]) -> list[str]:
+    """Entities worth tracking physically — those with needs or existing facts."""
+    ents = {s.entity for s in _load_specs(world)}
+    ents |= set(get_facts(world).keys())
+    return sorted(ents)
+
+
 # ─── LLM tool schemas ────────────────────────────────────────────────
 
 DEFINE_NEED_SCHEMA: dict[str, Any] = {
