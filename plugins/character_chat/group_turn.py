@@ -1347,7 +1347,11 @@ class GroupTurnOrchestrator:
         if "lorebook_before_history" in lore_sections:
             sections.append(lore_sections["lorebook_before_history"])
 
-        history_text = _format_history_tail(req.history, limit=6)
+        # RP-Fix: show a real recent transcript. ``limit`` is the message
+        # window (user lines + every character's turns); HIGH priority so the
+        # recent exchange isn't trimmed to 2 messages while 16k+ context sits
+        # free — that drop was why characters "forgot" facts from 2 turns ago.
+        history_text = _format_history_tail(req.history, limit=16)
         if history_text:
             # Snapshot req.history so the reduce_fn closure stays pure.
             history_ref = req.history
@@ -1359,11 +1363,12 @@ class GroupTurnOrchestrator:
             sections.append(
                 PromptSection(
                     name="history",
-                    priority=Priority.MEDIUM,
+                    priority=Priority.HIGH,
                     text=f"## Bisheriger Chat\n{history_text}",
                     role="user",
+                    max_tokens=3000,
                     reduce_fn=_reduce_history,
-                    reduce_steps=[4, 2],
+                    reduce_steps=[10, 6, 3],
                 )
             )
 
