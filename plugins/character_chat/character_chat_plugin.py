@@ -2641,6 +2641,8 @@ class CharacterChatPlugin(BasePlugin):
                     await self._register_pulse_timer(saved, session_id)
                 # Phase 9.12: same auto-tag as ``_tool_attach_character``.
                 await self._maybe_tag_session_rp(session_id)
+                # SillyTavern-style greeting as the character's first turn.
+                await self._maybe_post_greeting(session_id, saved)
                 # Scene Director (Phase 4): if this character implies a
                 # dependent ("has a baby" etc.), offer/auto-provision its
                 # needs. Cheap keyword pre-filter avoids an LLM call on every
@@ -2760,7 +2762,52 @@ class CharacterChatPlugin(BasePlugin):
         # scheduler now (idempotent: duplicate attach simply re-registers).
         if updated.proactive_pulse_pattern:
             await self._register_pulse_timer(updated, session_id)
+        # SillyTavern-style: show the character's greeting (first message) as
+        # its first turn — both visible in chat AND seeding the prompt history.
+        await self._maybe_post_greeting(session_id, updated)
         return {"ok": True, "character": _card_to_public(updated)}
+
+    async def _maybe_post_greeting(
+        self, session_id: str, card: CharacterCard
+    ) -> None:
+        """Post a character's greeting as its first turn (once per session).
+
+        Shows the SillyTavern-style first message in the chat AND seeds the
+        prompt history (turns.db → ``_build_rp_history``); it then naturally
+        scrolls out as the chat grows. No-op without a greeting, without an RP
+        container, or if already posted for this character.
+        """
+        greeting = _apply_placeholders((card.greeting or "").strip(), card.name)
+        if not greeting:
+            return
+        container = await self._get_rp_container(session_id)
+        if container is None:
+            return
+        try:
+            rows = await container.list_turns(limit=500)
+        except Exception:  # noqa: BLE001
+            rows = []
+        if _has_greeting_turn(rows, card.id):
+            return
+        turn = CharacterTurn(
+            character_id=card.id,
+            character_name=card.name,
+            content=greeting,
+            skipped=False,
+            order=0,
+        )
+        await self._persist_and_broadcast_turns(
+            session_id=session_id,
+            round_id=f"greeting:{card.id}",
+            trigger_kind="greeting",
+            trigger_text="",
+            turns=[turn],
+        )
+        log.info(
+            "character_chat.greeting_posted",
+            session_id=session_id,
+            character=card.name,
+        )
 
     async def _maybe_tag_session_rp(self, session_id: str) -> None:
         """Flip ``meta.kind`` to ``"rp"`` when a character first joins.
@@ -4788,6 +4835,29 @@ def _card_to_public(card: CharacterCard) -> dict[str, Any]:
         "created_at": card.created_at,
         "updated_at": card.updated_at,
     }
+
+
+def _apply_placeholders(text: str, char_name: str, user_name: str = "Mike") -> str:
+    """Substitute SillyTavern-style ``{{char}}`` / ``{{user}}`` placeholders."""
+    if not text:
+        return text
+    out = text
+    for token in ("{{char}}", "{{Char}}", "{{CHAR}}", "{{char_name}}"):
+        out = out.replace(token, char_name)
+    for token in ("{{user}}", "{{User}}", "{{USER}}"):
+        out = out.replace(token, user_name)
+    return out
+
+
+def _has_greeting_turn(rows: list[Any], char_id: str) -> bool:
+    """True if a greeting turn for ``char_id`` is already persisted (dedup)."""
+    for r in rows:
+        if (
+            getattr(r, "trigger_kind", "") == "greeting"
+            and getattr(r, "character_id", "") == char_id
+        ):
+            return True
+    return False
 
 
 def _build_rp_history(
