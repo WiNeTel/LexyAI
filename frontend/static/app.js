@@ -1461,6 +1461,9 @@
             case "character_round_error":
                 if (window._lexyCharacters) window._lexyCharacters.onRoundError(data);
                 break;
+            case "character_demand_triggered":
+                appendAmbientLine(data);
+                break;
 
             case "rp_director_start_ack":
                 if (data && data.ok === false) {
@@ -3175,6 +3178,7 @@
                         content: t.content,
                         skipped: t.skipped,
                         order: t.order,
+                        created_at: t.created_at,
                         session_id: sessionId,
                     });
                 }
@@ -6476,6 +6480,64 @@
 
     // ─── Character turn rendering ──────────────────────────────────
 
+    // ─── RP text formatting (timestamp · narration vs. speech) ──────
+    function fmtTurnTime(ca) {
+        const d = ca ? new Date(ca * 1000) : new Date();
+        const hm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+        if (d.toDateString() === new Date().toDateString()) return hm;
+        return d.toLocaleDateString([], { day: "2-digit", month: "2-digit" }) + " " + hm;
+    }
+
+    // Split an RP turn into paragraphs and colour *narration/action* vs
+    // "spoken dialogue" so the two read distinctly. Narration drops its
+    // asterisks (styled italic/dim); speech keeps its quotes (styled bright).
+    // Handles straight "..." and German „..." quotes.
+    function renderRpText(container, content) {
+        container.innerHTML = "";
+        const text = String(content || "");
+        const token = /\*([^*]+)\*|"([^"]+)"|„([^“”]+)[“”]/g;
+        text.split(/\n{2,}/).forEach((para) => {
+            if (!para.trim()) return;
+            const p = document.createElement("div");
+            p.className = "rp-para";
+            let last = 0, m;
+            token.lastIndex = 0;
+            while ((m = token.exec(para)) !== null) {
+                if (m.index > last) {
+                    p.appendChild(document.createTextNode(para.slice(last, m.index)));
+                }
+                const span = document.createElement("span");
+                if (m[1] !== undefined) {
+                    span.className = "rp-narration";
+                    span.textContent = m[1];      // narration, asterisks stripped
+                } else {
+                    span.className = "rp-speech";
+                    span.textContent = m[0];       // speech, keep the quotes
+                }
+                p.appendChild(span);
+                last = token.lastIndex;
+            }
+            if (last < para.length) {
+                p.appendChild(document.createTextNode(para.slice(last)));
+            }
+            container.appendChild(p);
+        });
+    }
+
+    // Visible ambient/trigger line in the RP chat, e.g. "*Das Baby schreit*".
+    function appendAmbientLine(data) {
+        if (!data || data.session_id !== state.sessionId) return;
+        const targetWindow = (state.activeTab === "rp" && rpChatWindow)
+            ? rpChatWindow
+            : chatWindow;
+        if (!targetWindow) return;
+        const div = document.createElement("div");
+        div.className = "msg ambient";
+        div.textContent = "* " + (data.text || "") + " *";
+        targetWindow.appendChild(div);
+        targetWindow.scrollTop = targetWindow.scrollHeight;
+    }
+
     function appendCharacterTurn(turn) {
         // Phase 9.12: Charakter-Turns gehören eigentlich immer in den
         // Rollenspiel-Tab. Falls aus Legacy-Gründen ein Char-Turn für
@@ -6521,12 +6583,18 @@
         const nameRow = document.createElement("div");
         nameRow.className = "char-bubble-name";
         nameRow.textContent = turn.character_name || "?";
+        const timeEl = document.createElement("span");
+        timeEl.className = "char-bubble-time";
+        timeEl.textContent = fmtTurnTime(turn.created_at);
+        nameRow.appendChild(timeEl);
         body.appendChild(nameRow);
         const text = document.createElement("div");
         text.className = "char-bubble-text";
-        text.textContent = turn.skipped
-            ? `*${turn.character_name} schweigt*`
-            : (turn.content || "");
+        if (turn.skipped) {
+            text.textContent = `*${turn.character_name} schweigt*`;
+        } else {
+            renderRpText(text, turn.content || "");
+        }
         body.appendChild(text);
 
         // Action bar — at parity with normal-chat bubbles. Edit / delete /
@@ -6699,9 +6767,11 @@
             if (!wrapper) return;
             const textEl = wrapper.querySelector(".char-bubble-text");
             if (textEl) {
-                textEl.textContent = data.skipped
-                    ? `*${data.character_name || "?"} schweigt*`
-                    : (data.content || "");
+                if (data.skipped) {
+                    textEl.textContent = `*${data.character_name || "?"} schweigt*`;
+                } else {
+                    renderRpText(textEl, data.content || "");
+                }
             }
         },
         onTurnDeleted: (data) => {

@@ -2278,6 +2278,42 @@ body.nav-open .nav-hamburger span:nth-child(3) { transform: translateY(-7px) rot
     font-style: italic;
 }
 
+/* RP-v2 — turn timestamp + narration/speech distinction */
+.msg.character .char-bubble-name {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+}
+.char-bubble-time {
+    color: var(--text-dimmer);
+    font-size: 10px;
+    font-weight: 400;
+    font-family: var(--mono);
+}
+.char-bubble-text .rp-para { margin: 0 0 6px 0; }
+.char-bubble-text .rp-para:last-child { margin-bottom: 0; }
+.char-bubble-text .rp-narration {
+    color: var(--text-dim);
+    font-style: italic;
+}
+.char-bubble-text .rp-speech {
+    color: var(--text);
+    font-weight: 500;
+}
+
+/* RP-v2 — ambient/trigger line, e.g. "* Das Baby schreit *" */
+.msg.ambient {
+    align-self: center;
+    max-width: 90%;
+    margin: 2px auto;
+    color: var(--text-dim);
+    font-style: italic;
+    font-size: 12.5px;
+    opacity: 0.9;
+    padding: 4px 16px;
+    text-align: center;
+}
+
 /* Character session modal */
 .character-session-modal .modal-body { max-width: 560px; }
 .char-session-mode-row { margin-bottom: 12px; }
