@@ -2893,6 +2893,23 @@ class CharacterChatPlugin(BasePlugin):
                 }
             )
 
+            # RP-v2 (Phase 3) — surface the open demand as a visible ambient
+            # line so the user SEES the trigger (the baby crying), not just the
+            # character's reaction. Most-urgent demand first.
+            if _world_open:
+                _amb = max(_world_open, key=lambda d: d.urgency)
+                await self.api.ws_broadcast(
+                    {
+                        "type": "character_demand_triggered",
+                        "session_id": session_id,
+                        "entity": _amb.entity,
+                        "need": _amb.need,
+                        "text": (
+                            f"{_amb.entity} {rp_world_tools.ambient_phrase(_amb.need)}"
+                        ),
+                    }
+                )
+
             result = await self._orchestrator.run_round(req)
 
             # Phase 13.2: anyone who skipped this round earns a 1-round
@@ -3830,6 +3847,7 @@ class CharacterChatPlugin(BasePlugin):
                     "session_id": session_id,
                     "round_id": round_id,
                     "turn_id": turn_id,
+                    "created_at": now,
                     **_turn_to_public(t),
                 }
             )
