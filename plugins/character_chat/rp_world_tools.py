@@ -390,3 +390,24 @@ WORLD_SNAPSHOT_SCHEMA: dict[str, Any] = {
     },
     "required": ["session_id"],
 }
+
+ANALYZE_SCENE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "session_id": {"type": "string", "description": "RP-Session-ID"},
+    },
+    "required": ["session_id"],
+}
+
+APPLY_PROPOSAL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "session_id": {"type": "string", "description": "RP-Session-ID"},
+        "needs": {
+            "type": "array",
+            "description": "Zu definierende Beduerfnisse (Scene-Director-Vorschlag)",
+            "items": {"type": "object"},
+        },
+    },
+    "required": ["session_id", "needs"],
+}
