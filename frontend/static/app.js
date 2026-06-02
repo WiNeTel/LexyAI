@@ -600,9 +600,18 @@
     // bubble we walk the whole window and count .msg.user / .msg.assistant
     // bubbles up to the target — that's exactly the SessionStore index.
     function historyIndexOf(wrapper) {
+        // Count within the SAME window the bubble lives in: RP messages are in
+        // rpChatWindow, normal chat in chatWindow. Character turns (.msg.character)
+        // are excluded — they are NOT SessionStore messages, so they must not
+        // shift the index. (Walking only chatWindow returned -1 for RP user
+        // messages → "Can't locate message in history".)
+        const win = (rpChatWindow && rpChatWindow.contains(wrapper))
+            ? rpChatWindow
+            : chatWindow;
+        if (!win) return -1;
         let idx = -1;
         let i = 0;
-        for (const el of chatWindow.querySelectorAll(".msg.user, .msg.assistant")) {
+        for (const el of win.querySelectorAll(".msg.user, .msg.assistant")) {
             if (el === wrapper) {
                 idx = i;
                 break;
@@ -6761,9 +6770,12 @@
         },
         onTurnUpdated: (data) => {
             if (!data || !data.turn_id) return;
-            const wrapper = chatWindow && chatWindow.querySelector(
-                `.msg.character[data-turn-id="${CSS.escape(data.turn_id)}"]`
-            );
+            // Character bubbles live in rpChatWindow (RP) — search there first,
+            // then chatWindow as fallback. Querying only chatWindow meant
+            // edit/regenerate never updated the RP bubble ("nothing happens").
+            const sel = `.msg.character[data-turn-id="${CSS.escape(data.turn_id)}"]`;
+            const wrapper = (rpChatWindow && rpChatWindow.querySelector(sel))
+                || (chatWindow && chatWindow.querySelector(sel));
             if (!wrapper) return;
             const textEl = wrapper.querySelector(".char-bubble-text");
             if (textEl) {
@@ -6776,9 +6788,9 @@
         },
         onTurnDeleted: (data) => {
             if (!data || !data.turn_id) return;
-            const wrapper = chatWindow && chatWindow.querySelector(
-                `.msg.character[data-turn-id="${CSS.escape(data.turn_id)}"]`
-            );
+            const sel = `.msg.character[data-turn-id="${CSS.escape(data.turn_id)}"]`;
+            const wrapper = (rpChatWindow && rpChatWindow.querySelector(sel))
+                || (chatWindow && chatWindow.querySelector(sel));
             if (wrapper) wrapper.remove();
         },
         onTurnAudio: (data) => {
