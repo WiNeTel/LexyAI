@@ -3017,7 +3017,10 @@ class CharacterChatPlugin(BasePlugin):
             if not characters:
                 return {"ok": False, "error": "no_characters_in_session"}
 
-            history = self._load_session_history(session_id)
+            # RP-Fix: real transcript (user + ALL character turns from prior
+            # rounds), not just the user's lines — so characters remember what
+            # was said (baby's name, ages …) instead of re-inventing it.
+            history = await self._load_rp_history(session_id)
 
             # Pulse-mention propagation: if the pulse text addresses another
             # character by name (NL detection — same parser used for user
@@ -3699,7 +3702,7 @@ class CharacterChatPlugin(BasePlugin):
         # Reconstruct a minimal GroupTurnRequest with the original trigger
         # so the prompt builder picks the same "Impuls" / "User"-Variante.
         all_chars = await self._store.list_in_session(session_id)
-        history = self._load_session_history(session_id)
+        history = await self._load_rp_history(session_id)
         trigger_kind = (existing.get("trigger_kind") or "").lower()
         trigger_text = existing.get("trigger_text") or ""
         user_msg = ""
@@ -4741,6 +4744,23 @@ class CharacterChatPlugin(BasePlugin):
             )
         return out
 
+    async def _load_rp_history(self, session_id: str) -> list[dict[str, Any]]:
+        """RP-aware history: the REAL recent transcript (user lines + every
+        character's turns) reconstructed from the per-session ``turns.db`` —
+        so a character sees its own and others' prior-round turns, not just the
+        user's messages. Falls back to the core session store for non-RP
+        sessions (or if no turns exist yet).
+        """
+        container = await self._get_rp_container(session_id)
+        if container is None:
+            return self._load_session_history(session_id)
+        try:
+            rows = await container.list_turns(limit=200)
+        except Exception:  # noqa: BLE001
+            return self._load_session_history(session_id)
+        hist = _build_rp_history(rows, limit_rounds=8)
+        return hist or self._load_session_history(session_id)
+
 
 # ─── Public serialisers ──────────────────────────────────────────────────────
 
@@ -4768,6 +4788,63 @@ def _card_to_public(card: CharacterCard) -> dict[str, Any]:
         "created_at": card.created_at,
         "updated_at": card.updated_at,
     }
+
+
+def _build_rp_history(
+    rows: list[Any],
+    *,
+    limit_rounds: int = 8,
+    max_chars_per_turn: int = 600,
+) -> list[dict[str, Any]]:
+    """Reconstruct a chronological RP transcript from persisted turn rows.
+
+    ``rows`` are TurnRow-like objects (chronological), each with ``round_id``,
+    ``trigger_kind``, ``trigger_text``, ``character_name``, ``content``,
+    ``skipped``. Groups by round, keeps the last ``limit_rounds`` rounds, and
+    emits per round: the user's message (only for user-triggered rounds) then
+    each non-skipped character turn. This is what makes a character see what
+    everyone — including itself — actually said in recent rounds, instead of
+    only the user's lines (the cause of the Mia→Lena / age drift).
+    """
+    by_round: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for r in rows:
+        rid = getattr(r, "round_id", "") or ""
+        if not rid:
+            continue
+        if rid not in by_round:
+            by_round[rid] = {
+                "trigger_kind": getattr(r, "trigger_kind", "") or "",
+                "trigger_text": getattr(r, "trigger_text", "") or "",
+                "turns": [],
+            }
+            order.append(rid)
+        if not getattr(r, "skipped", False) and getattr(r, "content", ""):
+            by_round[rid]["turns"].append(
+                (getattr(r, "character_name", "?") or "?", r.content)
+            )
+    out: list[dict[str, Any]] = []
+    for rid in order[-limit_rounds:]:
+        rd = by_round[rid]
+        if rd["trigger_kind"] == "user":
+            trig = (rd["trigger_text"] or "").strip()
+            if trig:
+                out.append(
+                    {
+                        "role": "user",
+                        "name": "Mike",
+                        "content": trig[:max_chars_per_turn],
+                    }
+                )
+        for name, content in rd["turns"]:
+            out.append(
+                {
+                    "role": "assistant",
+                    "name": name,
+                    "content": (content or "").strip()[:max_chars_per_turn],
+                }
+            )
+    return out
 
 
 def _turn_to_public(turn: CharacterTurn) -> dict[str, Any]:
