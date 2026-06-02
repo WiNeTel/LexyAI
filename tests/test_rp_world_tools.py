@@ -154,6 +154,46 @@ def test_open_demands_reads_without_advancing() -> None:
     assert rwt.snapshot(world) == {"baby": {"hunger": 72.0}}   # NOT advanced
 
 
+# ─── physical continuity facts ────────────────────────────────────────
+
+
+def test_merge_and_get_facts() -> None:
+    w = rwt.merge_facts({}, {"baby": {"held_by": "Shani", "location": "Wiege"}})
+    assert rwt.get_facts(w) == {"baby": {"held_by": "Shani", "location": "Wiege"}}
+    # update one field, keep the other
+    w = rwt.merge_facts(w, {"baby": {"location": "Sofa"}})
+    assert rwt.get_facts(w) == {"baby": {"held_by": "Shani", "location": "Sofa"}}
+
+
+def test_merge_facts_clears_on_empty_or_none() -> None:
+    w = rwt.merge_facts({}, {"baby": {"held_by": "Shani"}})
+    w = rwt.merge_facts(w, {"baby": {"held_by": ""}})        # cleared
+    assert rwt.get_facts(w) == {}                            # entity dropped when empty
+    w2 = rwt.merge_facts({}, {"baby": {"held_by": "Mike", "location": "none"}})
+    assert rwt.get_facts(w2) == {"baby": {"held_by": "Mike"}}   # "none" cleared
+
+
+def test_merge_facts_preserves_specs_and_state() -> None:
+    base = _baby_world(60.0)                                 # has specs + state
+    w = rwt.merge_facts(base, {"baby": {"held_by": "Shani"}})
+    assert w.get("specs") == base["specs"]
+    assert w.get("state") == base["state"]
+    assert rwt.get_facts(w)["baby"]["held_by"] == "Shani"
+
+
+def test_format_physical_facts() -> None:
+    txt = rwt.format_physical_facts({"baby": {"held_by": "Shani", "location": "Sofa"}})
+    assert "Physische Realitaet" in txt
+    assert "Shani" in txt and "Sofa" in txt
+    assert rwt.format_physical_facts({}) == ""
+
+
+def test_physical_entities_from_specs_and_facts() -> None:
+    w = _baby_world(60.0)                                    # spec entity "baby"
+    w = rwt.merge_facts(w, {"crib": {"location": "Schlafzimmer"}})
+    assert rwt.physical_entities(w) == ["baby", "crib"]
+
+
 # ─── caregiver + shared awareness (multi-chat) ────────────────────────
 
 

@@ -35,6 +35,7 @@ from lexy_core.coordination.convergence import (
     ConvergenceDetector,
     ConvergenceResult,
 )
+from lexy_core.coordination.fact_extractor import FactExtractor
 from lexy_core.coordination.loop import (
     CoordinationLoop,
     LoopConfig,
@@ -69,6 +70,7 @@ __all__ = [
     "Demand",
     "Referee",
     "Verdict",
+    "FactExtractor",
     "CoordinationLoop",
     "LoopConfig",
     "TickReport",

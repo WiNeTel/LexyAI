@@ -129,6 +129,10 @@ class GroupTurnRequest:
     # by the plugin before run_round; empty = no open demands this round.
     scene_awareness: str = ""
     obligations_by_char: dict[str, str] = field(default_factory=dict)
+    # RP-v2 Phase 2 — shared physical-continuity facts (who holds the baby,
+    # where it is …) as a MUST system section so no character contradicts the
+    # scene's physical reality. Plugin populates it from world.json "facts".
+    physical_facts: str = ""
 
 
 @dataclass
@@ -1022,6 +1026,7 @@ class GroupTurnOrchestrator:
         "age_guidance",
         "char_state",
         "open_obligations",          # RP-v2 — caregiver "act now" duty
+        "physical_continuity",       # RP-v2 Phase 2 — shared physical reality
         "others",
         "example_dialog",
         "global_style",
@@ -1169,6 +1174,19 @@ class GroupTurnOrchestrator:
                     text=f"## Offene Verpflichtung (jetzt handeln!)\n{obligation}",
                     role="system",
                     max_tokens=200,
+                )
+            )
+
+        # RP-v2 Phase 2 — shared physical reality (who holds the baby, where
+        # it is). MUST so it survives trimming and binds every character.
+        if (req.physical_facts or "").strip():
+            sections.append(
+                PromptSection(
+                    name="physical_continuity",
+                    priority=Priority.MUST,
+                    text=req.physical_facts.strip(),
+                    role="system",
+                    max_tokens=240,
                 )
             )
 
