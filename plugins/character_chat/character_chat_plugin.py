@@ -34,7 +34,12 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from lexy_core.coordination import FactExtractor, Referee
+from lexy_core.coordination import (
+    FactExtractor,
+    Referee,
+    SceneDirector,
+    looks_like_has_dependent,
+)
 from lexy_core.plugin_system import BasePlugin
 from lexy_core.utils.logging import get_logger
 
@@ -976,6 +981,11 @@ class CharacterChatPlugin(BasePlugin):
         # Coordination kernel: brain used by the Referee when adjudicating
         # whether a narrated action satisfied a demand (B4c sim-loop).
         self._referee_brain = str(cfg.get("referee_brain", "e4b") or "e4b")
+        # Scene Director (Phase 4): how auto-provisioning of detected needs
+        # behaves — "off" (never), "confirm" (suggest, user applies; default),
+        # "auto" (apply immediately).
+        _sd = str(cfg.get("scene_director_mode", "confirm") or "confirm").lower()
+        self._scene_director_mode = _sd if _sd in ("off", "confirm", "auto") else "confirm"
 
         # Context window overrides. Positive = force this size; 0 = auto
         # from brain. Safety margin reserves room for tokenizer overhead
@@ -1082,6 +1092,25 @@ class CharacterChatPlugin(BasePlugin):
                 "Entity/Attribut + definierte Beduerfnisse)."
             ),
             schema=rp_world_tools.WORLD_SNAPSHOT_SCHEMA,
+        )
+        self.api.register_tool(
+            name="rp_analyze_scene",
+            handler=self._tool_rp_analyze_scene,
+            description=(
+                "Scene Director: erkenne aus Persona/Beziehungen/Chat "
+                "Abhaengige (z.B. ein Baby) und schlage passende Beduerfnisse "
+                "vor bzw. lege sie an (je nach scene_director_mode)."
+            ),
+            schema=rp_world_tools.ANALYZE_SCENE_SCHEMA,
+        )
+        self.api.register_tool(
+            name="rp_apply_scene_proposal",
+            handler=self._tool_rp_apply_scene_proposal,
+            description=(
+                "Wende einen Scene-Director-Vorschlag an (definiere die "
+                "vorgeschlagenen Beduerfnisse) — der Bestaetigungs-Schritt."
+            ),
+            schema=rp_world_tools.APPLY_PROPOSAL_SCHEMA,
         )
 
         self.api.register_tool(
@@ -2077,6 +2106,114 @@ class CharacterChatPlugin(BasePlugin):
             facts=rp_world_tools.get_facts(world),
         )
 
+    # ─── Scene Director (Phase 4) ────────────────────────────────────
+
+    async def _recent_turns_text(self, session_id: str, limit: int = 6) -> str:
+        """Compact recent-turn transcript for scene analysis."""
+        container = await self._get_rp_container(session_id)
+        if container is None:
+            return ""
+        try:
+            rows = await container.list_turns(limit=limit)
+        except Exception:  # noqa: BLE001
+            return ""
+        parts: list[str] = []
+        for r in rows:
+            content = (getattr(r, "content", "") or "").strip()
+            if content:
+                parts.append(f"{getattr(r, 'character_name', '?')}: {content[:200]}")
+        return "\n".join(parts)
+
+    async def _apply_scene_needs(
+        self, session_id: str, needs: list[dict[str, Any]]
+    ) -> list[str]:
+        """Define each proposed need on the session world. Returns applied keys."""
+        container = await self._get_rp_container(session_id)
+        if container is None:
+            return []
+        world = await container.get_world()
+        applied: list[str] = []
+        for n in needs or []:
+            try:
+                world = rp_world_tools.define_need(
+                    world,
+                    entity=str(n.get("entity", "") or "").strip(),
+                    attribute=str(n.get("attribute", "") or "").strip(),
+                    rate_per_minute=float(n.get("rate_per_minute", 0) or 0),
+                    thresholds=list(n.get("thresholds") or []),
+                    caregiver=str(n.get("caregiver", "") or "").strip(),
+                    minutes_per_tick=float(self._simulation_default_interval),
+                )
+                applied.append(f"{n.get('entity')}.{n.get('attribute')}")
+            except (ValidationError, ValueError, TypeError) as exc:
+                log.warning("character_chat.scene_need_apply_failed", error=str(exc))
+        if applied:
+            await container.set_world(world)
+        return applied
+
+    async def _run_scene_director(
+        self, session_id: str, *, recent_text: str = ""
+    ) -> dict[str, Any]:
+        """Analyse the scene and act per ``scene_director_mode``.
+
+        off → no-op; auto → apply detected needs immediately; confirm →
+        broadcast a ``scene_director_suggestion`` for the UI to confirm.
+        """
+        if self._scene_director_mode == "off":
+            return {"ok": True, "mode": "off", "needs": []}
+        container = await self._get_rp_container(session_id)
+        if container is None:
+            return {"ok": False, "error": "no_rp_session"}
+        try:
+            chars = (
+                await self._store.list_in_session(session_id)
+                if self._store is not None
+                else []
+            )
+        except Exception:  # noqa: BLE001
+            chars = []
+        persona = "\n".join(f"{c.name}: {c.persona}" for c in chars if c.persona)
+        rel = "\n".join(
+            f"{c.name}: {c.relationships}" for c in chars if c.relationships
+        )
+        scene = str((await self._get_session_state(session_id)).get("scene") or "")
+        proposal = await SceneDirector().analyze(
+            persona=persona,
+            scenario=scene,
+            relationships=rel,
+            recent_text=recent_text,
+            llm_chat=self.api.llm_chat,
+            brain=self._referee_brain,
+        )
+        needs = proposal.get("needs") or []
+        if not needs:
+            return {"ok": True, "mode": self._scene_director_mode, "needs": []}
+        if self._scene_director_mode == "auto":
+            applied = await self._apply_scene_needs(session_id, needs)
+            log.info(
+                "character_chat.scene_director_auto",
+                session_id=session_id,
+                applied=applied,
+            )
+            return {"ok": True, "mode": "auto", "applied": applied}
+        # confirm — suggest, let the user/UI apply via rp_apply_scene_proposal
+        try:
+            await self.api.ws_broadcast(
+                {
+                    "type": "scene_director_suggestion",
+                    "session_id": session_id,
+                    "needs": needs,
+                    "note": proposal.get("note", ""),
+                }
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return {
+            "ok": True,
+            "mode": "confirm",
+            "proposal": {"needs": needs, "note": proposal.get("note", "")},
+        }
+
     async def _resolve_open_demands(
         self, session_id: str, demands: list[Any], turns: list[Any]
     ) -> None:
@@ -2412,6 +2549,35 @@ class CharacterChatPlugin(BasePlugin):
             "needs": rp_world_tools.list_needs(world),
         }
 
+    async def _tool_rp_analyze_scene(self, **kwargs: Any) -> dict[str, Any]:
+        """Run the Scene Director on a session (detect dependents/needs).
+
+        Behaviour follows ``scene_director_mode``: off → no-op, auto → apply
+        detected needs immediately, confirm → return + broadcast a proposal
+        the UI can confirm (apply via ``rp_apply_scene_proposal``).
+        """
+        session_id = str(kwargs.get("session_id", "") or "")
+        if await self._get_rp_container(session_id) is None:
+            return {"ok": False, "error": "no_rp_session"}
+        recent = await self._recent_turns_text(session_id)
+        return await self._run_scene_director(session_id, recent_text=recent)
+
+    async def _tool_rp_apply_scene_proposal(self, **kwargs: Any) -> dict[str, Any]:
+        """Apply a Scene-Director proposal's needs (the confirm-flow action)."""
+        session_id = str(kwargs.get("session_id", "") or "")
+        container = await self._get_rp_container(session_id)
+        if container is None:
+            return {"ok": False, "error": "no_rp_session"}
+        applied = await self._apply_scene_needs(
+            session_id, list(kwargs.get("needs") or [])
+        )
+        world = await container.get_world()
+        return {
+            "ok": True,
+            "applied": applied,
+            "snapshot": rp_world_tools.snapshot(world),
+        }
+
     async def _tool_spawn_character(self, **kwargs: Any) -> dict[str, Any]:
         """Create a character, optionally auto-attach + register pulses.
 
@@ -2475,6 +2641,19 @@ class CharacterChatPlugin(BasePlugin):
                     await self._register_pulse_timer(saved, session_id)
                 # Phase 9.12: same auto-tag as ``_tool_attach_character``.
                 await self._maybe_tag_session_rp(session_id)
+                # Scene Director (Phase 4): if this character implies a
+                # dependent ("has a baby" etc.), offer/auto-provision its
+                # needs. Cheap keyword pre-filter avoids an LLM call on every
+                # spawn; fire-and-forget so batch spawns stay fast.
+                if self._scene_director_mode != "off" and looks_like_has_dependent(
+                    f"{saved.persona} {saved.relationships}"
+                ):
+                    asyncio.create_task(
+                        self._run_scene_director(
+                            session_id, recent_text=saved.persona
+                        ),
+                        name=f"scene_director.{session_id}",
+                    )
             except Exception as exc:  # noqa: BLE001
                 log.warning(
                     "character_chat.spawn_auto_attach_failed",

@@ -43,6 +43,10 @@ from lexy_core.coordination.loop import (
     TickReport,
 )
 from lexy_core.coordination.referee import Referee, Verdict
+from lexy_core.coordination.scene_director import (
+    SceneDirector,
+    looks_like_has_dependent,
+)
 from lexy_core.coordination.scene_spec import (
     NeedSpec,
     build_world_state,
@@ -71,6 +75,8 @@ __all__ = [
     "Referee",
     "Verdict",
     "FactExtractor",
+    "SceneDirector",
+    "looks_like_has_dependent",
     "CoordinationLoop",
     "LoopConfig",
     "TickReport",
