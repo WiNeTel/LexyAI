@@ -21,6 +21,14 @@ config_defaults:
   max_tokens_per_turn: 4096
   # Temperature per turn — RP wants a bit of warmth, not clinical prose.
   temperature: 0.8
+  # RP "thinking" experiment: run character turns WITH the model's reasoning
+  # enabled. Can improve multi-turn state adherence (e.g. not re-undressing /
+  # re-standing each turn) on weaker models, but adds latency. Off by default.
+  # The env var LEXY_RP_THINKING overrides this (1/true/yes/on → on, 0 → off).
+  rp_thinking: false
+  # Token budget for a character turn when rp_thinking is on (floored at
+  # max_tokens_per_turn so reasoning never starves the visible reply).
+  rp_thinking_max_tokens: 1600
   # Sequential-turn budget: how many characters speak in one round after a user
   # message. Phase 13.2: dropped from 4 → 2. With 4 chars all reacting to
   # every pulse the chat became "ich auch / ich auch / ich auch" — same
