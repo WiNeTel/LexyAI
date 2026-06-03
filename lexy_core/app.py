@@ -25,6 +25,7 @@ Startup order (see ``architecture/overview.md``):
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 from pathlib import Path
 from typing import Any
@@ -153,6 +154,13 @@ class LexyApp:
         self.config = load_config(self._config_path)
         set_config(self.config)
         configure_logging(level=self.config.system.log_level)
+
+        # Bridge the ``system.debug_prompts`` config flag to the env var that
+        # group_turn reads (it's deliberately framework-agnostic and imports
+        # no config). ``setdefault`` means an explicit env var still wins, so
+        # ``LEXY_DEBUG_PROMPTS=0`` can force it off even when config is true.
+        if self.config.system.debug_prompts:
+            os.environ.setdefault("LEXY_DEBUG_PROMPTS", "1")
 
         log.info(
             "app.starting",
