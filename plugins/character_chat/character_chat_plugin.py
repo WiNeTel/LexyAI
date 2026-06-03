@@ -408,10 +408,20 @@ class CharacterChatPlugin(BasePlugin):
                 skipped INTEGER NOT NULL DEFAULT 0,
                 trigger_kind TEXT NOT NULL DEFAULT 'user',
                 trigger_text TEXT NOT NULL DEFAULT '',
+                reasoning TEXT NOT NULL DEFAULT '',
                 created_at REAL NOT NULL
             )
             """
         )
+        # Lazy migration: add ``reasoning`` to pre-existing tables. Idempotent —
+        # a duplicate-column error just means it's already there.
+        try:
+            await db.execute(
+                "ALTER TABLE character_turns ADD COLUMN "
+                "reasoning TEXT NOT NULL DEFAULT ''"
+            )
+        except Exception:  # noqa: BLE001
+            pass
         # Per-session opt-in: when ``character_mode = 1``, the
         # ``before_user_input`` hook intercepts the user message and runs
         # a character round instead of the normal agent flow.
@@ -484,6 +494,7 @@ class CharacterChatPlugin(BasePlugin):
 
         self._orchestrator = GroupTurnOrchestrator(
             llm_chat=self.api.llm_chat,
+            llm_chat_structured=self.api.llm_chat_structured,
             brain=self._default_brain,
             max_tokens=self._max_tokens,
             temperature=self._temperature,
@@ -4170,6 +4181,7 @@ class CharacterChatPlugin(BasePlugin):
                         skipped=t.skipped,
                         trigger_kind=trigger_kind,
                         trigger_text=trigger_text,
+                        reasoning=getattr(t, "reasoning", "") or "",
                         created_at=now,
                     ))
                 except Exception as exc:  # noqa: BLE001
@@ -4183,8 +4195,8 @@ class CharacterChatPlugin(BasePlugin):
                 await db.execute(
                     "INSERT INTO character_turns (id, session_id, character_id, "
                     "character_name, round_id, order_num, content, skipped, "
-                    "trigger_kind, trigger_text, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "trigger_kind, trigger_text, reasoning, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         turn_id,
                         session_id,
@@ -4196,6 +4208,7 @@ class CharacterChatPlugin(BasePlugin):
                         1 if t.skipped else 0,
                         trigger_kind,
                         trigger_text,
+                        getattr(t, "reasoning", "") or "",
                         now,
                     ),
                 )
@@ -5010,6 +5023,9 @@ def _turn_to_public(turn: CharacterTurn) -> dict[str, Any]:
         "content": turn.content,
         "skipped": turn.skipped,
         "order": turn.order,
+        # Display-only chain-of-thought (empty unless RP thinking is on). The
+        # frontend shows it collapsed in the bubble; it never goes into prompts.
+        "reasoning": getattr(turn, "reasoning", "") or "",
     }
 
 

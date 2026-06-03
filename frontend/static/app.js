@@ -3187,6 +3187,7 @@
                         content: t.content,
                         skipped: t.skipped,
                         order: t.order,
+                        reasoning: t.reasoning,
                         created_at: t.created_at,
                         session_id: sessionId,
                     });
@@ -6547,6 +6548,23 @@
         targetWindow.scrollTop = targetWindow.scrollHeight;
     }
 
+    function buildCharacterReasoningBlock(reasoning) {
+        // Display-only collapsible "thoughts" shown INSIDE the character
+        // bubble (collapsed by default). The reasoning is NEVER sent back
+        // into a prompt — it's purely for inspecting what the model thought.
+        const details = document.createElement("details");
+        details.className = "char-reasoning";
+        details.open = false;
+        const summary = document.createElement("summary");
+        summary.textContent = "💭 Gedanken";
+        const bodyEl = document.createElement("div");
+        bodyEl.className = "char-reasoning-body";
+        bodyEl.textContent = String(reasoning || "");  // textContent, never innerHTML
+        details.appendChild(summary);
+        details.appendChild(bodyEl);
+        return details;
+    }
+
     function appendCharacterTurn(turn) {
         // Phase 9.12: Charakter-Turns gehören eigentlich immer in den
         // Rollenspiel-Tab. Falls aus Legacy-Gründen ein Char-Turn für
@@ -6605,6 +6623,12 @@
             renderRpText(text, turn.content || "");
         }
         body.appendChild(text);
+
+        // Display-only chain-of-thought (collapsed). Present only when RP
+        // thinking is on; never part of the prompt — purely for inspection.
+        if (!turn.skipped && turn.reasoning && String(turn.reasoning).trim()) {
+            body.appendChild(buildCharacterReasoningBlock(turn.reasoning));
+        }
 
         // Action bar — at parity with normal-chat bubbles. Edit / delete /
         // regenerate dispatch via WS to the character_chat plugin's

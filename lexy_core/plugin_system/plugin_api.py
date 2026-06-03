@@ -85,6 +85,23 @@ class PluginAPI:
             raise RuntimeError("LLM client not initialised")
         return await self._app.llm.chat(messages=messages, brain=brain, **kwargs)
 
+    async def llm_chat_structured(
+        self,
+        messages: list[dict[str, str]],
+        brain: str = "auto",
+        **kwargs: Any,
+    ) -> tuple[str, str]:
+        """Single-shot chat returning ``(content, reasoning)``.
+
+        The reasoning (chain-of-thought) is **display only** — never put it
+        back into a prompt or into memory.
+        """
+        if not self._app.llm:
+            raise RuntimeError("LLM client not initialised")
+        return await self._app.llm.chat_structured(
+            messages=messages, brain=brain, **kwargs
+        )
+
     async def llm_chat_stream(
         self,
         messages: list[dict[str, str]],

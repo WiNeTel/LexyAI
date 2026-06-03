@@ -281,6 +281,31 @@ class LexyLLM:
                 content_parts.append(chunk)
         return "".join(content_parts)
 
+    async def chat_structured(
+        self,
+        messages: list[dict[str, Any]],
+        brain: str = "auto",
+        **overrides: Any,
+    ) -> tuple[str, str]:
+        """Single-shot completion returning ``(content, reasoning)``.
+
+        Same as :meth:`chat` but ALSO accumulates the model's reasoning
+        (chain-of-thought) as a second value. The reasoning is **display
+        only** — callers must never feed it back into a later prompt or into
+        memory, or it pollutes the context. Empty string when the model emits
+        no reasoning (e.g. ``thinking=False``).
+        """
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        async for kind, chunk in self.chat_stream_structured(
+            messages=messages, brain=brain, **overrides
+        ):
+            if kind == "content":
+                content_parts.append(chunk)
+            elif kind == "reasoning":
+                reasoning_parts.append(chunk)
+        return "".join(content_parts), "".join(reasoning_parts)
+
     # ─── Streaming (content only, legacy signature) ─────────────────
 
     async def chat_stream(

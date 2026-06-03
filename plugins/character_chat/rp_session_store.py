@@ -94,6 +94,9 @@ class TurnRow:
     skipped: bool = False
     trigger_kind: str = "user"
     trigger_text: str = ""
+    # Display-only chain-of-thought (only when RP thinking is on). Never fed
+    # back into a prompt — shown collapsed in the chat bubble.
+    reasoning: str = ""
     created_at: float = field(default_factory=time.time)
 
 
@@ -182,6 +185,7 @@ CREATE TABLE IF NOT EXISTS turns (
     skipped INTEGER NOT NULL DEFAULT 0,
     trigger_kind TEXT NOT NULL DEFAULT 'user',
     trigger_text TEXT NOT NULL DEFAULT '',
+    reasoning TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_turns_char ON turns(character_id, created_at);
@@ -524,8 +528,8 @@ class RPSessionContainer:
         await db.execute(
             "INSERT INTO turns (id, character_id, character_name, "
             "round_id, order_num, content, skipped, trigger_kind, "
-            "trigger_text, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "trigger_text, reasoning, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 turn.id,
                 turn.character_id,
@@ -536,6 +540,7 @@ class RPSessionContainer:
                 1 if turn.skipped else 0,
                 turn.trigger_kind,
                 turn.trigger_text,
+                turn.reasoning,
                 turn.created_at,
             ),
         )
@@ -553,7 +558,7 @@ class RPSessionContainer:
             cursor = await db.execute(
                 "SELECT id, character_id, character_name, round_id, "
                 "order_num, content, skipped, trigger_kind, trigger_text, "
-                "created_at FROM turns WHERE character_id = ? "
+                "reasoning, created_at FROM turns WHERE character_id = ? "
                 "ORDER BY created_at ASC, order_num ASC LIMIT ?",
                 (character_id, limit),
             )
@@ -561,7 +566,7 @@ class RPSessionContainer:
             cursor = await db.execute(
                 "SELECT id, character_id, character_name, round_id, "
                 "order_num, content, skipped, trigger_kind, trigger_text, "
-                "created_at FROM turns "
+                "reasoning, created_at FROM turns "
                 "ORDER BY created_at ASC, order_num ASC LIMIT ?",
                 (limit,),
             )
@@ -578,7 +583,8 @@ class RPSessionContainer:
                 skipped=bool(r[6]),
                 trigger_kind=str(r[7]),
                 trigger_text=str(r[8]),
-                created_at=float(r[9]),
+                reasoning=str(r[9]),
+                created_at=float(r[10]),
             )
             for r in rows
         ]
@@ -588,7 +594,7 @@ class RPSessionContainer:
         cursor = await db.execute(
             "SELECT id, character_id, character_name, round_id, "
             "order_num, content, skipped, trigger_kind, trigger_text, "
-            "created_at FROM turns WHERE id = ?",
+            "reasoning, created_at FROM turns WHERE id = ?",
             (turn_id,),
         )
         row = await cursor.fetchone()
@@ -605,7 +611,8 @@ class RPSessionContainer:
             skipped=bool(row[6]),
             trigger_kind=str(row[7]),
             trigger_text=str(row[8]),
-            created_at=float(row[9]),
+            reasoning=str(row[9]),
+            created_at=float(row[10]),
         )
 
     async def update_turn_content(self, turn_id: str, content: str) -> None:
@@ -627,7 +634,7 @@ class RPSessionContainer:
         cursor = await db.execute(
             "SELECT id, character_id, character_name, round_id, "
             "order_num, content, skipped, trigger_kind, trigger_text, "
-            "created_at FROM turns WHERE round_id = ? "
+            "reasoning, created_at FROM turns WHERE round_id = ? "
             "ORDER BY order_num ASC",
             (round_id,),
         )
@@ -644,7 +651,8 @@ class RPSessionContainer:
                 skipped=bool(r[6]),
                 trigger_kind=str(r[7]),
                 trigger_text=str(r[8]),
-                created_at=float(r[9]),
+                reasoning=str(r[9]),
+                created_at=float(r[10]),
             )
             for r in rows
         ]
@@ -733,6 +741,14 @@ class RPSessionContainer:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(str(db_path))
         await self._db.executescript(_SCHEMA)
+        # Lazy migration for sessions created before the ``reasoning`` column.
+        # Idempotent — a duplicate-column error just means it already exists.
+        try:
+            await self._db.execute(
+                "ALTER TABLE turns ADD COLUMN reasoning TEXT NOT NULL DEFAULT ''"
+            )
+        except Exception:  # noqa: BLE001
+            pass
         await self._db.commit()
 
     async def _write_json_async(self, name: str, data: Any) -> None:
