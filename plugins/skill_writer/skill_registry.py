@@ -66,6 +66,16 @@ class SkillEntry:
     allowed_tools: str | None = None
     body_md: str = ""
 
+    # ── P3/P5 (curator lifecycle + self-refine versioning) ───────
+    # ``state`` is the curator lifecycle (active → stale → archived),
+    # distinct from ``status`` (active/disabled/failed = usability).
+    # ``pinned`` exempts a skill from curation. ``version``/``supersedes``
+    # track self-refine iterations.
+    version: int = 1
+    supersedes: str | None = None
+    pinned: bool = False
+    state: str = "active"
+
     def to_public(self) -> dict[str, Any]:
         """JSON-friendly dict for REST/WS responses."""
         return {
@@ -85,6 +95,10 @@ class SkillEntry:
             "compatibility": self.compatibility,
             "metadata": dict(self.metadata),
             "allowed_tools": self.allowed_tools,
+            "version": self.version,
+            "supersedes": self.supersedes,
+            "pinned": self.pinned,
+            "state": self.state,
         }
 
 
@@ -94,7 +108,8 @@ _SELECT_COLS = (
     "id, name, description, file_path, status, "
     "created_at, updated_at, usage_count, success_count, "
     "failure_count, last_used_at, source, "
-    "license, compatibility, metadata_json, allowed_tools, body_md"
+    "license, compatibility, metadata_json, allowed_tools, body_md, "
+    "version, supersedes, pinned, state"
 )
 
 
@@ -128,6 +143,10 @@ def _row_to_entry(row: tuple[Any, ...]) -> SkillEntry:
         metadata=metadata,
         allowed_tools=row[15],
         body_md=row[16] or "",
+        version=int(row[17]) if row[17] is not None else 1,
+        supersedes=row[18],
+        pinned=bool(row[19]),
+        state=row[20] or "active",
     )
 
 
@@ -139,6 +158,16 @@ _PHASE_11_COLUMNS: tuple[tuple[str, str], ...] = (
     ("metadata_json", "TEXT NOT NULL DEFAULT '{}'"),
     ("allowed_tools", "TEXT"),
     ("body_md", "TEXT NOT NULL DEFAULT ''"),
+)
+
+
+# P3/P5 — curator lifecycle + self-refine versioning columns. Added via the
+# same idempotent ALTER pattern so existing DBs upgrade in place.
+_CURATOR_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("version", "INTEGER NOT NULL DEFAULT 1"),
+    ("supersedes", "TEXT"),
+    ("pinned", "INTEGER NOT NULL DEFAULT 0"),
+    ("state", "TEXT NOT NULL DEFAULT 'active'"),
 )
 
 
@@ -181,14 +210,17 @@ class SkillRegistry:
                 compatibility TEXT,
                 metadata_json TEXT NOT NULL DEFAULT '{}',
                 allowed_tools TEXT,
-                body_md     TEXT NOT NULL DEFAULT ''
+                body_md     TEXT NOT NULL DEFAULT '',
+                version     INTEGER NOT NULL DEFAULT 1,
+                supersedes  TEXT,
+                pinned      INTEGER NOT NULL DEFAULT 0,
+                state       TEXT NOT NULL DEFAULT 'active'
             )
             """
         )
-        # Idempotent migration for DBs that pre-date Phase 11 — try
-        # to ALTER, swallow the "duplicate column" error if it's
-        # already there.
-        for col_name, col_decl in _PHASE_11_COLUMNS:
+        # Idempotent migration for DBs that pre-date Phase 11 / the curator —
+        # try to ALTER, swallow the "duplicate column" error if already there.
+        for col_name, col_decl in (*_PHASE_11_COLUMNS, *_CURATOR_COLUMNS):
             try:
                 await self._db.execute(
                     f"ALTER TABLE skills ADD COLUMN {col_name} {col_decl}"
@@ -430,6 +462,43 @@ class SkillRegistry:
         )
         await self._db.commit()
         log.info("skill_registry.status_changed", name=name, status=status)
+
+    async def set_state(self, name: str, state: str) -> None:
+        """Update the curator lifecycle state (active / stale / archived)."""
+        await self._db.execute(
+            "UPDATE skills SET state = ?, updated_at = ? WHERE name = ?",
+            (state, time.time(), name),
+        )
+        await self._db.commit()
+        log.info("skill_registry.state_changed", name=name, state=state)
+
+    async def set_pinned(self, name: str, pinned: bool) -> None:
+        """Pin (or unpin) a skill so the curator leaves it alone."""
+        await self._db.execute(
+            "UPDATE skills SET pinned = ?, updated_at = ? WHERE name = ?",
+            (1 if pinned else 0, time.time(), name),
+        )
+        await self._db.commit()
+        log.info("skill_registry.pinned_changed", name=name, pinned=pinned)
+
+    async def set_file_path(self, name: str, file_path: str) -> None:
+        """Update the on-disk folder path (used when archiving / restoring)."""
+        await self._db.execute(
+            "UPDATE skills SET file_path = ?, updated_at = ? WHERE name = ?",
+            (file_path, time.time(), name),
+        )
+        await self._db.commit()
+
+    async def set_version(
+        self, name: str, version: int, supersedes: str | None = None
+    ) -> None:
+        """Record a self-refine iteration (new version + the id it replaces)."""
+        await self._db.execute(
+            "UPDATE skills SET version = ?, supersedes = ?, updated_at = ? "
+            "WHERE name = ?",
+            (version, supersedes, time.time(), name),
+        )
+        await self._db.commit()
 
     async def load_card(self, name: str):
         """Convenience: registry entry → live :class:`SkillCard` from disk.

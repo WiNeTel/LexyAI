@@ -134,6 +134,17 @@ class MemoryConfig(BaseModel):
     vector_weight: float = 0.7
     bm25_weight: float = 0.3
     fts_db_path: str = "./data/memory/fts.db"
+    # Recoverable archive: "deleting" a memory copies it into a sibling
+    # ``__archive__<collection>`` first, so cleanup (dedup, decay,
+    # contradiction-supersede) is always reversible. ``archive_purge_days``
+    # is the long TTL after which archived items may be purged for good.
+    archive_enabled: bool = True
+    archive_purge_days: int = 180
+    # When true, ``recall`` bumps ``access_count`` / ``last_accessed`` on the
+    # returned items (off the hot path). Usage-based decay uses this signal to
+    # only forget memories that were never recalled. Disable if write
+    # amplification ever shows up in profiling.
+    track_access: bool = True
 
 
 class EmbeddingConfig(BaseModel):

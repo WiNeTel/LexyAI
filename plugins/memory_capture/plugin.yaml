@@ -31,3 +31,11 @@ config_defaults:
   # Per-session cooldown for the LLM classifier so we're not making
   # an extra LLM call on every single message in a busy session.
   implicit_classify_cooldown: 30
+  # P2 — contradiction-aware writes. When a new fact is very close to an
+  # existing one (cosine >= contradiction_band_min), a tiny e4b call decides
+  # duplicate / contradiction / unrelated. On contradiction the stale fact is
+  # superseded and recoverably archived. Disable to fall back to plain
+  # skip-on-similar dedup.
+  contradiction_resolution_enabled: true
+  contradiction_brain: e4b
+  contradiction_band_min: 0.85

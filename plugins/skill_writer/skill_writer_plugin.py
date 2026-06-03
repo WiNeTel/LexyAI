@@ -26,7 +26,10 @@ Features:
 from __future__ import annotations
 
 import importlib.util
+import asyncio
 import json
+import re
+import shutil
 import sys
 import time
 import uuid
@@ -37,13 +40,88 @@ from lexy_core.plugin_system import BasePlugin
 from lexy_core.utils.logging import get_logger
 
 from .auto_agent import AgentManager
+from .skill_curator import DEFAULT_MANAGED_SOURCES, SkillCurator
+from .skill_executions import SkillExecutionLog, should_refine
+from .skill_index import build_catalog_block
 from .skill_loader import SkillLoaderError, load_skill_folder
 from .skill_registry import SkillRegistry
 from .skill_spec import SkillSpecError
 from .skill_template import emit_skill_folder, sanitize_skill_name
 from .skill_validator import SkillValidator
+from .task_detector import TaskDetector, TaskSignal
 
 log = get_logger(module="skill_writer_plugin")
+
+
+# P4 — prompt the author brain uses to draft a reusable skill from a detected
+# tool pattern. Output is strict JSON so it can be parsed + auto-registered.
+_AUTO_SKILL_DRAFT_PROMPT = """\
+Du bist Lexys Skill-Autor. Aus einer wiederkehrenden Aufgabe sollst du einen \
+wiederverwendbaren Skill bauen.
+
+Kontext:
+- Auslöser: %REASON%
+- Genutzte Tools (Reihenfolge): %TOOLS%
+- Letzte User-Aufgabe: %REQUEST%
+
+Schreibe einen kleinen Python-Skill, der diese Aufgabe automatisiert. Der Code \
+ist NUR der Body einer Funktion `execute(api, **kwargs)` — keine Signatur, kein \
+Header, keine Markdown-Fences. Verfügbar sind `api` (Lexy PluginAPI) und \
+`kwargs`. Erlaubte Imports: json, re, datetime, math, collections, itertools, \
+functools, pathlib, time, hashlib, base64. KEIN os/sys/subprocess/open.
+
+Antworte AUSSCHLIESSLICH als JSON (kein weiterer Text):
+{"name": "kebab-case-name", "description": "Was der Skill tut + wann nutzen", \
+"code": "return {...}"}"""
+
+
+# P5 — prompt the refine brain uses to patch a failing skill. Same strict-JSON
+# contract as the draft prompt so the result can be parsed + re-registered.
+_REFINE_SKILL_PROMPT = """\
+Du bist Lexys Skill-Reparateur. Ein Skill schlägt wiederholt fehl. Repariere ihn.
+
+Skill: %NAME%
+Beschreibung: %DESCRIPTION%
+
+Aktueller Code (Body von `execute(api, **kwargs)`):
+%CODE%
+
+Letzte Fehler:
+%FAILURES%
+
+Schreibe eine korrigierte Version. Der Code ist NUR der Body von \
+`execute(api, **kwargs)` — keine Signatur, kein Header, keine Fences. Erlaubte \
+Imports: json, re, datetime, math, collections, itertools, functools, pathlib, \
+time, hashlib, base64. KEIN os/sys/subprocess/open.
+
+Antworte AUSSCHLIESSLICH als JSON:
+{"name": "%NAME%", "description": "ggf. verbessert", "code": "return {...}"}"""
+
+
+# Anti-thrash: at most one self-refine attempt per skill per this window.
+_REFINE_COOLDOWN_SECONDS = 300.0
+
+
+def _parse_skill_draft(response: str) -> tuple[str, str, str] | None:
+    """Parse the author brain's JSON draft → ``(name, description, code)``.
+
+    Returns ``None`` when the output isn't usable (the auto-learn attempt is
+    then quietly dropped — it's best-effort).
+    """
+    text = str(response or "").strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    name = str(data.get("name") or "").strip()
+    description = str(data.get("description") or "").strip()
+    code = str(data.get("code") or "").strip()
+    if not name or not description or not code:
+        return None
+    return (name, description, code)
 
 
 # ── Tool Schemas ───────────────────────────────────────────────────────────
@@ -212,9 +290,22 @@ class SkillWriterPlugin(BasePlugin):
         self._validator: SkillValidator | None = None
         self._registry: SkillRegistry | None = None
         self._agent_manager: AgentManager | None = None
+        self._curator: SkillCurator | None = None
         self._skills_path: Path = Path("./data/skills")
         self._require_approval: bool = True
         self._auto_propose: bool = True
+        self._inject_skill_catalog: bool = True
+        self._catalog_inline_max: int = 12
+        # P4 — autonomous skill learning
+        self._detector: TaskDetector | None = None
+        self._auto_learn_skills: bool = True
+        self._skill_author_brain: str = "e4b"
+        # P5 — self-refinement
+        self._exec_log: SkillExecutionLog | None = None
+        self._self_refine_skills: bool = True
+        self._refine_after_failures: int = 3
+        self._refine_brain: str = "e4b"
+        self._refine_cooldown: dict[str, float] = {}
 
     # ─── Lifecycle ──────────────────────────────────────────────────
 
@@ -229,6 +320,10 @@ class SkillWriterPlugin(BasePlugin):
         self._skills_path.mkdir(parents=True, exist_ok=True)
         self._require_approval = bool(config.get("require_approval", True))
         self._auto_propose = bool(config.get("auto_propose", True))
+        self._inject_skill_catalog = bool(config.get("inject_skill_catalog", True))
+        self._catalog_inline_max = int(config.get("catalog_inline_max", 12))
+        self._auto_learn_skills = bool(config.get("auto_learn_skills", True))
+        self._skill_author_brain = str(config.get("skill_author_brain", "e4b"))
 
         max_size = int(config.get("max_skill_size_bytes", 10000))
         allowed_imports = list(config.get("sandbox_allowed_imports", []))
@@ -295,6 +390,13 @@ class SkillWriterPlugin(BasePlugin):
 
         self._registry = SkillRegistry(db=db, skills_path=self._skills_path)
         await self._registry.init_tables()
+
+        # P5 — skill execution log (for self-refinement error context).
+        self._exec_log = SkillExecutionLog(db=db)
+        await self._exec_log.init_tables()
+        self._self_refine_skills = bool(config.get("self_refine_skills", True))
+        self._refine_after_failures = int(config.get("refine_after_failures", 3))
+        self._refine_brain = str(config.get("refine_brain", "e4b"))
 
         # Vorhandene Skills vom Disk einlesen
         scanned = await self._registry.scan_disk()
@@ -404,6 +506,31 @@ class SkillWriterPlugin(BasePlugin):
             "agent_list_request", self._ws_agent_list_request
         )
 
+        # ── P3 — Skill Curator (lifecycle + low-success safety net) ──
+        if self._registry is not None:
+            self._curator = SkillCurator(
+                registry=self._registry,
+                skills_path=self._skills_path,
+                api=self.api,
+                stale_days=int(config.get("stale_days", 30)),
+                archive_days=int(config.get("archive_days", 90)),
+                min_success_rate=float(config.get("min_success_rate", 0.4)),
+                min_runs=int(config.get("min_runs", 5)),
+                interval_hours=float(config.get("curator_interval_hours", 24.0)),
+                min_idle_minutes=float(config.get("curator_min_idle_minutes", 10.0)),
+            )
+            if bool(config.get("curator_enabled", True)):
+                self._curator.start()
+            self.api.register_ws_handler(
+                "skill_curator_run", self._ws_curator_run
+            )
+            self.api.register_ws_handler(
+                "skill_curator_status", self._ws_curator_status
+            )
+            self.api.register_ws_handler("skill_pin", self._ws_skill_pin)
+            self.api.register_ws_handler("skill_restore", self._ws_skill_restore)
+            self.api.on_event("core.user_message", self._on_user_activity)
+
         # ── Hook: Inject agent status into prompt context ──
 
         self.api.register_hook(
@@ -412,15 +539,40 @@ class SkillWriterPlugin(BasePlugin):
             priority=60,
         )
 
+        # P6 — surface the skill catalogue into the system prompt so the
+        # model knows which skills exist (progressive disclosure: names +
+        # descriptions only). Uses ``system_prompt_parts`` — the channel
+        # agent._plan actually reads.
+        self.api.register_hook(
+            "before_prompt_build",
+            self._hook_inject_skill_catalog,
+            priority=55,
+        )
+
         # ── Events ──
 
         self.api.on_event("core.tool_error", self._on_tool_error)
         self.api.on_event("agent.done", self._on_agent_done)
 
+        # P4 — autonomous skill learning. The detector watches each turn's
+        # tool usage; a skill-worthy pattern is drafted + activated live.
+        self._detector = TaskDetector(
+            complex_threshold=int(config.get("complex_task_tool_threshold", 8)),
+            repeat_threshold=int(config.get("repeat_threshold", 3)),
+        )
+        self.api.register_hook(
+            "after_response_send",
+            self._on_response_for_skill_learning,
+            priority=50,
+        )
+
         log.info("skill_writer.enabled")
 
     async def on_disable(self) -> None:
-        """Cleanup: stop all agents."""
+        """Cleanup: stop the curator loop and all agents."""
+        if self._curator is not None:
+            await self._curator.stop()
+            self._curator = None
         if self._agent_manager is not None:
             await self._agent_manager.cleanup()
             self._agent_manager = None
@@ -737,15 +889,23 @@ class SkillWriterPlugin(BasePlugin):
         try:
             result = await module.execute(self.api, **kwargs)
             await self._registry.update_stats(skill_name, success=True)
+            if self._exec_log is not None:
+                await self._exec_log.record(skill_name, ok=True, args_json=args or "")
             log.info("skill_writer.run_ok", skill=skill_name)
             return {"skill": skill_name, "result": result}
         except Exception as exc:  # noqa: BLE001
             await self._registry.update_stats(skill_name, success=False)
+            if self._exec_log is not None:
+                await self._exec_log.record(
+                    skill_name, ok=False, error=str(exc), args_json=args or ""
+                )
             log.error(
                 "skill_writer.run_error",
                 skill=skill_name,
                 error=str(exc),
             )
+            # P5 — self-repair once the failure threshold is crossed.
+            await self._maybe_refine_skill(skill_name)
             return {"skill": skill_name, "error": str(exc)}
 
     # ─── Tool: delete_skill ─────────────────────────────────────────
@@ -888,6 +1048,65 @@ class SkillWriterPlugin(BasePlugin):
         )
         await client.send_json({"type": "skill_list", **result})
 
+    # ─── P3 — Curator WS controls ───────────────────────────────────
+
+    async def _on_user_activity(self, data: dict[str, Any]) -> None:
+        """Reset the curator idle timer on every user message."""
+        if self._curator is not None:
+            self._curator.note_activity()
+
+    async def _ws_curator_run(
+        self, client: Any, message: dict[str, Any]
+    ) -> None:
+        """WS: Run a curator cycle. ``dry_run`` previews without mutating."""
+        if self._curator is None:
+            await client.send_json({"type": "error", "error": "curator disabled"})
+            return
+        dry_run = bool(message.get("dry_run", False))
+        report = await self._curator.run(dry_run=dry_run)
+        await client.send_json({"type": "skill_curator_result", **report})
+
+    async def _ws_curator_status(
+        self, client: Any, message: dict[str, Any]
+    ) -> None:
+        """WS: Current lifecycle-state summary."""
+        if self._curator is None:
+            await client.send_json({"type": "error", "error": "curator disabled"})
+            return
+        status = await self._curator.status()
+        await client.send_json({"type": "skill_curator_status", **status})
+
+    async def _ws_skill_pin(
+        self, client: Any, message: dict[str, Any]
+    ) -> None:
+        """WS: Pin/unpin a skill so the curator leaves it alone."""
+        name = str(message.get("name", ""))
+        pinned = bool(message.get("pinned", True))
+        if self._curator is None or not name:
+            await client.send_json(
+                {"type": "error", "error": "missing name or curator disabled"}
+            )
+            return
+        ok = await self._curator.set_pinned(name, pinned)
+        await client.send_json(
+            {"type": "skill_pinned", "name": name, "pinned": pinned, "ok": ok}
+        )
+
+    async def _ws_skill_restore(
+        self, client: Any, message: dict[str, Any]
+    ) -> None:
+        """WS: Restore an archived skill back to active."""
+        name = str(message.get("name", ""))
+        if self._curator is None or not name:
+            await client.send_json(
+                {"type": "error", "error": "missing name or curator disabled"}
+            )
+            return
+        ok = await self._curator.restore(name)
+        await client.send_json(
+            {"type": "skill_restored", "name": name, "ok": ok}
+        )
+
     async def _ws_skill_approve(
         self, client: Any, message: dict[str, Any]
     ) -> None:
@@ -975,6 +1194,241 @@ class SkillWriterPlugin(BasePlugin):
         extra = data.get("extra_context", "")
         data["extra_context"] = extra + context_block
         return data
+
+    async def _hook_inject_skill_catalog(
+        self, data: dict[str, Any]
+    ) -> dict[str, Any]:
+        """before_prompt_build — append the active-skill catalogue.
+
+        Writes to ``system_prompt_parts`` (the list agent._plan consumes),
+        not the legacy ``extra_context`` channel.
+        """
+        if self._registry is None or not self._inject_skill_catalog:
+            return data
+        try:
+            entries = await self._registry.list_all(status="active")
+        except Exception as exc:  # noqa: BLE001
+            log.debug("skill_writer.catalog_list_failed", error=str(exc))
+            return data
+        block = build_catalog_block(
+            entries, inline_max=self._catalog_inline_max
+        )
+        if block:
+            parts = data.setdefault("system_prompt_parts", [])
+            if isinstance(parts, list):
+                parts.append(block)
+        return data
+
+    # ─── P4 — Autonomous skill learning ─────────────────────────────
+
+    async def _on_response_for_skill_learning(
+        self, data: dict[str, Any]
+    ) -> None:
+        """after_response_send (void) — learn a skill from a worthy pattern.
+
+        Fully autonomous: a detected pattern is drafted by the author brain
+        and registered live (no approval gate). The curator's low-success
+        net (P3) prunes any that turn out weak, and everything is recoverable.
+        """
+        if not self._auto_learn_skills or self._detector is None:
+            return
+        if not isinstance(data, dict):
+            return
+        signal = self._detector.record(data.get("tools_used") or [])
+        if signal is None:
+            return
+        try:
+            await self._auto_create_skill(signal, data)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("skill_writer.auto_learn_failed", error=str(exc))
+
+    async def _auto_create_skill(
+        self, signal: TaskSignal, ctx: dict[str, Any]
+    ) -> None:
+        """Draft + register a skill for a detected pattern (live)."""
+        if self._registry is None:
+            return
+        request = str(ctx.get("text") or "").strip()[:500] or "(unbekannt)"
+        prompt = (
+            _AUTO_SKILL_DRAFT_PROMPT.replace("%REASON%", signal.reason)
+            .replace("%TOOLS%", " > ".join(signal.tools))
+            .replace("%REQUEST%", request)
+        )
+        try:
+            response = await self.api.llm_chat(
+                messages=[{"role": "user", "content": prompt}],
+                brain=self._skill_author_brain,
+                max_tokens=800,
+                temperature=0.2,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("skill_writer.auto_draft_failed", error=str(exc))
+            return
+
+        draft = _parse_skill_draft(response)
+        if draft is None:
+            log.info("skill_writer.auto_draft_unparseable", reason=signal.reason)
+            return
+        name, description, code = draft
+
+        # Dedup: don't recreate a skill that already exists by name.
+        if await self._registry.get(sanitize_skill_name(name)) is not None:
+            log.info("skill_writer.auto_skill_exists", name=name)
+            return
+
+        result = await self._write_and_register(
+            name=name,
+            description=description,
+            code=code,
+            source_tag="auto_pattern",
+        )
+        if "error" in result:
+            log.info(
+                "skill_writer.auto_create_rejected",
+                name=name,
+                error=result["error"],
+            )
+            return
+        log.info(
+            "skill_writer.auto_created",
+            name=result.get("name"),
+            reason=signal.reason,
+        )
+        # Transparency: surface what Lexy just taught herself.
+        try:
+            await self.api.ws_broadcast(
+                {
+                    "type": "skill_auto_learned",
+                    "name": result.get("name"),
+                    "reason": signal.reason,
+                }
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ─── P5 — Self-refinement ───────────────────────────────────────
+
+    async def _maybe_refine_skill(self, name: str) -> None:
+        """Self-repair an auto-skill once it has failed enough times."""
+        if (
+            not self._self_refine_skills
+            or self._registry is None
+            or self._exec_log is None
+        ):
+            return
+        entry = await self._registry.get(name)
+        if entry is None or entry.source not in DEFAULT_MANAGED_SOURCES:
+            return  # never autonomously rewrite the user's own skills
+        if not should_refine(
+            entry.failure_count, threshold=self._refine_after_failures
+        ):
+            return
+        now = time.time()
+        if now - self._refine_cooldown.get(name, 0.0) < _REFINE_COOLDOWN_SECONDS:
+            return  # anti-thrash: one refine attempt per cooldown window
+        self._refine_cooldown[name] = now
+        try:
+            await self._refine_skill(entry)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("skill_writer.refine_failed", name=name, error=str(exc))
+
+    async def _refine_skill(self, entry: Any) -> None:
+        """Draft a patched version, validate it, then swap it in live.
+
+        The old version is recoverably archived to ``.archive/`` *before* the
+        new one is written, and the new code is validated first so a failed
+        draft never destroys a working skill.
+        """
+        if self._registry is None or self._validator is None or self._exec_log is None:
+            return
+        name = entry.name
+        failures = await self._exec_log.recent_failures(name, limit=5)
+        failure_text = "\n".join(f"- {f['error']}" for f in failures) or "(keine)"
+        old_code = await self._read_skill_code(entry.file_path)
+
+        brain = self._refine_brain
+        if len(old_code) > 1500:  # size-gated escalation to the deep brain
+            brain = "a4b"
+        prompt = (
+            _REFINE_SKILL_PROMPT.replace("%NAME%", name)
+            .replace("%DESCRIPTION%", entry.description or "")
+            .replace("%CODE%", old_code[:2000])
+            .replace("%FAILURES%", failure_text[:1000])
+        )
+        try:
+            response = await self.api.llm_chat(
+                messages=[{"role": "user", "content": prompt}],
+                brain=brain,
+                max_tokens=900,
+                temperature=0.2,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("skill_writer.refine_draft_failed", name=name, error=str(exc))
+            return
+
+        draft = _parse_skill_draft(response)
+        if draft is None:
+            log.info("skill_writer.refine_unparseable", name=name)
+            return
+        _, new_description, new_code = draft
+
+        # Validate BEFORE touching the live skill — keep the old one intact on
+        # a bad draft.
+        valid, err = self._validator.validate(new_code, expect_execute=False)
+        if not valid:
+            log.info("skill_writer.refine_invalid", name=name, error=err)
+            return
+
+        new_version = (entry.version or 1) + 1
+        old_id = entry.id
+
+        # Archive the old folder (recoverable), then re-register fresh.
+        old_folder = Path(entry.file_path)
+        archive_root = self._skills_path / ".archive"
+        archive_root.mkdir(parents=True, exist_ok=True)
+        dest = archive_root / f"{name}-v{entry.version}-{int(time.time())}"
+        if old_folder.is_dir():
+            try:
+                await asyncio.to_thread(shutil.move, str(old_folder), str(dest))
+            except OSError as exc:
+                log.warning(
+                    "skill_writer.refine_archive_failed", name=name, error=str(exc)
+                )
+                return
+        await self._registry.delete(name)
+
+        result = await self._write_and_register(
+            name=name,
+            description=new_description or entry.description,
+            code=new_code,
+            source_tag="self_refine",
+        )
+        if "error" in result:
+            log.warning(
+                "skill_writer.refine_write_failed", name=name, error=result["error"]
+            )
+            return
+        await self._registry.set_version(name, new_version, supersedes=old_id)
+        log.info("skill_writer.refined", name=name, version=new_version)
+        try:
+            await self.api.ws_broadcast(
+                {"type": "skill_refined", "name": name, "version": new_version}
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    @staticmethod
+    async def _read_skill_code(folder: str) -> str:
+        """Read a skill's ``scripts/skill.py`` (best-effort, for refine context)."""
+        path = Path(folder) / "scripts" / "skill.py"
+
+        def _read() -> str:
+            try:
+                return path.read_text(encoding="utf-8")
+            except OSError:
+                return ""
+
+        return await asyncio.to_thread(_read)
 
     # ─── Event Handlers ─────────────────────────────────────────────
 

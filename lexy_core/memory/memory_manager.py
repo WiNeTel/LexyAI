@@ -17,6 +17,8 @@ Embeddings come from the LexyApp-owned ``EmbeddingClient`` (Jina v3 / Jina v5).
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
 import time
 import uuid
@@ -43,6 +45,19 @@ log: structlog.BoundLogger = get_logger(module="memory_manager")
 # "scope disabled", but the sentinel survives serialisation through
 # plugin APIs where ``None`` might get coerced to a default.
 CROSS_PROJECT_SCOPE = "__all__"
+
+
+# Prefix for the per-collection recoverable-archive sibling collections
+# (e.g. ``facts`` → ``archive__facts``). Archived items are copied here
+# before being removed from the live collection so every "delete" stays
+# recoverable. Archive collections live in ``_aux_collections`` and are
+# therefore excluded from the default "search all" recall path.
+#
+# ChromaDB collection names must start *and* end with an alphanumeric
+# character (``[a-zA-Z0-9]``) with only ``._-`` allowed in between, so a
+# leading-underscore prefix like ``__archive__`` is rejected — hence the
+# leading letter here.
+ARCHIVE_PREFIX = "archive__"
 
 
 @dataclass
@@ -125,7 +140,15 @@ class MemoryManager:
         self._embedding = embedding_client
         self._client: ClientAPI | None = None
         self._collections: dict[str, Collection] = {}
+        # Auxiliary collections that must NOT appear in the default
+        # "search all" recall path: the recoverable archives
+        # (``__archive__*``) and the skill catalogue (``skills``). They are
+        # still addressable when a caller targets them explicitly.
+        self._aux_collections: dict[str, Collection] = {}
         self._fts: aiosqlite.Connection | None = None
+        # Fire-and-forget access-tracking tasks (recall bumps access_count
+        # off the hot path). Kept referenced so they aren't GC'd mid-flight.
+        self._bg_tasks: set[asyncio.Task[None]] = set()
         # Optional session store. When wired, ``store()`` can resolve the
         # current ``project_id`` from a session metadata lookup whenever
         # the caller passes ``session_id`` but not ``project_id``.
@@ -240,11 +263,15 @@ class MemoryManager:
             await self._fts.commit()
 
     async def shutdown(self) -> None:
+        for task in list(self._bg_tasks):
+            task.cancel()
+        self._bg_tasks.clear()
         if self._fts is not None:
             await self._fts.close()
             self._fts = None
         self._client = None
         self._collections.clear()
+        self._aux_collections.clear()
         log.info("memory.shutdown")
 
     # ─── Wipe operations ───────────────────────────────────────────
@@ -517,6 +544,32 @@ class MemoryManager:
         log.info("memory.collection_refreshed", collection=name)
         return col
 
+    @staticmethod
+    def _archive_name(collection: str) -> str:
+        """Return the archive sibling name for a live collection."""
+        return f"{ARCHIVE_PREFIX}{collection}"
+
+    async def ensure_aux_collection(self, name: str) -> Collection:
+        """Idempotently register an auxiliary collection.
+
+        Auxiliary collections (archives, the skill catalogue) are kept out
+        of ``_collections`` so the default "search all" recall path never
+        sweeps them, while still being addressable by explicit name.
+        """
+        if self._client is None:
+            raise RuntimeError("MemoryManager not initialised")
+        existing = self._aux_collections.get(name)
+        if existing is not None:
+            return existing
+        col = self._client.get_or_create_collection(name=name)
+        self._aux_collections[name] = col
+        log.info("memory.aux_collection_ready", collection=name)
+        return col
+
+    def _lookup_collection(self, name: str) -> Collection | None:
+        """Resolve a collection by name across live + auxiliary caches."""
+        return self._collections.get(name) or self._aux_collections.get(name)
+
     # ─── Store / Recall ─────────────────────────────────────────────
 
     async def store(
@@ -623,7 +676,19 @@ class MemoryManager:
         """
         if not query.strip():
             return []
-        targets = [collection] if collection else list(self._collections.keys())
+        # Default "search all" must never sweep archive collections. They
+        # live in ``_aux_collections`` (so they're already excluded), but
+        # we filter the prefix here too as a backstop in case one ever
+        # leaks into ``_collections``. An explicit ``collection`` target
+        # is honoured as-is and resolved against aux collections too.
+        if collection:
+            targets = [collection]
+        else:
+            targets = [
+                name
+                for name in self._collections.keys()
+                if not name.startswith(ARCHIVE_PREFIX)
+            ]
 
         scope = project_id
         if scope == CROSS_PROJECT_SCOPE:
@@ -653,7 +718,13 @@ class MemoryManager:
                     for k, v in metadata_equals.items()
                 )
             ]
-        return merged[:limit]
+        result = merged[:limit]
+        # Usage-based decay relies on knowing which memories actually get
+        # recalled. Bump ``access_count`` for the returned window off the hot
+        # path so recall latency is unaffected.
+        if self._config.track_access and result:
+            self._schedule_access_bump(result)
+        return result
 
     async def search_fts(
         self,
@@ -755,6 +826,357 @@ class MemoryManager:
         ]
         return items, total
 
+    # ─── Archive (recoverable delete) ───────────────────────────────
+
+    @staticmethod
+    def _strip_archive_tags(metadata: dict[str, Any]) -> dict[str, Any]:
+        """Fallback restore path: drop the archive bookkeeping keys when no
+        ``_origin_meta`` snapshot is present (legacy archive rows)."""
+        cleaned = dict(metadata)
+        for key in (
+            "archived_at",
+            "archive_reason",
+            "origin_collection",
+            "origin_id",
+            "_origin_meta",
+        ):
+            cleaned.pop(key, None)
+        return cleaned
+
+    @staticmethod
+    def _as_float_list(embedding: Any) -> list[float] | None:
+        """Coerce a ChromaDB embedding (list or numpy array) to ``list[float]``.
+
+        Returns ``None`` when the embedding is absent so callers can decide
+        to re-embed instead.
+        """
+        if embedding is None:
+            return None
+        try:
+            return [float(value) for value in embedding]
+        except TypeError:
+            return None
+
+    async def get_by_ids(
+        self, collection: str, ids: list[str]
+    ) -> list[dict[str, Any]]:
+        """Fetch documents + metadata + embeddings for specific ids.
+
+        Resolves across live and auxiliary collections so it works for
+        archive inspection too. Missing ids are silently skipped.
+        """
+        col = self._lookup_collection(collection)
+        if col is None or not ids:
+            return []
+        try:
+            got = col.get(
+                ids=ids,
+                include=["documents", "metadatas", "embeddings"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "memory.get_by_ids_failed", collection=collection, error=str(exc)
+            )
+            return []
+        got_ids = list(got.get("ids") or [])
+        docs = list(got.get("documents") or [])
+        metas = list(got.get("metadatas") or [])
+        raw_embs = got.get("embeddings")
+        embs = list(raw_embs) if raw_embs is not None else []
+        out: list[dict[str, Any]] = []
+        for idx, item_id in enumerate(got_ids):
+            out.append(
+                {
+                    "id": item_id,
+                    "content": docs[idx] if idx < len(docs) else "",
+                    "metadata": metas[idx] if idx < len(metas) else {},
+                    "embedding": (
+                        self._as_float_list(embs[idx]) if idx < len(embs) else None
+                    ),
+                }
+            )
+        return out
+
+    async def archive_items(
+        self,
+        collection: str,
+        ids: list[str],
+        reason: str,
+        extra_meta: dict[str, Any] | None = None,
+    ) -> dict[str, int]:
+        """Move items into the recoverable archive: copy → delete.
+
+        Items are first copied (with their embeddings) into the sibling
+        ``__archive__<collection>`` collection, tagged with ``archived_at``,
+        ``archive_reason``, ``origin_collection`` and ``origin_id``, and only
+        then removed from the live collection + FTS mirror. If the copy
+        fails, nothing is deleted, so the originals are never lost.
+
+        Returns ``{"archived": <n>, "fts": <rows>}``.
+        """
+        if not self._config.archive_enabled:
+            log.info("memory.archive_disabled", collection=collection)
+            return {"archived": 0, "fts": 0}
+        if self._client is None:
+            raise RuntimeError("MemoryManager not initialised")
+        if collection.startswith(ARCHIVE_PREFIX) or collection not in self._collections:
+            log.warning("memory.archive_bad_collection", collection=collection)
+            return {"archived": 0, "fts": 0}
+
+        items = await self.get_by_ids(collection, ids)
+        if not items:
+            return {"archived": 0, "fts": 0}
+
+        archive = await self.ensure_aux_collection(self._archive_name(collection))
+        now = time.time()
+        add_ids: list[str] = []
+        add_docs: list[str] = []
+        add_embs: list[list[float]] = []
+        add_metas: list[dict[str, Any]] = []
+        for item in items:
+            original_meta = dict(item["metadata"] or {})
+            meta = dict(original_meta)
+            meta.update(
+                {
+                    "archived_at": now,
+                    "archive_reason": reason,
+                    "origin_collection": collection,
+                    "origin_id": item["id"],
+                    # Exact snapshot of the original metadata so a restore is
+                    # byte-for-byte faithful regardless of the archive tags or
+                    # caller-supplied ``extra_meta`` mixed in above.
+                    "_origin_meta": json.dumps(original_meta, ensure_ascii=False),
+                }
+            )
+            if extra_meta:
+                meta.update(extra_meta)
+            embedding = item["embedding"]
+            if embedding is None:
+                embedding = await self._embed_one(item["content"])
+            add_ids.append(item["id"])
+            add_docs.append(item["content"])
+            add_embs.append(embedding)
+            add_metas.append(meta)
+
+        # Copy first — if this raises, the originals stay put (recoverable).
+        archive.add(
+            ids=add_ids,
+            documents=add_docs,
+            embeddings=add_embs,
+            metadatas=add_metas,
+        )
+
+        live = self._collections[collection]
+        live.delete(ids=add_ids)
+
+        fts_deleted = 0
+        if self._fts is not None:
+            placeholders = ",".join("?" for _ in add_ids)
+            cursor = await self._fts.execute(
+                f"DELETE FROM items_fts WHERE id IN ({placeholders})",
+                tuple(add_ids),
+            )
+            fts_deleted = cursor.rowcount if cursor.rowcount is not None else 0
+            await self._fts.commit()
+
+        log.info(
+            "memory.archived",
+            collection=collection,
+            count=len(add_ids),
+            reason=reason,
+            fts_rows=int(fts_deleted),
+        )
+        return {"archived": len(add_ids), "fts": int(fts_deleted)}
+
+    async def restore_items(
+        self, origin_collection: str, ids: list[str]
+    ) -> dict[str, int]:
+        """Restore archived items back into their origin collection.
+
+        Re-adds documents + embeddings (archive tags stripped) to the live
+        collection and the FTS mirror, then removes them from the archive.
+        Returns ``{"restored": <n>, "fts": <rows>}``.
+        """
+        if self._client is None:
+            raise RuntimeError("MemoryManager not initialised")
+        archive_name = self._archive_name(origin_collection)
+        await self.ensure_aux_collection(archive_name)
+        items = await self.get_by_ids(archive_name, ids)
+        if not items:
+            return {"restored": 0, "fts": 0}
+
+        if origin_collection not in self._collections:
+            await self.ensure_collection(origin_collection)
+        live = self._require_collection(origin_collection)
+
+        add_ids: list[str] = []
+        add_docs: list[str] = []
+        add_embs: list[list[float]] = []
+        add_metas: list[dict[str, Any]] = []
+        fts_rows: list[tuple[Any, ...]] = []
+        for item in items:
+            archived_meta = dict(item["metadata"] or {})
+            snapshot = archived_meta.get("_origin_meta")
+            if snapshot:
+                try:
+                    meta = json.loads(snapshot)
+                except (ValueError, TypeError):
+                    meta = self._strip_archive_tags(archived_meta)
+            else:
+                meta = self._strip_archive_tags(archived_meta)
+            embedding = item["embedding"]
+            if embedding is None:
+                embedding = await self._embed_one(item["content"])
+            add_ids.append(item["id"])
+            add_docs.append(item["content"])
+            add_embs.append(embedding)
+            add_metas.append(meta)
+            fts_rows.append(
+                (
+                    item["id"],
+                    origin_collection,
+                    item["content"],
+                    meta.get("created_at", time.time()),
+                    meta.get("project_id", DEFAULT_PROJECT_ID),
+                )
+            )
+
+        live.add(
+            ids=add_ids,
+            documents=add_docs,
+            embeddings=add_embs,
+            metadatas=add_metas,
+        )
+
+        fts_restored = 0
+        if self._fts is not None:
+            await self._fts.executemany(
+                "INSERT INTO items_fts(id, collection, content, created_at, "
+                "project_id) VALUES (?, ?, ?, ?, ?)",
+                fts_rows,
+            )
+            await self._fts.commit()
+            fts_restored = len(fts_rows)
+
+        self._aux_collections[archive_name].delete(ids=add_ids)
+
+        log.info(
+            "memory.restored",
+            collection=origin_collection,
+            count=len(add_ids),
+        )
+        return {"restored": len(add_ids), "fts": fts_restored}
+
+    async def purge_archive(
+        self, collection: str, archived_before: float
+    ) -> int:
+        """Permanently delete archived items older than ``archived_before``.
+
+        This is the only non-recoverable delete in the archive subsystem and
+        is meant to run with a long TTL (``MemoryConfig.archive_purge_days``).
+        Returns the number of items purged.
+        """
+        if self._client is None:
+            raise RuntimeError("MemoryManager not initialised")
+        archive_name = self._archive_name(collection)
+        archive = await self.ensure_aux_collection(archive_name)
+        try:
+            got = archive.get(where={"archived_at": {"$lt": archived_before}})
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "memory.purge_archive_failed", collection=collection, error=str(exc)
+            )
+            return 0
+        ids = list(got.get("ids") or [])
+        if not ids:
+            return 0
+        archive.delete(ids=ids)
+        log.warning(
+            "memory.archive_purged", collection=collection, count=len(ids)
+        )
+        return len(ids)
+
+    async def browse_archive(
+        self, collection: str, page: int = 1, limit: int = 25
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Paginate the archive for one collection (inspection / restore UI)."""
+        archive_name = self._archive_name(collection)
+        archive = await self.ensure_aux_collection(archive_name)
+        offset = max(0, (page - 1) * limit)
+        try:
+            result = archive.get(limit=limit, offset=offset)
+            total = archive.count()
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "memory.browse_archive_failed",
+                collection=collection,
+                error=str(exc),
+            )
+            return [], 0
+        ids = result.get("ids") or []
+        docs = result.get("documents") or []
+        metas = result.get("metadatas") or []
+        items = [
+            {"id": i, "content": d, "metadata": m or {}}
+            for i, d, m in zip(ids, docs, metas)
+        ]
+        return items, total
+
+    # ─── Access tracking (usage-based decay support) ────────────────
+
+    def _schedule_access_bump(self, hits: list[dict[str, Any]]) -> None:
+        """Fire-and-forget the access-count bump for a recall window."""
+        try:
+            task = asyncio.create_task(self._bump_access(list(hits)))
+        except RuntimeError:
+            # No running loop (e.g. called from sync context) — skip silently.
+            return
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    async def _bump_access(self, hits: list[dict[str, Any]]) -> None:
+        """Increment ``access_count`` + refresh ``last_accessed`` for hits.
+
+        Re-reads the full metadata per id and writes it back merged, so the
+        update can never drop existing fields (Chroma ``update`` replaces the
+        metadata blob it's given). Failures are swallowed — tracking is a
+        best-effort signal, never worth failing a recall over.
+        """
+        if not hits:
+            return
+        now = time.time()
+        by_collection: dict[str, list[str]] = {}
+        for hit in hits:
+            item_id = hit.get("id")
+            collection = hit.get("collection")
+            if item_id and collection:
+                by_collection.setdefault(collection, []).append(item_id)
+
+        for collection, ids in by_collection.items():
+            col = self._lookup_collection(collection)
+            if col is None:
+                continue
+            try:
+                got = col.get(ids=ids, include=["metadatas"])
+                got_ids = list(got.get("ids") or [])
+                metas = list(got.get("metadatas") or [])
+                new_metas: list[dict[str, Any]] = []
+                for meta in metas:
+                    merged_meta = dict(meta or {})
+                    merged_meta["access_count"] = (
+                        int(merged_meta.get("access_count", 0) or 0) + 1
+                    )
+                    merged_meta["last_accessed"] = now
+                    new_metas.append(merged_meta)
+                if got_ids:
+                    col.update(ids=got_ids, metadatas=new_metas)
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "memory.access_track_failed",
+                    collection=collection,
+                    error=str(exc),
+                )
+
     # ─── Internals ──────────────────────────────────────────────────
 
     async def _embed_one(self, text: str) -> list[float]:
@@ -808,7 +1230,7 @@ class MemoryManager:
 
         results: list[dict[str, Any]] = []
         for name in collections:
-            col = self._collections.get(name)
+            col = self._collections.get(name) or self._aux_collections.get(name)
             if col is None:
                 continue
             try:

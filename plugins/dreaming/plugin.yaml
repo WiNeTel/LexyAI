@@ -13,3 +13,19 @@ config_defaults:
   similarity_threshold: 0.85
   decay_days: 90
   min_idle_minutes: 30
+  # P1 — recoverable self-cleaning
+  # Archive (don't just log) the originals after a dedup-merge.
+  archive_merged_originals: true
+  # Usage-based decay: archive entries older than decay_days that were never
+  # recalled (access_count == 0). Recoverable via the memory archive.
+  decay_enabled: true
+  decay_requires_zero_access: true
+  decay_dry_run: false
+  # Which collections decay sweeps. Conservative default: only ephemeral
+  # session context. Widen to ["context","errors","solutions","facts"] to let
+  # Lexy forget unused knowledge too (still recoverable).
+  decay_collections: ["context"]
+  # Recoverable cleanup (decay) should run on idle even outside quiet-hours —
+  # a machine that's off at night would otherwise never clean up. Cosmetic
+  # ops (dedup/link/staleness) still wait for quiet-hours.
+  maintenance_ignores_quiet_hours: true
