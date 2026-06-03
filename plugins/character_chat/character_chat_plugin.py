@@ -2062,40 +2062,82 @@ class CharacterChatPlugin(BasePlugin):
     async def _update_physical_facts(
         self, session_id: str, turns: list[Any]
     ) -> None:
-        """Extract the current physical reality from this round's narration.
+        """Pin the scene's physical reality from this round's narration.
 
-        Keeps shared facts (who holds the baby, where it is) in sync so the
-        next turn's prompt states the truth — stops the "puts baby down →
-        back on her arm" contradiction. One cheap LLM call, only for scenes
-        that actually track an entity; fail-safe (leaves facts unchanged).
+        Extracts, in ONE cheap LLM call, both:
+
+        * **entity** positions — who holds the baby, where it is (stops the
+          "puts baby down → back on her arm" contradiction), and
+        * **each speaking character's own body state** — posture + where in
+          the room they are (stops the "stands up from the sofa twice in a
+          row" contradiction).
+
+        Both are merged into the world ``facts`` and surface next turn via the
+        MUST "Physische Realitaet (verbindlich!)" block, so the next speaker
+        starts from the truth instead of re-narrating an already-done move.
+        Fail-safe: a missed extraction leaves existing facts unchanged.
         """
         container = await self._get_rp_container(session_id)
         if container is None:
             return
         world = await container.get_world()
         entities = rp_world_tools.physical_entities(world)
-        if not entities:
+
+        # Characters who actually spoke this round — track their own posture
+        # + location so the loop closes for the speakers, not just objects.
+        labeled: list[str] = []
+        char_names: list[str] = []
+        for t in turns:
+            is_dict = isinstance(t, dict)
+            if (t.get("skipped") if is_dict else getattr(t, "skipped", False)):
+                continue
+            content = (
+                (t.get("content") if is_dict else getattr(t, "content", "")) or ""
+            ).strip()
+            name = (
+                (t.get("character_name") if is_dict
+                 else getattr(t, "character_name", "")) or ""
+            ).strip()
+            if not content or not name:
+                continue
+            if name not in char_names:
+                char_names.append(name)
+            # Name-label each turn so the extractor can attribute first-person
+            # narration ("ich stehe auf …") to the right character.
+            labeled.append(f"{name}: {content}")
+
+        if not entities and not char_names:
             return
-        narration = self._collect_narration(
-            {"turns": [_turn_to_public(t) for t in turns]}
-        )
+        narration = "\n\n".join(labeled).strip()
         if not narration:
             return
+
+        targets: list[str] = []
+        if entities:
+            targets.append(
+                f"Objekte/Personen mit Position: {', '.join(entities)} "
+                "— je held_by (wer haelt/traegt sie) und location (wo)."
+            )
+        if char_names:
+            targets.append(
+                f"Sprechende Figuren: {', '.join(char_names)} — je posture "
+                "(Koerperhaltung: sitzend/stehend/liegend/kniend …) und "
+                "location (wo im Raum: Sofa, Schreibtisch/PC, Tuer …)."
+            )
         instruction = (
-            "Bestimme den aktuellen physischen Stand dieser Entitaeten: "
-            f"{', '.join(entities)}. Fuer jede, soweit der Text es klar sagt: "
-            "held_by (welche Figur sie haelt/traegt) und location (wo sie ist). "
-            'Format: {"<entity>": {"held_by": "...", "location": "..."}}. '
-            "Lass Felder weg, die der Text nicht eindeutig nennt."
+            "Bestimme den AKTUELLEN physischen Stand am ENDE der Szene "
+            "(nimm den ZULETZT beschriebenen Stand, falls sich etwas geaendert "
+            "hat). Fuer:\n- " + "\n- ".join(targets) + "\n"
+            'Format JSON: {"<name>": {"posture": "...", "location": "...", '
+            '"held_by": "..."}}. Lass Felder weg, die der Text nicht '
+            "eindeutig nennt."
         )
         extracted = await FactExtractor().extract(
             narration, instruction, self.api.llm_chat, brain=self._referee_brain
         )
-        # Keep only known entities; drop junk keys.
-        clean = {
-            e: v for e, v in (extracted or {}).items()
-            if e in entities and isinstance(v, dict)
-        }
+        clean = rp_world_tools.clean_physical_extract(
+            extracted, set(entities) | set(char_names)
+        )
         if not clean:
             return
         world = rp_world_tools.merge_facts(world, clean)
