@@ -33,3 +33,34 @@ config_defaults:
     - time
     - hashlib
     - base64
+  # ── P3 — Skill Curator (lifecycle + low-success safety net) ──
+  # Recoverable: archived skills move to data/skills/.archive/ and can be
+  # restored. Only auto-created skills are managed; manual/imported and
+  # pinned skills are never touched.
+  curator_enabled: true
+  curator_interval_hours: 24.0
+  curator_min_idle_minutes: 10.0
+  stale_days: 30          # active → stale after this many unused days
+  archive_days: 90        # stale → archived after this many unused days
+  min_success_rate: 0.4   # auto-skill below this (after min_runs) is archived
+  min_runs: 5
+  # ── P6 — surface the skill catalogue into the system prompt ──
+  # Progressive disclosure: only name + description per skill. When more than
+  # catalog_inline_max skills exist, the most-recently-used ones are shown.
+  inject_skill_catalog: true
+  catalog_inline_max: 12
+  # ── P4 — autonomous skill learning ──
+  # Fully autonomous (no approval gate): a skill-worthy turn is drafted by the
+  # author brain and registered live. The curator's low-success net prunes weak
+  # ones; everything is recoverable. RP turns are never learned from.
+  auto_learn_skills: true
+  complex_task_tool_threshold: 8   # >= this many tools in one turn → worthy
+  repeat_threshold: 3              # same tool sequence seen N times → worthy
+  skill_author_brain: e4b
+  # ── P5 — self-refinement ──
+  # After an auto-skill fails refine_after_failures times, Lexy drafts a fixed
+  # version (live), archiving the old one. Only auto-created skills are
+  # repaired — never the user's own. e4b drafts; large bodies escalate to a4b.
+  self_refine_skills: true
+  refine_after_failures: 3
+  refine_brain: e4b

@@ -82,6 +82,29 @@ User-Nachricht: %USER_MESSAGE%"""
 _JSON_BLOCK_RE = re.compile(r"\{[^{}]*\}", re.DOTALL)
 
 
+# P2 — one-word relation classifier for contradiction resolution. Compares a
+# new fact against the closest existing one. Single-word output keeps it cheap
+# and easy to parse; anything unrecognised falls back to "store" (safe).
+_RELATION_PROMPT = """\
+Du vergleichst zwei gespeicherte Fakten über denselben User.
+
+ALT: %OLD%
+NEU: %NEW%
+
+Bestimme die Beziehung:
+- DUPLIKAT: NEU sagt im Kern dasselbe wie ALT, keine neue Information.
+- WIDERSPRUCH: NEU aktualisiert oder ersetzt ALT (z.B. neuer Wohnort, \
+geänderte Vorliebe, korrigierter Wert). ALT ist dann veraltet.
+- UNABHAENGIG: NEU und ALT betreffen verschiedene Dinge.
+
+Antworte mit GENAU einem Wort: DUPLIKAT, WIDERSPRUCH oder UNABHAENGIG."""
+
+
+# Sentinel returned by the contradiction resolver meaning "a near-identical
+# fact already exists — skip the store entirely".
+_SKIP_DUPLICATE = "__skip_duplicate__"
+
+
 class MemoryCapturePlugin(BasePlugin):
     """Captures user facts via trigger phrases and (optionally) LLM."""
 
@@ -157,6 +180,17 @@ class MemoryCapturePlugin(BasePlugin):
         self._implicit_classify_cooldown = float(
             cfg.get("implicit_classify_cooldown", 30)
         )
+        # P2 — contradiction-aware write. When a new fact is very close to an
+        # existing one (>= band), a tiny LLM call decides duplicate vs
+        # contradiction vs unrelated instead of blindly skipping. On
+        # contradiction the old fact is superseded (recoverably archived).
+        self._contradiction_enabled = bool(
+            cfg.get("contradiction_resolution_enabled", True)
+        )
+        self._contradiction_brain = str(cfg.get("contradiction_brain", "e4b"))
+        self._contradiction_band_min = float(
+            cfg.get("contradiction_band_min", 0.85)
+        )
 
     # ─── Layer 2: explicit trigger ──────────────────────────────────
 
@@ -229,24 +263,9 @@ class MemoryCapturePlugin(BasePlugin):
         if not fact or len(fact.strip()) < 5:
             return ctx
 
-        # Semantic dedup: if the fact is essentially already in
-        # facts, skip the store.
-        try:
-            similar = await self.api.memory_recall(
-                query=fact,
-                collection="facts",
-                limit=3,
-            )
-        except Exception:  # noqa: BLE001
-            similar = []
-        if similar and similar[0].get("score", 0.0) >= 0.85:
-            log.info(
-                "memory_capture.implicit_dedup_skip",
-                fact=fact[:60],
-                top_score=similar[0].get("score"),
-            )
-            return ctx
-
+        # Semantic dedup + contradiction resolution happen centrally in
+        # _store_fact_with_dedup now (the shared write choke-point), so both
+        # the explicit and implicit layers get the same treatment.
         await self._store_fact_with_dedup(
             fact=fact,
             session_id=session_id,
@@ -314,6 +333,70 @@ class MemoryCapturePlugin(BasePlugin):
             confidence = 0.0
         return (fact, confidence)
 
+    # ─── Contradiction resolution (P2) ──────────────────────────────
+
+    async def _resolve_against_existing(self, fact: str) -> str | None:
+        """Compare ``fact`` against the closest existing fact.
+
+        Returns one of:
+            * :data:`_SKIP_DUPLICATE` — a near-identical fact already exists,
+              so the caller should skip the store.
+            * an item id — ``fact`` updates/contradicts that existing fact,
+              which the caller should supersede (recoverably archive).
+            * ``None`` — no close neighbour, or the two are unrelated → store.
+        """
+        try:
+            similar = await self.api.memory_recall(
+                query=fact, collection="facts", limit=3
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        if not similar:
+            return None
+        top = similar[0]
+        score = float(top.get("score", 0.0) or 0.0)
+        if score < self._contradiction_band_min:
+            return None
+        old_id = str(top.get("id") or "")
+        old_content = str(top.get("content") or "")
+        if not old_id or not old_content:
+            return None
+        if not self._contradiction_enabled:
+            # Pre-P2 behaviour: a close neighbour means "duplicate, skip".
+            return _SKIP_DUPLICATE
+        relation = await self._classify_relation(
+            new_fact=fact, old_fact=old_content
+        )
+        if relation == "duplicate":
+            return _SKIP_DUPLICATE
+        if relation == "contradiction":
+            return old_id
+        return None  # unrelated → store alongside
+
+    async def _classify_relation(self, *, new_fact: str, old_fact: str) -> str:
+        """Classify the relation as ``duplicate`` / ``contradiction`` /
+        ``unrelated``. Falls back to ``unrelated`` (the safe, non-destructive
+        choice) on any error or unrecognised output."""
+        prompt = _RELATION_PROMPT.replace("%OLD%", old_fact[:500]).replace(
+            "%NEW%", new_fact[:500]
+        )
+        try:
+            response = await self.api.llm_chat(
+                messages=[{"role": "user", "content": prompt}],
+                brain=self._contradiction_brain,
+                max_tokens=8,
+                temperature=0.0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("memory_capture.relation_classify_error", error=str(exc))
+            return "unrelated"
+        text = str(response or "").upper()
+        if "WIDERSPRUCH" in text:
+            return "contradiction"
+        if "DUPLIKAT" in text:
+            return "duplicate"
+        return "unrelated"
+
     # ─── Storage helper (shared by both layers) ─────────────────────
 
     async def _store_fact_with_dedup(
@@ -343,11 +426,22 @@ class MemoryCapturePlugin(BasePlugin):
             )
             return False
 
+        # P2 — contradiction-aware semantic dedup against the closest existing
+        # fact. Only fires when a near-duplicate exists, so the LLM call is
+        # rare. ``supersedes_id`` is set when the new fact replaces an old one.
+        supersedes_id = await self._resolve_against_existing(fact)
+        if supersedes_id == _SKIP_DUPLICATE:
+            self._recent_facts[fact] = now
+            log.info("memory_capture.dedup_skip", fact=fact[:80], source=source)
+            return False
+
         full_metadata = {"source": source, "session_id": session_id}
+        if supersedes_id:
+            full_metadata["supersedes"] = supersedes_id
         full_metadata.update(metadata)
 
         try:
-            await self.api.memory_store(
+            new_id = await self.api.memory_store(
                 text=fact,
                 collection="facts",
                 metadata=full_metadata,
@@ -360,6 +454,28 @@ class MemoryCapturePlugin(BasePlugin):
                 error=str(exc),
             )
             return False
+
+        # The new fact won — recoverably archive the one it supersedes.
+        if supersedes_id:
+            try:
+                await self.api.memory_archive(
+                    "facts",
+                    [supersedes_id],
+                    reason="superseded",
+                    extra_meta={"superseded_by": new_id},
+                )
+                log.info(
+                    "memory_capture.fact_superseded",
+                    old_id=supersedes_id,
+                    new_id=new_id,
+                    fact=fact[:80],
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "memory_capture.supersede_archive_failed",
+                    old_id=supersedes_id,
+                    error=str(exc),
+                )
 
         self._recent_facts[fact] = now
         log.info(

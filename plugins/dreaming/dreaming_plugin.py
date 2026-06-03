@@ -49,6 +49,14 @@ class DreamingPlugin(BasePlugin):
         self._min_idle_minutes: int = 30
         self._dreaming_enabled: bool = True
 
+        # P1 — recoverable self-cleaning
+        self._archive_merged_originals: bool = True
+        self._decay_enabled: bool = True
+        self._decay_requires_zero_access: bool = True
+        self._decay_dry_run: bool = False
+        self._decay_collections: list[str] = ["context"]
+        self._maintenance_ignores_quiet_hours: bool = True
+
         self._last_user_activity: float = time.time()
         self._loop_task: asyncio.Task[None] | None = None
         self._running: bool = False
@@ -67,6 +75,21 @@ class DreamingPlugin(BasePlugin):
         self._decay_days = int(config.get("decay_days", 90))
         self._min_idle_minutes = int(config.get("min_idle_minutes", 30))
         self._dreaming_enabled = bool(config.get("enabled", True))
+
+        self._archive_merged_originals = bool(
+            config.get("archive_merged_originals", True)
+        )
+        self._decay_enabled = bool(config.get("decay_enabled", True))
+        self._decay_requires_zero_access = bool(
+            config.get("decay_requires_zero_access", True)
+        )
+        self._decay_dry_run = bool(config.get("decay_dry_run", False))
+        self._decay_collections = list(
+            config.get("decay_collections", ["context"])
+        )
+        self._maintenance_ignores_quiet_hours = bool(
+            config.get("maintenance_ignores_quiet_hours", True)
+        )
 
         quiet_hours: list[str] = config.get("quiet_hours", ["02:00", "06:00"])
         self._parse_quiet_hours(quiet_hours)
@@ -138,14 +161,26 @@ class DreamingPlugin(BasePlugin):
                 if not self._dreaming_enabled:
                     log.debug("dreaming.skipped", reason="disabled")
                     continue
-                if not self._is_quiet_hour():
-                    log.debug("dreaming.skipped", reason="outside_quiet_hours")
-                    continue
                 if not self._is_idle():
                     log.debug("dreaming.skipped", reason="user_active")
                     continue
+
+                # Inside quiet-hours → full cycle (consolidation + cleanup).
+                # Outside, but idle → light maintenance-only cleanup, since
+                # recoverable decay shouldn't depend on the clock.
+                quiet = self._is_quiet_hour()
+                if quiet:
+                    maintenance_only = False
+                elif self._maintenance_ignores_quiet_hours and self._decay_enabled:
+                    maintenance_only = True
+                else:
+                    log.debug("dreaming.skipped", reason="outside_quiet_hours")
+                    continue
+
                 try:
-                    results = await self._run_cycle(force=False)
+                    results = await self._run_cycle(
+                        force=False, maintenance_only=maintenance_only
+                    )
                     if results:
                         await self.api.ws_broadcast({
                             "type": "dreaming_result",
@@ -158,16 +193,50 @@ class DreamingPlugin(BasePlugin):
 
     # ─── Cycle orchestration ────────────────────────────────────────
 
-    async def _run_cycle(self, *, force: bool) -> list[dict[str, Any]]:
+    async def _run_cycle(
+        self, *, force: bool, maintenance_only: bool = False
+    ) -> list[dict[str, Any]]:
         """
-        Execute one dreaming cycle with a mix of the three operation types.
+        Execute one dreaming cycle.
+
+        Recoverable cleanup (usage-based decay) runs first and always, so a
+        ``maintenance_only`` light cycle (outside quiet-hours) can clean up
+        without the heavier LLM-driven consolidation. The cosmetic ops
+        (dedup / link / staleness) only run in a full cycle.
 
         Returns a list of operation result dicts for WS broadcast and events.
         """
         self._cycle_count += 1
-        log.info("dreaming.cycle_start", cycle=self._cycle_count, force=force)
+        log.info(
+            "dreaming.cycle_start",
+            cycle=self._cycle_count,
+            force=force,
+            maintenance_only=maintenance_only,
+        )
         results: list[dict[str, Any]] = []
         ops_done: int = 0
+
+        # Recoverable cleanup first — cheap, deterministic, no LLM.
+        if self._decay_enabled:
+            try:
+                decay_result = await self._op_decay()
+                if decay_result is not None:
+                    results.append(decay_result)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("dreaming.op_failed", op="decay", error=str(exc))
+
+        if maintenance_only:
+            await self.api.emit(
+                "core.dreaming_cycle",
+                {
+                    "cycle": self._cycle_count,
+                    "operations_completed": len(results),
+                    "results": results,
+                    "maintenance_only": True,
+                },
+            )
+            log.info("dreaming.cycle_done", cycle=self._cycle_count, ops=len(results))
+            return results
 
         # Verteilung: 40 % Duplikat-Erkennung, 30 % Fact-Linkage, 30 % Staleness
         operations: list[str] = (
@@ -287,13 +356,34 @@ class DreamingPlugin(BasePlugin):
             },
         )
 
-        # ChromaDB hat kein einfaches delete-by-query, daher loggen wir die
-        # Originale als "zu bereinigen". Ein zukuenftiger Maintenance-Job
-        # kann diese aufgrund der IDs entfernen.
+        # Recoverably archive the two originals now that the merged entry
+        # exists — this is the maintenance job the old log-only TODO promised.
+        # The archive copies them aside first, so a failure here never loses
+        # data (the originals simply stay live and get re-merged next cycle).
+        archived = 0
+        origin_ids = [i for i in (seed_id, dupe_id) if i]
+        if self._archive_merged_originals and origin_ids:
+            try:
+                result = await self.api.memory_archive(
+                    collection,
+                    origin_ids,
+                    reason="dedup_merge",
+                    extra_meta={"merged_into": merged_id},
+                )
+                archived = int(result.get("archived", 0))
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "dreaming.dedup_archive_failed",
+                    seed_id=seed_id,
+                    dupe_id=dupe_id,
+                    error=str(exc),
+                )
+
         log.info(
             "dreaming.dedup_merged",
             merged_id=merged_id,
-            source_ids=[seed_id, dupe_id],
+            source_ids=origin_ids,
+            archived=archived,
             collection=collection,
             similarity=best_dupe.get("score", 0.0),
         )
@@ -302,7 +392,8 @@ class DreamingPlugin(BasePlugin):
             "op": "deduplicate",
             "collection": collection,
             "merged_id": merged_id,
-            "source_ids": [seed_id, dupe_id],
+            "source_ids": origin_ids,
+            "archived": archived,
             "similarity": round(best_dupe.get("score", 0.0), 3),
             "merged_preview": merged_text[:200],
         }
@@ -472,6 +563,89 @@ class DreamingPlugin(BasePlugin):
             "total_checked": total_checked,
             "stale_count": stale_count,
             "decay_days": self._decay_days,
+        }
+
+    # ─── Operation 4: Usage-based decay (recoverable cleanup) ───────
+
+    async def _op_decay(self) -> dict[str, Any] | None:
+        """Archive entries older than ``decay_days`` that were never recalled.
+
+        Unlike the staleness *report*, this actually cleans up — but
+        recoverably: items are moved to the memory archive (restorable),
+        never hard-deleted. Consolidated entries (merged / link) are kept.
+        With ``decay_requires_zero_access`` (default) only memories with
+        ``access_count == 0`` are eligible, so anything Lexy actually uses
+        survives. ``decay_dry_run`` reports candidates without touching them.
+        """
+        cutoff = time.time() - (self._decay_days * 86400)
+        by_collection: dict[str, dict[str, int]] = {}
+        archived_total = 0
+        candidates_total = 0
+
+        for collection in self._decay_collections:
+            to_archive: list[str] = []
+            page = 1
+            while page <= 100:  # hard safety cap (100 * 200 = 20k scanned)
+                items, _total = await self.api.memory_browse(
+                    collection=collection, page=page, limit=200
+                )
+                if not items:
+                    break
+                for item in items:
+                    meta = item.get("metadata") or {}
+                    if meta.get("type") in ("merged", "link"):
+                        continue  # keep consolidated knowledge
+                    created = meta.get("created_at") or meta.get("timestamp") or 0.0
+                    try:
+                        created = float(created)
+                    except (ValueError, TypeError):
+                        created = 0.0
+                    access = int(meta.get("access_count", 0) or 0)
+                    is_old = 0 < created < cutoff
+                    unused = access == 0 if self._decay_requires_zero_access else True
+                    if is_old and unused:
+                        to_archive.append(item["id"])
+                if len(items) < 200:
+                    break
+                page += 1
+
+            candidates_total += len(to_archive)
+            archived = 0
+            if to_archive and not self._decay_dry_run:
+                try:
+                    result = await self.api.memory_archive(
+                        collection, to_archive, reason="decay_unused"
+                    )
+                    archived = int(result.get("archived", 0))
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "dreaming.decay_archive_failed",
+                        collection=collection,
+                        error=str(exc),
+                    )
+            archived_total += archived
+            by_collection[collection] = {
+                "candidates": len(to_archive),
+                "archived": archived,
+            }
+
+        if candidates_total == 0:
+            log.debug("dreaming.decay_nothing_stale")
+            return None
+
+        log.info(
+            "dreaming.decay",
+            candidates=candidates_total,
+            archived=archived_total,
+            dry_run=self._decay_dry_run,
+        )
+        return {
+            "op": "decay",
+            "candidates": candidates_total,
+            "archived": archived_total,
+            "dry_run": self._decay_dry_run,
+            "decay_days": self._decay_days,
+            "by_collection": by_collection,
         }
 
     # ─── Helpers ────────────────────────────────────────────────────

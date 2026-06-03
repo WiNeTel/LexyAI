@@ -155,7 +155,12 @@ class _FakeAPI:
     shouldn't.
     """
 
-    def __init__(self, *, llm_response: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        llm_response: str | None = None,
+        relation_response: str = "UNABHAENGIG",
+    ) -> None:
         self._cfg: dict[str, Any] = {
             "enabled_languages": ["de", "en"],
             "cooldown_seconds": 60,
@@ -166,7 +171,12 @@ class _FakeAPI:
         }
         self.stored: list[dict[str, Any]] = []
         self.broadcasts: list[dict[str, Any]] = []
+        self.archived: list[dict[str, Any]] = []
         self.recall_responses: list[list[dict[str, Any]]] = []  # FIFO
+        # Response the P2 relation classifier (api.llm_chat) returns:
+        # DUPLIKAT / WIDERSPRUCH / UNABHAENGIG.
+        self.relation_response = relation_response
+        self.llm_chat_calls = 0
 
         # Stub LLM so the implicit-classifier path can be exercised
         # without a real network call.
@@ -174,6 +184,27 @@ class _FakeAPI:
         self._llm.chat = AsyncMock(return_value=llm_response or "")
         self._app = MagicMock()
         self._app.llm = self._llm
+
+    async def llm_chat(self, **kwargs: Any) -> str:
+        self.llm_chat_calls += 1
+        return self.relation_response
+
+    async def memory_archive(
+        self,
+        collection: str,
+        ids: list[str],
+        reason: str,
+        extra_meta: dict[str, Any] | None = None,
+    ) -> dict[str, int]:
+        self.archived.append(
+            {
+                "collection": collection,
+                "ids": list(ids),
+                "reason": reason,
+                "extra_meta": dict(extra_meta or {}),
+            }
+        )
+        return {"archived": len(ids), "fts": len(ids)}
 
     def get_config(self) -> dict[str, Any]:
         return dict(self._cfg)
@@ -352,17 +383,18 @@ async def test_implicit_hook_skips_below_confidence_threshold() -> None:
 
 @pytest.mark.asyncio
 async def test_implicit_hook_dedups_via_recall() -> None:
-    """If the recall finds a near-identical fact (score ≥ 0.85) we
-    skip the store — prevents spamming the same fact 5x."""
+    """If the recall finds a near-identical fact (score ≥ 0.85) and the
+    P2 relation classifier confirms it's a DUPLIKAT, we skip the store —
+    prevents spamming the same fact 5x."""
     classifier_json = json.dumps({
         "is_fact": True,
         "fact": "User wohnt am Nordpol",
         "confidence": 0.95,
     })
-    api = _FakeAPI(llm_response=classifier_json)
+    api = _FakeAPI(llm_response=classifier_json, relation_response="DUPLIKAT")
     api.update_config(implicit_capture_enabled=True)
     api.recall_responses.append([
-        {"content": "User wohnt am Nordpol seit Jahren", "score": 0.91}
+        {"id": "old-np", "content": "User wohnt am Nordpol seit Jahren", "score": 0.91}
     ])
     plugin = _build_plugin(api)
     await plugin.on_load()
@@ -371,6 +403,7 @@ async def test_implicit_hook_dedups_via_recall() -> None:
         {"text": "Ich wohne übrigens am Nordpol", "session_id": "s"}
     )
     assert api.stored == []
+    assert api.archived == []  # pure duplicate → nothing to supersede
 
 
 @pytest.mark.asyncio
@@ -429,3 +462,127 @@ async def test_implicit_hook_strips_markdown_code_fence() -> None:
     )
     assert len(api.stored) == 1
     assert "Jazz" in api.stored[0]["text"]
+
+
+# ── P2: contradiction resolution at the write choke-point ──────────
+
+
+@pytest.mark.asyncio
+async def test_contradiction_supersedes_old_fact() -> None:
+    """A new fact that updates a close existing one stores the new entry
+    (tagged supersedes) and recoverably archives the old one."""
+    api = _FakeAPI(relation_response="WIDERSPRUCH")
+    api.recall_responses.append(
+        [{"id": "old-1", "content": "User nutzt Python 3.11", "score": 0.93}]
+    )
+    plugin = _build_plugin(api)
+    await plugin.on_load()
+
+    stored = await plugin._store_fact_with_dedup(
+        fact="User nutzt Python 3.12",
+        session_id="s1",
+        source="trigger_phrase",
+        metadata={"language": "de"},
+    )
+
+    assert stored is True
+    assert len(api.stored) == 1
+    assert api.stored[0]["metadata"].get("supersedes") == "old-1"
+    assert len(api.archived) == 1
+    arc = api.archived[0]
+    assert arc["collection"] == "facts"
+    assert arc["ids"] == ["old-1"]
+    assert arc["reason"] == "superseded"
+    assert arc["extra_meta"]["superseded_by"] == "stored-1"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_close_fact_is_skipped() -> None:
+    api = _FakeAPI(relation_response="DUPLIKAT")
+    api.recall_responses.append(
+        [{"id": "old-1", "content": "User wohnt in Berlin", "score": 0.97}]
+    )
+    plugin = _build_plugin(api)
+    await plugin.on_load()
+
+    stored = await plugin._store_fact_with_dedup(
+        fact="User lebt in Berlin",
+        session_id="s1",
+        source="implicit_capture",
+        metadata={},
+    )
+
+    assert stored is False
+    assert api.stored == []
+    assert api.archived == []
+
+
+@pytest.mark.asyncio
+async def test_unrelated_close_neighbor_still_stores() -> None:
+    api = _FakeAPI(relation_response="UNABHAENGIG")
+    api.recall_responses.append(
+        [{"id": "old-1", "content": "User mag Jazz", "score": 0.88}]
+    )
+    plugin = _build_plugin(api)
+    await plugin.on_load()
+
+    stored = await plugin._store_fact_with_dedup(
+        fact="User hat einen Hund namens Rex",
+        session_id="s1",
+        source="implicit_capture",
+        metadata={},
+    )
+
+    assert stored is True
+    assert len(api.stored) == 1
+    assert "supersedes" not in api.stored[0]["metadata"]
+    assert api.archived == []
+
+
+@pytest.mark.asyncio
+async def test_below_band_skips_relation_classifier() -> None:
+    """A weak neighbour (< band) must NOT trigger the LLM relation call —
+    the fact is just stored as new."""
+    api = _FakeAPI(relation_response="WIDERSPRUCH")  # would supersede IF called
+    api.recall_responses.append(
+        [{"id": "old-1", "content": "etwas anderes", "score": 0.40}]
+    )
+    plugin = _build_plugin(api)
+    await plugin.on_load()
+
+    stored = await plugin._store_fact_with_dedup(
+        fact="User heißt Mike",
+        session_id="s1",
+        source="trigger_phrase",
+        metadata={},
+    )
+
+    assert stored is True
+    assert len(api.stored) == 1
+    assert api.llm_chat_calls == 0  # band gate prevented the LLM call
+    assert api.archived == []
+
+
+@pytest.mark.asyncio
+async def test_contradiction_disabled_falls_back_to_skip() -> None:
+    """With contradiction resolution off, a close neighbour means plain
+    skip (pre-P2 dedup behaviour) — no LLM call, no supersede."""
+    api = _FakeAPI(relation_response="WIDERSPRUCH")
+    api._cfg["contradiction_resolution_enabled"] = False
+    api.recall_responses.append(
+        [{"id": "old-1", "content": "User nutzt Python 3.11", "score": 0.93}]
+    )
+    plugin = _build_plugin(api)
+    await plugin.on_load()
+
+    stored = await plugin._store_fact_with_dedup(
+        fact="User nutzt Python 3.12",
+        session_id="s1",
+        source="implicit_capture",
+        metadata={},
+    )
+
+    assert stored is False
+    assert api.stored == []
+    assert api.archived == []
+    assert api.llm_chat_calls == 0

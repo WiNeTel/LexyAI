@@ -297,6 +297,64 @@ class PluginAPI:
             query=query, limit=limit, project_id=project_id
         )
 
+    async def memory_browse(
+        self, collection: str = "facts", page: int = 1, limit: int = 25
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Paginate one collection. Returns ``(items, total)``."""
+        if not self._app.memory:
+            return [], 0
+        return await self._app.memory.browse(
+            collection=collection, page=page, limit=limit
+        )
+
+    async def memory_get_by_ids(
+        self, collection: str, ids: list[str]
+    ) -> list[dict[str, Any]]:
+        """Fetch documents + metadata + embeddings for specific ids."""
+        if not self._app.memory:
+            return []
+        return await self._app.memory.get_by_ids(collection, ids)
+
+    async def memory_archive(
+        self,
+        collection: str,
+        ids: list[str],
+        reason: str,
+        extra_meta: dict[str, Any] | None = None,
+    ) -> dict[str, int]:
+        """Recoverable delete: archive items, then remove them from the
+        live collection + FTS mirror. Returns ``{"archived", "fts"}``.
+        """
+        if not self._app.memory:
+            return {"archived": 0, "fts": 0}
+        return await self._app.memory.archive_items(
+            collection=collection, ids=ids, reason=reason, extra_meta=extra_meta
+        )
+
+    async def memory_restore(
+        self, origin_collection: str, ids: list[str]
+    ) -> dict[str, int]:
+        """Restore archived items back into their origin collection."""
+        if not self._app.memory:
+            return {"restored": 0, "fts": 0}
+        return await self._app.memory.restore_items(origin_collection, ids)
+
+    async def memory_browse_archive(
+        self, collection: str, page: int = 1, limit: int = 25
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Paginate the recoverable archive for one collection."""
+        if not self._app.memory:
+            return [], 0
+        return await self._app.memory.browse_archive(
+            collection=collection, page=page, limit=limit
+        )
+
+    async def memory_ensure_aux_collection(self, name: str) -> None:
+        """Register an auxiliary collection (kept out of default recall)."""
+        if not self._app.memory:
+            return
+        await self._app.memory.ensure_aux_collection(name)
+
     # ─── Solutions ───────────────────────────────────────────────────
 
     async def solutions_store(self, problem: str, solution: str) -> str:
