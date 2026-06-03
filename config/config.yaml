@@ -6,6 +6,10 @@ system:
   version: "2.0.0"
   debug: true
   log_level: "INFO"
+  # RP prompt debugging: when true, every character turn prints the exact
+  # system+user prompt and the raw LLM response to the backend console.
+  # The env var LEXY_DEBUG_PROMPTS overrides this (set to 0 to force off).
+  debug_prompts: false
   # VRAM profile — decides which servers Lexy talks to and which plugins
   # are loaded. Pick based on your GPU budget:
   #

@@ -29,6 +29,11 @@ class SystemConfig(BaseModel):
     version: str = "2.0.0"
     debug: bool = False
     log_level: str = "INFO"
+    # When true, every character turn prints the exact system+user prompt and
+    # the raw LLM response to the backend console (RP prompt debugging). The
+    # env var ``LEXY_DEBUG_PROMPTS`` overrides this (set it to 0 to force off
+    # even when this is true). Default off so normal runs stay quiet.
+    debug_prompts: bool = False
     # VRAM profile. Determines which llama.cpp servers Lexy expects:
     #
     # * ``chat``  — e4b (fast) + a4b (deep). No STT. Best when VRAM is
