@@ -657,3 +657,62 @@ async def test_result_echoes_trigger_fields() -> None:
     )
     assert result.user_message == "test"
     assert result.pulse_from_id == ""
+
+
+# ─── RP "thinking" experiment toggle ─────────────────────────────────────────
+
+
+def _bob_call(llm: _FakeLLM) -> dict[str, Any]:
+    """The llm_chat call that produced Bob's character turn."""
+    return next(
+        c for c in llm.calls
+        if any("Du bist Bob" in m["content"] for m in c["messages"]
+               if m["role"] == "system")
+    )
+
+
+@pytest.mark.asyncio
+async def test_character_thinking_off_by_default() -> None:
+    llm = _FakeLLM(
+        route_by_system={"Turn-Orchestrator": "bob", "Du bist Bob": "Hallo!"}
+    )
+    orch = GroupTurnOrchestrator(llm_chat=llm, max_tokens=320)
+    await orch.run_round(
+        GroupTurnRequest(
+            session_id="s1", history=[], characters=[_bob()], user_message="Hi",
+        )
+    )
+    call = _bob_call(llm)
+    assert call["thinking"] is False
+    assert call["max_tokens"] == 320
+
+
+@pytest.mark.asyncio
+async def test_character_thinking_on_passes_flag_and_bumps_budget() -> None:
+    llm = _FakeLLM(
+        route_by_system={"Turn-Orchestrator": "bob", "Du bist Bob": "Hallo!"}
+    )
+    orch = GroupTurnOrchestrator(
+        llm_chat=llm,
+        max_tokens=320,
+        character_thinking=True,
+        thinking_max_tokens=1600,
+    )
+    await orch.run_round(
+        GroupTurnRequest(
+            session_id="s1", history=[], characters=[_bob()], user_message="Hi",
+        )
+    )
+    call = _bob_call(llm)
+    # thinking flows through to the LLM and the budget is the larger cap so
+    # reasoning tokens don't starve the visible reply.
+    assert call["thinking"] is True
+    assert call["max_tokens"] == 1600
+
+
+def test_thinking_max_tokens_never_below_reply_cap() -> None:
+    # If misconfigured below the reply cap, the reply cap wins (no shrink).
+    orch = GroupTurnOrchestrator(
+        llm_chat=_FakeLLM(), max_tokens=800, thinking_max_tokens=200,
+    )
+    assert orch._thinking_max_tokens == 800
