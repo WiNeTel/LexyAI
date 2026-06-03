@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 import uuid
 from typing import Any
@@ -495,6 +496,8 @@ class CharacterChatPlugin(BasePlugin):
             speaker_selection_brain=self._speaker_selection_brain,
             global_style_prompt=self._global_rp_style_prompt,
             always_call_orchestrator=self._always_call_orchestrator,
+            character_thinking=self._rp_thinking,
+            thinking_max_tokens=self._rp_thinking_max_tokens,
         )
         self._pulse_generator = PulseGenerator(
             llm_chat=self.api.llm_chat,
@@ -913,6 +916,20 @@ class CharacterChatPlugin(BasePlugin):
         ).strip()
         self._always_call_orchestrator = bool(
             cfg.get("always_call_orchestrator", False)
+        )
+        # RP "thinking" experiment (Mike): run character turns WITH the model's
+        # reasoning enabled to test multi-turn state adherence. Off by default
+        # (adds latency + needs a bigger token budget). Env LEXY_RP_THINKING
+        # overrides config so it can be toggled per run without editing files.
+        _rp_think_env = os.environ.get("LEXY_RP_THINKING", "").strip().lower()
+        if _rp_think_env in ("1", "true", "yes", "on"):
+            self._rp_thinking = True
+        elif _rp_think_env in ("0", "false", "no", "off"):
+            self._rp_thinking = False
+        else:
+            self._rp_thinking = bool(cfg.get("rp_thinking", False))
+        self._rp_thinking_max_tokens = int(
+            cfg.get("rp_thinking_max_tokens", 1600) or 1600
         )
         self._smart_pulses_enabled = bool(
             cfg.get("smart_pulses_enabled", True)

@@ -355,10 +355,18 @@ class GroupTurnOrchestrator:
         speaker_selection_brain: str | None = None,
         global_style_prompt: str = "",
         always_call_orchestrator: bool = False,
+        character_thinking: bool = False,
+        thinking_max_tokens: int = 1600,
     ) -> None:
         self._llm_chat = llm_chat
         self._brain = brain
         self._max_tokens = max_tokens
+        # RP "thinking" experiment: when True, character turns run with the
+        # model's reasoning enabled (can improve multi-turn state adherence,
+        # at a latency cost). Reasoning needs headroom or it eats the whole
+        # token budget and the reply comes back empty — so use a larger cap.
+        self._character_thinking = character_thinking
+        self._thinking_max_tokens = max(thinking_max_tokens, max_tokens)
         self._temperature = temperature
         self._max_speakers = max_speakers_per_round
         if turn_selection not in ("autonomous", "round_robin"):
@@ -943,9 +951,16 @@ class GroupTurnOrchestrator:
             previous_turns=previous_turns,
             own_memories=own_memories,
         )
+        # Reserve enough output budget for reasoning+reply when thinking is on,
+        # otherwise the normal (small) reply cap.
+        turn_max_tokens = (
+            self._thinking_max_tokens
+            if self._character_thinking
+            else self._max_tokens
+        )
         budget = ContextBudget(
             context_size=self._context_size_fn(),
-            max_output_tokens=self._max_tokens,
+            max_output_tokens=turn_max_tokens,
             safety_margin=self._safety_margin,
         )
         fitted, trim_log = budget.fit_sections(sections)
@@ -972,22 +987,22 @@ class GroupTurnOrchestrator:
             brain=self._brain,
             system_prompt=system_prompt,
             user_content=user_content,
-            max_tokens=self._max_tokens,
+            max_tokens=turn_max_tokens,
             temperature=self._temperature,
         )
 
         try:
-            # Characters don't need Chain-of-Thought — they need a fast,
-            # in-voice reply. a4b has ``thinking=true`` by default which
-            # eats ``max_tokens`` budget for reasoning tokens and often
-            # returns empty content (→ turn marked skipped → no bubble in
-            # chat). Force it off here regardless of brain config.
+            # By default characters reply WITHOUT chain-of-thought — a fast,
+            # in-voice reply (thinking burns the token budget for reasoning
+            # and often returns empty content). The RP-thinking experiment
+            # (``character_thinking``) flips this on to test whether reasoning
+            # improves multi-turn state adherence, with a larger token cap.
             raw = await self._llm_chat(
                 messages=messages,
                 brain=self._brain,
-                max_tokens=self._max_tokens,
+                max_tokens=turn_max_tokens,
                 temperature=self._temperature,
-                thinking=False,
+                thinking=self._character_thinking,
             )
         except Exception as exc:  # noqa: BLE001
             log.error(
@@ -1065,11 +1080,11 @@ class GroupTurnOrchestrator:
                     retry_raw = await self._llm_chat(
                         messages=retry_messages,
                         brain=self._brain,
-                        max_tokens=self._max_tokens,
+                        max_tokens=turn_max_tokens,
                         temperature=min(
                             1.0, self._temperature + 0.1,
                         ),  # nudge up for variety
-                        thinking=False,
+                        thinking=self._character_thinking,
                     )
                     retry_content = (retry_raw or "").strip()
                     if retry_content and not self._is_pass(retry_content):
