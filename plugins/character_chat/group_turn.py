@@ -97,15 +97,29 @@ def _emit_prompt_debug(
     log.info(block)
 
 
-def _emit_response_debug(*, character: str, content: str, skipped: bool) -> None:
-    """Print the raw LLM response next to its prompt (gated by the same flag)."""
+def _emit_response_debug(
+    *, character: str, content: str, skipped: bool, reasoning: str = ""
+) -> None:
+    """Print the raw LLM response next to its prompt (gated by the same flag).
+
+    When reasoning (chain-of-thought) is present, it's shown too — this is the
+    quickest way to confirm RP thinking is actually engaging in the CMD.
+    """
     if not _prompt_debug_enabled():
         return
     body = content if content else "(empty)"
+    reason_section = ""
+    if reasoning and reasoning.strip():
+        reason_section = (
+            f"{_DEBUG_RULE}\n"
+            f"[REASONING] {len(reasoning)} chars (display-only, NOT in prompt)\n"
+            f"{reasoning.strip()}\n"
+        )
     block = (
         f"\n{_DEBUG_RULE}\n"
         f"LLM RESPONSE <- character={character} skipped={skipped} "
-        f"chars={len(content)}\n"
+        f"chars={len(content)} reasoning_chars={len(reasoning)}\n"
+        f"{reason_section}"
         f"{body}\n"
         f"{_DEBUG_FRAME}"
     )
@@ -125,6 +139,10 @@ class CharacterTurn:
     skipped: bool = False  # True if the character answered [PASS] or was empty
     # 0-based index within the round; useful for UI/tests.
     order: int = 0
+    # Display-only chain-of-thought (only populated when RP thinking is on).
+    # MUST NOT be fed back into any prompt or memory — shown collapsed in the
+    # chat bubble for diagnostics.
+    reasoning: str = ""
 
 
 @dataclass
@@ -322,6 +340,10 @@ def detect_repetition(
 # Signature: (messages, brain, max_tokens, temperature) -> str.
 LLMChat = Callable[..., Awaitable[str]]
 
+# Like ``LLMChat`` but returns ``(content, reasoning)`` — used only when RP
+# thinking is on, to capture the chain-of-thought for display (never prompts).
+LLMChatStructured = Callable[..., Awaitable[tuple[str, str]]]
+
 # Optional per-character memory fetch. Called as
 # ``recall_fn(character_id=..., query=..., limit=...)`` just before a turn's
 # LLM call so the character's own remembered snippets can be threaded into
@@ -343,6 +365,7 @@ class GroupTurnOrchestrator:
         self,
         *,
         llm_chat: LLMChat,
+        llm_chat_structured: LLMChatStructured | None = None,
         brain: str = "e4b",
         max_tokens: int = 320,
         temperature: float = 0.8,
@@ -359,6 +382,9 @@ class GroupTurnOrchestrator:
         thinking_max_tokens: int = 1600,
     ) -> None:
         self._llm_chat = llm_chat
+        # Optional structured variant returning (content, reasoning). Used only
+        # when character_thinking is on, to capture the CoT for display.
+        self._llm_chat_structured = llm_chat_structured
         self._brain = brain
         self._max_tokens = max_tokens
         # RP "thinking" experiment: when True, character turns run with the
@@ -991,19 +1017,35 @@ class GroupTurnOrchestrator:
             temperature=self._temperature,
         )
 
+        reasoning = ""
+        # When RP thinking is on AND a structured callable was injected, capture
+        # the chain-of-thought alongside the reply (display only — never fed back
+        # into a prompt/history). Otherwise the normal content-only path.
+        use_structured = (
+            self._character_thinking and self._llm_chat_structured is not None
+        )
         try:
             # By default characters reply WITHOUT chain-of-thought — a fast,
             # in-voice reply (thinking burns the token budget for reasoning
             # and often returns empty content). The RP-thinking experiment
             # (``character_thinking``) flips this on to test whether reasoning
             # improves multi-turn state adherence, with a larger token cap.
-            raw = await self._llm_chat(
-                messages=messages,
-                brain=self._brain,
-                max_tokens=turn_max_tokens,
-                temperature=self._temperature,
-                thinking=self._character_thinking,
-            )
+            if use_structured:
+                raw, reasoning = await self._llm_chat_structured(
+                    messages=messages,
+                    brain=self._brain,
+                    max_tokens=turn_max_tokens,
+                    temperature=self._temperature,
+                    thinking=self._character_thinking,
+                )
+            else:
+                raw = await self._llm_chat(
+                    messages=messages,
+                    brain=self._brain,
+                    max_tokens=turn_max_tokens,
+                    temperature=self._temperature,
+                    thinking=self._character_thinking,
+                )
         except Exception as exc:  # noqa: BLE001
             log.error(
                 "character_chat.turn_llm_failed: %s (char=%s)", exc, card.name
@@ -1026,6 +1068,7 @@ class GroupTurnOrchestrator:
             character=card.name,
             content=(raw or "").strip(),
             skipped=skipped,
+            reasoning=reasoning,
         )
 
         # Phase 13.2 + 13.5 (B+D): repetition guard. Compares the new
@@ -1101,6 +1144,7 @@ class GroupTurnOrchestrator:
             content=content,
             skipped=skipped,
             order=order,
+            reasoning=reasoning,
         )
 
     # ─── Section-based prompt building (context-budget aware) ────────────
@@ -1910,5 +1954,6 @@ __all__ = [
     "GroupTurnRequest",
     "GroupTurnResult",
     "LLMChat",
+    "LLMChatStructured",
     "asyncio",
 ]

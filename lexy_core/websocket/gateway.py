@@ -958,6 +958,7 @@ def build_app(lexy: "LexyApp") -> FastAPI:
                             "skipped": t.skipped,
                             "trigger_kind": t.trigger_kind,
                             "trigger_text": t.trigger_text,
+                            "reasoning": getattr(t, "reasoning", "") or "",
                             "created_at": t.created_at,
                         }
                         for t in rows
@@ -969,7 +970,7 @@ def build_app(lexy: "LexyApp") -> FastAPI:
         cursor = await db.execute(
             "SELECT id, character_id, character_name, round_id, "
             "order_num, content, skipped, trigger_kind, trigger_text, "
-            "created_at FROM character_turns "
+            "reasoning, created_at FROM character_turns "
             "WHERE session_id = ? "
             "ORDER BY created_at ASC, order_num ASC LIMIT ?",
             (session_id, capped),
@@ -989,7 +990,8 @@ def build_app(lexy: "LexyApp") -> FastAPI:
                     "skipped": bool(r[6]),
                     "trigger_kind": r[7] or "",
                     "trigger_text": r[8] or "",
-                    "created_at": float(r[9] or 0.0),
+                    "reasoning": r[9] or "",
+                    "created_at": float(r[10] or 0.0),
                 }
                 for r in rows
             ],

@@ -2278,6 +2278,32 @@ body.nav-open .nav-hamburger span:nth-child(3) { transform: translateY(-7px) rot
     font-style: italic;
 }
 
+/* RP "thinking" — collapsible chain-of-thought inside the character bubble.
+   Display-only; the reasoning never enters a prompt. Mirrors .reasoning-bubble. */
+.msg.character .char-reasoning {
+    margin-top: 6px;
+    background: rgba(124, 158, 255, 0.05);
+    border: 1px dashed rgba(124, 158, 255, 0.35);
+    border-radius: 8px;
+    padding: 4px 10px;
+    font-family: var(--mono);
+    font-size: 11px;
+}
+.msg.character .char-reasoning summary {
+    cursor: pointer;
+    user-select: none;
+    color: var(--char-color, #7aa2f7);
+    font-weight: 500;
+    list-style: none;
+}
+.msg.character .char-reasoning summary::-webkit-details-marker { display: none; }
+.msg.character .char-reasoning[open] summary { margin-bottom: 4px; }
+.char-reasoning-body {
+    white-space: pre-wrap;
+    line-height: 1.5;
+    color: var(--text-dim);
+}
+
 /* RP-v2 — turn timestamp + narration/speech distinction */
 .msg.character .char-bubble-name {
     display: flex;

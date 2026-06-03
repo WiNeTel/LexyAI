@@ -54,17 +54,18 @@ async def _insert_turn(
     content: str,
     trigger_kind: str = "user",
     trigger_text: str = "",
+    reasoning: str = "",
     created_at: float | None = None,
 ) -> None:
     db = await plugin.api.get_db()
     await db.execute(
         "INSERT INTO character_turns (id, session_id, character_id, "
         "character_name, round_id, order_num, content, skipped, "
-        "trigger_kind, trigger_text, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+        "trigger_kind, trigger_text, reasoning, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
         (
             turn_id, session_id, character_id, character_name, round_id,
-            order_num, content, trigger_kind, trigger_text,
+            order_num, content, trigger_kind, trigger_text, reasoning,
             created_at if created_at is not None else time.time(),
         ),
     )
@@ -117,6 +118,7 @@ def test_turns_returned_chronologically_with_full_metadata(
         character_id="c1", character_name="Alpha",
         round_id="r1", order_num=0,
         content="Alpha sagt hi", trigger_text="Hallo zusammen",
+        reasoning="Alpha denkt kurz nach",
         created_at=base,
     ))
     asyncio.get_event_loop().run_until_complete(_insert_turn(
@@ -153,11 +155,14 @@ def test_turns_returned_chronologically_with_full_metadata(
         for key in (
             "turn_id", "character_id", "character_name", "round_id",
             "order", "content", "skipped", "trigger_kind",
-            "trigger_text", "created_at",
+            "trigger_text", "reasoning", "created_at",
         ):
             assert key in t, f"missing {key} in {t}"
     assert turns[0]["character_name"] == "Alpha"
     assert turns[2]["round_id"] == "r2"
+    # Display-only reasoning round-trips through persistence + the endpoint.
+    assert turns[0]["reasoning"] == "Alpha denkt kurz nach"
+    assert turns[1]["reasoning"] == ""  # absent → empty default
 
 
 def test_limit_param_caps_returned_rows(lexy_client: TestClient) -> None:
