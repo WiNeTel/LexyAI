@@ -2193,6 +2193,25 @@ class CharacterChatPlugin(BasePlugin):
             await container.set_world(world)
         return applied
 
+    def _maybe_trigger_scene_director(
+        self, session_id: str, card: CharacterCard
+    ) -> None:
+        """Fire the Scene Director for a character that implies a dependent.
+
+        Shared by spawn AND attach (Mike's gap: attaching an existing
+        character used to skip this, so the baby's needs were never offered).
+        Cheap keyword pre-filter avoids an LLM call on every spawn/attach;
+        fire-and-forget so the call stays snappy.
+        """
+        if not _should_trigger_scene_director(
+            self._scene_director_mode, card.persona, card.relationships
+        ):
+            return
+        asyncio.create_task(
+            self._run_scene_director(session_id, recent_text=card.persona),
+            name=f"scene_director.{session_id}",
+        )
+
     async def _run_scene_director(
         self, session_id: str, *, recent_text: str = ""
     ) -> dict[str, Any]:
@@ -2685,19 +2704,9 @@ class CharacterChatPlugin(BasePlugin):
                 await self._maybe_tag_session_rp(session_id)
                 # SillyTavern-style greeting as the character's first turn.
                 await self._maybe_post_greeting(session_id, saved)
-                # Scene Director (Phase 4): if this character implies a
-                # dependent ("has a baby" etc.), offer/auto-provision its
-                # needs. Cheap keyword pre-filter avoids an LLM call on every
-                # spawn; fire-and-forget so batch spawns stay fast.
-                if self._scene_director_mode != "off" and looks_like_has_dependent(
-                    f"{saved.persona} {saved.relationships}"
-                ):
-                    asyncio.create_task(
-                        self._run_scene_director(
-                            session_id, recent_text=saved.persona
-                        ),
-                        name=f"scene_director.{session_id}",
-                    )
+                # Scene Director (Phase 4): offer/auto-provision a dependent's
+                # needs (the baby's hunger etc.). Shared with the attach path.
+                self._maybe_trigger_scene_director(session_id, saved)
             except Exception as exc:  # noqa: BLE001
                 log.warning(
                     "character_chat.spawn_auto_attach_failed",
@@ -2807,6 +2816,10 @@ class CharacterChatPlugin(BasePlugin):
         # SillyTavern-style: show the character's greeting (first message) as
         # its first turn — both visible in chat AND seeding the prompt history.
         await self._maybe_post_greeting(session_id, updated)
+        # Scene Director: offer/auto-provision a dependent's needs (baby's
+        # hunger etc.) — parity with the spawn path, so attaching an existing
+        # character that has a baby also gets its triggers (Mike's gap).
+        self._maybe_trigger_scene_director(session_id, updated)
         return {"ok": True, "character": _card_to_public(updated)}
 
     async def _maybe_post_greeting(
@@ -4877,6 +4890,20 @@ def _card_to_public(card: CharacterCard) -> dict[str, Any]:
         "created_at": card.created_at,
         "updated_at": card.updated_at,
     }
+
+
+def _should_trigger_scene_director(
+    mode: str, persona: str, relationships: Any
+) -> bool:
+    """Decide whether attaching/spawning a character runs the Scene Director.
+
+    True only when the director is enabled (``mode`` != "off") AND the
+    persona/relationships look like the character has a dependent (a baby,
+    pregnancy, …). Pure → the gate is unit-testable without scheduling.
+    """
+    if mode == "off":
+        return False
+    return looks_like_has_dependent(f"{persona} {relationships}")
 
 
 def _apply_placeholders(text: str, char_name: str, user_name: str = "Mike") -> str:
