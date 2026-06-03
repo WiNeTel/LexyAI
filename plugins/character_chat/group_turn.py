@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 import re
 from dataclasses import dataclass, field
@@ -49,6 +50,66 @@ from .mention_parser import parse_nl_mentions
 
 
 log = logging.getLogger(__name__)
+
+
+# ─── Prompt debug (opt-in via LEXY_DEBUG_PROMPTS) ────────────────────────────
+#
+# When the env var ``LEXY_DEBUG_PROMPTS`` is truthy (1/true/yes/on), the exact
+# system + user content sent to the LLM — plus the raw response — is printed to
+# the backend console for every character turn. Default OFF so normal runs stay
+# quiet. ``configure_logging`` routes stdlib logging to stdout with a bare
+# ``%(message)s`` format, so the multi-line block surfaces verbatim in the CMD.
+#
+# Usage (Windows CMD):  set LEXY_DEBUG_PROMPTS=1  &&  python -m lexy_core
+_DEBUG_TRUTHY: frozenset[str] = frozenset({"1", "true", "yes", "on"})
+_DEBUG_RULE = "─" * 72
+_DEBUG_FRAME = "═" * 72
+
+
+def _prompt_debug_enabled() -> bool:
+    """Return True when LEXY_DEBUG_PROMPTS is set to a truthy value."""
+    return os.environ.get("LEXY_DEBUG_PROMPTS", "").strip().lower() in _DEBUG_TRUTHY
+
+
+def _emit_prompt_debug(
+    *,
+    character: str,
+    brain: str,
+    system_prompt: str,
+    user_content: str,
+    max_tokens: int,
+    temperature: float,
+) -> None:
+    """Print the exact prompt sent to the LLM (gated by LEXY_DEBUG_PROMPTS)."""
+    if not _prompt_debug_enabled():
+        return
+    block = (
+        f"\n{_DEBUG_FRAME}\n"
+        f"PROMPT DEBUG -> character={character} brain={brain} "
+        f"max_tokens={max_tokens} temperature={temperature}\n"
+        f"system={len(system_prompt)} chars  user={len(user_content)} chars\n"
+        f"{_DEBUG_RULE}\n"
+        f"[SYSTEM]\n{system_prompt}\n"
+        f"{_DEBUG_RULE}\n"
+        f"[USER]\n{user_content}\n"
+        f"{_DEBUG_FRAME}"
+    )
+    log.info(block)
+
+
+def _emit_response_debug(*, character: str, content: str, skipped: bool) -> None:
+    """Print the raw LLM response next to its prompt (gated by the same flag)."""
+    if not _prompt_debug_enabled():
+        return
+    body = content if content else "(empty)"
+    block = (
+        f"\n{_DEBUG_RULE}\n"
+        f"LLM RESPONSE <- character={character} skipped={skipped} "
+        f"chars={len(content)}\n"
+        f"{body}\n"
+        f"{_DEBUG_FRAME}"
+    )
+    log.info(block)
 
 
 # ─── Data types ──────────────────────────────────────────────────────────────
@@ -906,6 +967,15 @@ class GroupTurnOrchestrator:
             {"role": "user", "content": user_content},
         ]
 
+        _emit_prompt_debug(
+            character=card.name,
+            brain=self._brain,
+            system_prompt=system_prompt,
+            user_content=user_content,
+            max_tokens=self._max_tokens,
+            temperature=self._temperature,
+        )
+
         try:
             # Characters don't need Chain-of-Thought — they need a fast,
             # in-voice reply. a4b has ``thinking=true`` by default which
@@ -936,6 +1006,12 @@ class GroupTurnOrchestrator:
         if not content or self._is_pass(content):
             skipped = True
             content = ""
+
+        _emit_response_debug(
+            character=card.name,
+            content=(raw or "").strip(),
+            skipped=skipped,
+        )
 
         # Phase 13.2 + 13.5 (B+D): repetition guard. Compares the new
         # turn against TWO pools:
