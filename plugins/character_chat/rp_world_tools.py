@@ -327,6 +327,41 @@ def physical_entities(world: dict[str, Any]) -> list[str]:
     return sorted(ents)
 
 
+# Physical-fact keys accepted from a narration extraction. ``held_by`` /
+# ``location`` describe objects (e.g. the baby); ``posture`` / ``location``
+# describe a character's own body state (sitting on the sofa vs. at the desk).
+# Anything else the extractor invents is dropped.
+PHYSICAL_KEYS: frozenset[str] = frozenset({"held_by", "location", "posture"})
+
+
+def clean_physical_extract(
+    extracted: dict[str, Any],
+    allowed: set[str],
+    keys: frozenset[str] = PHYSICAL_KEYS,
+) -> dict[str, dict[str, str]]:
+    """Filter a raw narration extraction to known names + physical keys.
+
+    Keeps only top-level names in ``allowed`` (the entities / characters we
+    asked about) and, within each, only keys in ``keys`` whose value is
+    non-empty. Fail-safe: non-dict input or junk shapes yield ``{}`` so a bad
+    extraction leaves existing facts unchanged.
+    """
+    clean: dict[str, dict[str, str]] = {}
+    if not isinstance(extracted, dict):
+        return clean
+    for name, kv in extracted.items():
+        if name not in allowed or not isinstance(kv, dict):
+            continue
+        filtered = {
+            k: str(v).strip()
+            for k, v in kv.items()
+            if k in keys and v is not None and str(v).strip()
+        }
+        if filtered:
+            clean[name] = filtered
+    return clean
+
+
 # ─── LLM tool schemas ────────────────────────────────────────────────
 
 DEFINE_NEED_SCHEMA: dict[str, Any] = {

@@ -194,6 +194,53 @@ def test_physical_entities_from_specs_and_facts() -> None:
     assert rwt.physical_entities(w) == ["baby", "crib"]
 
 
+# ─── closed-loop posture/location extraction (the "stands up twice" fix) ──
+
+
+def test_clean_physical_extract_keeps_allowed_names_and_keys() -> None:
+    extracted = {
+        "Shani": {"posture": "sitzend", "location": "Schreibtisch", "mood": "nervös"},
+        "baby": {"held_by": "Shani", "location": "Körbchen"},
+        "Greta": {"posture": "stehend"},     # name not allowed → dropped
+        "garbage": "not-a-dict",             # junk shape → dropped
+    }
+    clean = rwt.clean_physical_extract(extracted, {"Shani", "baby"})
+    assert clean == {
+        # mood is not a physical key → dropped; allowed names kept
+        "Shani": {"posture": "sitzend", "location": "Schreibtisch"},
+        "baby": {"held_by": "Shani", "location": "Körbchen"},
+    }
+
+
+def test_clean_physical_extract_drops_empty_and_nondict() -> None:
+    assert rwt.clean_physical_extract({"Shani": {"posture": "  "}}, {"Shani"}) == {}
+    assert rwt.clean_physical_extract({"Shani": {"posture": None}}, {"Shani"}) == {}
+    assert rwt.clean_physical_extract("nope", {"Shani"}) == {}
+    assert rwt.clean_physical_extract({}, {"Shani"}) == {}
+
+
+def test_format_physical_facts_renders_character_posture() -> None:
+    # The closed-loop fix stores a character's own body-state as a fact;
+    # format_physical_facts must surface posture (a free key) + location.
+    txt = rwt.format_physical_facts(
+        {"Shani": {"posture": "sitzend", "location": "Schreibtisch am PC"}}
+    )
+    assert "Shani" in txt
+    assert "sitzend" in txt
+    assert "Schreibtisch am PC" in txt
+
+
+def test_character_posture_survives_merge_roundtrip() -> None:
+    # Turn 1: Shani ends up at the PC. Turn 2 must see that, not the sofa.
+    w = rwt.merge_facts({}, {"Shani": {"posture": "sitzend", "location": "Sofa"}})
+    w = rwt.merge_facts(w, {"Shani": {"location": "Schreibtisch am PC"}})
+    assert rwt.get_facts(w)["Shani"] == {
+        "posture": "sitzend",
+        "location": "Schreibtisch am PC",
+    }
+    assert "Shani" in rwt.physical_entities(w)   # keeps being tracked next round
+
+
 # ─── caregiver + shared awareness (multi-chat) ────────────────────────
 
 
